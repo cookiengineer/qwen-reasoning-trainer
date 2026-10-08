@@ -109,4 +109,11 @@ type Backend interface {
 	SSMConv(sx, c Buffer) (Buffer, error)
 	GatedDeltaNet(q, k, v, g, beta, state Buffer) (out, newState Buffer, err error)
 	Copy(dst, src Buffer) error
+
+	// UploadWeight stores a raw quantized weight [dims] of type t on the device.
+	UploadWeight(t quant.Type, raw []byte, dims []int) (Buffer, error)
+	// DequantWeight dequantizes a weight buffer to float32.
+	DequantWeight(w Buffer) (Buffer, error)
+	// MatMulWeight multiplies a (possibly quantized) weight by an activation.
+	MatMulWeight(w Buffer, x Buffer) (Buffer, error)
 }

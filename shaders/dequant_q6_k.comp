@@ -1,0 +1,44 @@
+#version 450
+
+// Dequantizes Q6_K blocks (210 bytes / 256 elements) to float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint n; uint a; uint b; uint c; } p;
+
+uint getb(uint off) { return (data[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+float f16(uint off) { return unpackHalf2x16(getb(off) | (getb(off + 1u) << 8u)).x; }
+int i8(uint off) { uint v = getb(off); return (v >= 128u) ? int(v) - 256 : int(v); }
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.n) {
+        return;
+    }
+    uint inblk = p.a + gid;
+    uint oublk = p.b + gid;
+    uint base = inblk * 210u;
+    float d = f16(base + 208u);
+    uint o = oublk * 256u;
+
+    for (uint n = 0u; n < 256u; n += 128u) {
+        uint ql = base + (n >> 1u);
+        uint qh = base + 128u + (n >> 2u);
+        uint sc = base + 192u + (n >> 4u);
+        uint o = o + n;
+        for (uint l = 0u; l < 32u; l++) {
+            uint is = l >> 4u;
+            int q1 = int((getb(ql + l) & 0xFu) | (((getb(qh + l) >> 0u) & 3u) << 4u)) - 32;
+            int q2 = int((getb(ql + l + 32u) & 0xFu) | (((getb(qh + l) >> 2u) & 3u) << 4u)) - 32;
+            int q3 = int((getb(ql + l) >> 4u) | (((getb(qh + l) >> 4u) & 3u) << 4u)) - 32;
+            int q4 = int((getb(ql + l + 32u) >> 4u) | (((getb(qh + l) >> 6u) & 3u) << 4u)) - 32;
+            y[o + l] = d * float(i8(sc + is)) * float(q1);
+            y[o + l + 32u] = d * float(i8(sc + is + 2u)) * float(q2);
+            y[o + l + 64u] = d * float(i8(sc + is + 4u)) * float(q3);
+            y[o + l + 96u] = d * float(i8(sc + is + 6u)) * float(q4);
+        }
+    }
+}

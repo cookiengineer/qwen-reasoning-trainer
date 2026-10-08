@@ -108,14 +108,62 @@ func FromModelcfg(mc *modelcfg.Config) (*Config, error) {
 	return c, nil
 }
 
-// Model binds configuration and weights for a forward pass.
+// Model binds configuration and weights for a forward pass. When Backend is
+// set, matrix multiplications run on that device (weights are dequantized on
+// the host and uploaded per call); otherwise they run on the CPU reference ops.
 type Model struct {
-	Cfg *Config
-	W   *Weights
+	Cfg        *Config
+	W          *Weights
+	Backend    compute.Backend
+	devWeights map[*Weight]compute.Buffer
 }
 
 // NewModel creates a model from loaded weights.
 func NewModel(w *Weights) *Model { return &Model{Cfg: w.Cfg, W: w} }
+
+// mm multiplies a quantized weight by an activation. On the CPU path the weight
+// is dequantized in blocks on the fly. On the GPU path the raw quantized weight
+// is uploaded once and cached on the device, dequantized there per matmul.
+func (m *Model) mm(w *Weight, x *compute.Tensor) (*compute.Tensor, error) {
+	if m.Backend == nil {
+		return w.MatMul(x)
+	}
+	if m.devWeights == nil {
+		m.devWeights = map[*Weight]compute.Buffer{}
+	}
+	wb, ok := m.devWeights[w]
+	if !ok {
+		var err error
+		wb, err = m.Backend.UploadWeight(w.Typ, w.Raw, w.Dims)
+		if err != nil {
+			return nil, err
+		}
+		m.devWeights[w] = wb
+	}
+	xb, err := m.Backend.Upload(x)
+	if err != nil {
+		return nil, err
+	}
+	defer m.Backend.Free(xb)
+	ob, err := m.Backend.MatMulWeight(wb, xb)
+	if err != nil {
+		return nil, err
+	}
+	defer m.Backend.Free(ob)
+	return m.Backend.Download(ob)
+}
+
+// FreeDevice releases device-resident weights. It should be called before the
+// backend is closed.
+func (m *Model) FreeDevice() {
+	if m.Backend == nil || m.devWeights == nil {
+		return
+	}
+	for _, b := range m.devWeights {
+		m.Backend.Free(b)
+	}
+	m.devWeights = nil
+}
 
 // rms applies RMS normalization over the leading dimension.
 func rms(x *compute.Tensor, w []float32, eps float32) *compute.Tensor {

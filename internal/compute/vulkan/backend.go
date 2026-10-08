@@ -197,9 +197,19 @@ func (b *Backend) MatMul(a, c compute.Buffer) (compute.Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	groups := [3]uint32{ceilDiv(uint32(n*m), 64), 1, 1}
-	if err := b.dispatch("matmul", []*buffer{x, y, out}, push(uint32(k), uint32(n), uint32(m)), groups); err != nil {
-		return nil, err
+	// Chunk the dispatch to stay below the per-dimension group limit.
+	const maxPerDispatch = 65535 * 64
+	total := uint32(n * m)
+	for start := uint32(0); start < total; start += maxPerDispatch {
+		chunk := total - start
+		if chunk > maxPerDispatch {
+			chunk = maxPerDispatch
+		}
+		groups := [3]uint32{ceilDiv(chunk, 64), 1, 1}
+		if err := b.dispatch("matmul", []*buffer{x, y, out}, push(uint32(k), uint32(n), uint32(m), start), groups); err != nil {
+			b.Free(out)
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -329,9 +339,20 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 	if causal {
 		c = 1
 	}
-	groups := [3]uint32{uint32(nHead * nTok), 1, 1}
-	if err := b.dispatch("attention", []*buffer{tq, tk, tv, out}, push(uint32(headDim), uint32(nTok), uint32(nHead), uint32(nHeadKV), scale, c), groups); err != nil {
-		return nil, err
+	// Chunk the dispatch to stay below the per-dimension group limit. The
+	// attention shader has local_size_x = 1, so one group per element.
+	const maxPerDispatch = 65535
+	total := uint32(nHead * nTok)
+	for start := uint32(0); start < total; start += maxPerDispatch {
+		chunk := total - start
+		if chunk > maxPerDispatch {
+			chunk = maxPerDispatch
+		}
+		groups := [3]uint32{chunk, 1, 1}
+		if err := b.dispatch("attention", []*buffer{tq, tk, tv, out}, push(uint32(headDim), uint32(nTok), uint32(nHead), uint32(nHeadKV), scale, c, start), groups); err != nil {
+			b.Free(out)
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -432,6 +453,201 @@ func (b *Backend) Copy(dst, src compute.Buffer) error {
 
 // Ne0 returns Dims[0] or 1.
 func (x *buffer) Ne0() int { return dimOr1(x.dims, 0) }
+
+// dequantShaders maps a quantized type to its dequant shader and block size.
+var dequantShaders = map[quant.Type]struct {
+	name       string
+	blockElems int
+}{
+	quant.TypeF16:    {"dequant_f16", 1},
+	quant.TypeQ8_0:   {"dequant_q8_0", 32},
+	quant.TypeQ4_K:   {"dequant_q4_k", 256},
+	quant.TypeQ5_K:   {"dequant_q5_k", 256},
+	quant.TypeQ6_K:   {"dequant_q6_k", 256},
+	quant.TypeQ3_K:   {"dequant_q3_k", 256},
+	quant.TypeIQ4_XS: {"dequant_iq4_xs", 256},
+	quant.TypeIQ4_NL: {"dequant_iq4_nl", 32},
+	quant.TypeIQ3_S:  {"dequant_iq3_s", 256},
+}
+
+// UploadWeight implements compute.Backend. The buffer is padded to a 4-byte
+// boundary so shaders can read 32-bit words safely.
+func (b *Backend) UploadWeight(t quant.Type, raw []byte, dims []int) (compute.Buffer, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("vulkan: empty weight")
+	}
+	size := uint64((len(raw) + 3) &^ 3)
+	buf, err := b.allocBuffer(size, vkBufferUsageStorage|vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
+	if err != nil {
+		return nil, err
+	}
+	buf.dims = append([]int(nil), dims...)
+	buf.typ = t
+	dst := unsafe.Slice((*byte)(buf.mapped), int(size))
+	for i := range dst {
+		dst[i] = 0
+	}
+	copy(dst, raw)
+	return buf, nil
+}
+
+// SetMaxScratchFloats overrides the row-block size used by MatMulWeight. It is
+// intended for tests that need to force multiple row blocks.
+func (b *Backend) SetMaxScratchFloats(n int) { b.maxScratchFloats = n }
+
+// dequantRange dequantizes count blocks starting at input block inBase into a
+// float32 buffer, writing from output block outBase. outDims are the dims of the
+// produced float32 tensor.
+func (b *Backend) dequantRange(x *buffer, inBase, outBase, count uint32, outDims []int) (*buffer, error) {
+	sh, ok := dequantShaders[x.typ]
+	if !ok {
+		return nil, fmt.Errorf("vulkan: no dequant shader for %s", x.typ)
+	}
+	out, err := b.newF32Buffer(outDims...)
+	if err != nil {
+		return nil, err
+	}
+	// Vulkan caps dispatch counts per dimension; process in chunks.
+	const maxPerDispatch = 65535 * 64
+	for start := uint32(0); start < count; start += maxPerDispatch {
+		chunk := count - start
+		if chunk > maxPerDispatch {
+			chunk = maxPerDispatch
+		}
+		groups := [3]uint32{ceilDiv(chunk, 64), 1, 1}
+		if err := b.dispatch(sh.name, []*buffer{x, out}, push(chunk, inBase+start, outBase+start, uint32(0)), groups); err != nil {
+			b.Free(out)
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// DequantWeight implements compute.Backend.
+func (b *Backend) DequantWeight(w compute.Buffer) (compute.Buffer, error) {
+	x, err := asBuffer(w)
+	if err != nil {
+		return nil, err
+	}
+	if x.typ == quant.TypeF32 {
+		out, err := b.newF32Buffer(x.dims...)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.Copy(out, x); err != nil {
+			b.Free(out)
+			return nil, err
+		}
+		return out, nil
+	}
+	sh, ok := dequantShaders[x.typ]
+	if !ok {
+		return nil, fmt.Errorf("vulkan: no dequant shader for %s", x.typ)
+	}
+	count := uint32(x.NumElements())
+	if sh.blockElems > 1 {
+		count = uint32(x.NumElements() / sh.blockElems)
+	}
+	return b.dequantRange(x, 0, 0, count, x.dims)
+}
+
+// MatMulWeight implements compute.Backend. Quantized weights are processed in
+// row blocks: each block is dequantized on the device into a bounded float32
+// scratch buffer and multiplied, then the results are assembled on the host.
+// This keeps every storage-buffer binding within device limits.
+func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
+	wb, err := asBuffer(w)
+	if err != nil {
+		return nil, err
+	}
+	xb, err := asBuffer(x)
+	if err != nil {
+		return nil, err
+	}
+	if wb.typ == quant.TypeF32 {
+		return b.MatMul(w, x)
+	}
+	sh, ok := dequantShaders[wb.typ]
+	if !ok {
+		return b.matMulHostDequant(wb, x)
+	}
+	k := wb.Ne0()
+	n := dimOr1(wb.dims, 1)
+	m := dimOr1(xb.dims, 1)
+	if xb.Ne0() != k {
+		return nil, compute.ErrShape
+	}
+	if sh.blockElems > 1 && k%sh.blockElems != 0 {
+		return nil, fmt.Errorf("vulkan: row length %d not a multiple of block %d", k, sh.blockElems)
+	}
+
+	// Bound the float32 scratch to ~256 MiB and the block count per dequant
+	// call below the dispatch limit.
+	maxFloats := b.maxScratchFloats
+	if maxFloats <= 0 {
+		maxFloats = 64 * 1024 * 1024
+	}
+	const maxBlocks = 65535 * 64
+	rowBlock := n
+	if k > 0 && rowBlock*k > maxFloats {
+		rowBlock = maxFloats / k
+	}
+	if sh.blockElems > 1 {
+		if rb := int(maxBlocks) * sh.blockElems / k; rb < rowBlock {
+			rowBlock = rb
+		}
+	} else {
+		if rb := int(maxBlocks) / k; rb < rowBlock {
+			rowBlock = rb
+		}
+	}
+	if rowBlock < 1 {
+		rowBlock = 1
+	}
+
+	outHost := compute.NewF32(n, m)
+	for n0 := 0; n0 < n; n0 += rowBlock {
+		rows := rowBlock
+		if n0+rows > n {
+			rows = n - n0
+		}
+		inBase := uint32(n0 * k / sh.blockElems)
+		count := uint32(rows * k / sh.blockElems)
+		scratch, err := b.dequantRange(wb, inBase, 0, count, []int{k, rows})
+		if err != nil {
+			return nil, err
+		}
+		blockOut, err := b.MatMul(scratch, x)
+		b.Free(scratch)
+		if err != nil {
+			return nil, err
+		}
+		bt, err := b.Download(blockOut)
+		b.Free(blockOut)
+		if err != nil {
+			return nil, err
+		}
+		for c := 0; c < m; c++ {
+			copy(outHost.F32[n0+c*n:n0+rows+c*n], bt.F32[c*rows:(c+1)*rows])
+		}
+	}
+	return b.Upload(outHost)
+}
+
+func (b *Backend) matMulHostDequant(w *buffer, x compute.Buffer) (compute.Buffer, error) {
+	raw := unsafe.Slice((*byte)(w.mapped), int(w.size))
+	f32, err := quant.Dequant(w.typ, raw, int64(w.NumElements()))
+	if err != nil {
+		return nil, err
+	}
+	wt := &compute.Tensor{Dims: append([]int(nil), w.dims...), Type: quant.TypeF32, F32: f32}
+	wb, err := b.Upload(wt)
+	if err != nil {
+		return nil, err
+	}
+	defer b.Free(wb)
+	return b.MatMul(wb, x)
+}
 
 func dimOr1(dims []int, i int) int {
 	if i < 0 || i >= len(dims) {

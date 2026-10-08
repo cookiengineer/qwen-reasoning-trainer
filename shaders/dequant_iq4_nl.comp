@@ -1,0 +1,34 @@
+#version 450
+
+// Dequantizes IQ4_NL blocks (18 bytes / 32 elements) to float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint n; uint a; uint b; uint c; } p;
+
+uint getb(uint off) { return (data[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+float f16(uint off) { return unpackHalf2x16(getb(off) | (getb(off + 1u) << 8u)).x; }
+
+const float KV[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.n) {
+        return;
+    }
+    uint inblk = p.a + gid;
+    uint oublk = p.b + gid;
+    uint base = inblk * 18u;
+    float d = f16(base);
+    uint o = oublk * 32u;
+    for (uint j = 0u; j < 16u; j++) {
+        uint q = getb(base + 2u + j);
+        y[o + j] = d * KV[q & 0xFu];
+        y[o + j + 16u] = d * KV[q >> 4];
+    }
+}

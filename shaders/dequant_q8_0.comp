@@ -1,0 +1,29 @@
+#version 450
+
+// Dequantizes Q8_0 blocks (34 bytes / 32 elements) to float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint n; uint a; uint b; uint c; } p;
+
+uint getb(uint off) { return (data[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+float f16(uint off) { return unpackHalf2x16(getb(off) | (getb(off + 1u) << 8u)).x; }
+int i8(uint off) { uint v = getb(off); return (v >= 128u) ? int(v) - 256 : int(v); }
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.n) {
+        return;
+    }
+    uint inblk = p.a + gid;
+    uint oublk = p.b + gid;
+    uint base = inblk * 34u;
+    uint o = oublk * 32u;
+    float d = f16(base);
+    for (uint j = 0u; j < 32u; j++) {
+        y[o + j] = d * float(i8(base + 2u + j));
+    }
+}

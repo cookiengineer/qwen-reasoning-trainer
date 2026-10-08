@@ -2,14 +2,21 @@ package cli
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute/vulkan"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/gguf"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/hf"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/tokenizer"
 )
 
 const usage = `qwen-trainer - Qwen3.8-27B reasoning trainer
@@ -21,6 +28,7 @@ Commands:
   download   Download the model GGUF from Hugging Face
   inspect    Print model architecture, tensor types, and size
   gpu-info   Print Vulkan device capabilities
+  run        Load the model and greedily generate tokens
   help       Show this help
 
 Global flags:
@@ -55,6 +63,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return cmdInspect(cfg, stdout, stderr)
 	case "gpu-info":
 		return cmdGPUInfo(cfg, stdout, stderr)
+	case "run":
+		return cmdRun(cfg, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", cfg.Command)
 		fmt.Fprint(stderr, usage)
@@ -100,6 +110,142 @@ func cmdDownload(cfg *Config, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stderr, "\nDone: %s\n", cfg.Model)
 	fmt.Fprintln(stdout, cfg.Model)
 	return 0
+}
+
+func cmdRun(cfg *Config, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	tokenList := fs.String("tokens", "", "comma-separated prompt token ids")
+	prompt := fs.String("prompt", "", "text prompt (encoded with the model tokenizer)")
+	system := fs.String("system", "", "optional system message for --prompt")
+	gen := fs.Int("generate", 8, "number of tokens to generate")
+	useGPU := fs.Bool("gpu", false, "run matmuls on the Vulkan backend")
+	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+
+	path, err := resolveModel(cfg, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	g, err := gguf.Open(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	defer g.Close()
+	mc, err := modelcfg.FromGGUF(g)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	vocab, err := tokenizer.FromGGUF(g)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+
+	var tokens []int32
+	if *prompt != "" {
+		tokens = vocab.ChatPrompt(*system, *prompt)
+	} else {
+		if tokens, err = parseTokens(*tokenList); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 2
+		}
+	}
+	if len(tokens) == 0 {
+		fmt.Fprintln(stderr, "error: provide --tokens or --prompt")
+		return 2
+	}
+	fmt.Fprintf(stderr, "loading weights from %s (block_count=%d)...\n", path, mc.BlockCount)
+	t0 := time.Now()
+	w, err := qwen38.LoadFromGGUF(g, mc)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "weights loaded in %s\n", time.Since(t0).Round(time.Millisecond))
+
+	m := qwen38.NewModel(w)
+	if *useGPU {
+		be, err := vulkan.New()
+		if err != nil {
+			fmt.Fprintln(stderr, "error: vulkan backend:", err)
+			return 1
+		}
+		defer func() { m.FreeDevice(); be.Close() }()
+		m.Backend = be
+		fmt.Fprintf(stderr, "using backend %s\n", be.Capabilities().Name)
+	}
+
+	st := qwen38.NewState(m.Cfg)
+	t1 := time.Now()
+	res, err := m.Forward(tokens, qwen38.ForwardOptions{State: st, LastTokenOnly: true})
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "prompt %d tokens in %s\n", len(tokens), time.Since(t1).Round(time.Millisecond))
+
+	generated := make([]int32, 0, *gen)
+	pos := len(tokens)
+	for i := 0; i < *gen; i++ {
+		next := argmax(res.Logits)
+		if vocab.IsEOS(next) {
+			break
+		}
+		generated = append(generated, next)
+		step := time.Now()
+		res, err = m.Forward([]int32{next}, qwen38.ForwardOptions{
+			State:         st,
+			Positions:     []int32{int32(pos)},
+			LastTokenOnly: true,
+		})
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stderr, "token %d: id=%d in %s\n", i, next, time.Since(step).Round(time.Millisecond))
+		pos++
+	}
+
+	fmt.Fprintf(stdout, "prompt_tokens: %v\n", tokens)
+	fmt.Fprintf(stdout, "generated_ids: %v\n", generated)
+	fmt.Fprintf(stdout, "decoded: %q\n", vocab.Decode(generated))
+	return 0
+}
+
+func parseTokens(s string) ([]int32, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]int32, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid token %q", p)
+		}
+		out = append(out, int32(v))
+	}
+	return out, nil
+}
+
+func argmax(logits *compute.Tensor) int32 {
+	best := 0
+	n := logits.Ne(0)
+	for i := 1; i < n; i++ {
+		if logits.F32[i] > logits.F32[best] {
+			best = i
+		}
+	}
+	return int32(best)
 }
 
 func cmdGPUInfo(cfg *Config, stdout, stderr io.Writer) int {

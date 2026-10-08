@@ -475,6 +475,10 @@ type Backend struct {
 	mu        sync.Mutex
 	pipelines map[string]uintptr
 	closed    bool
+
+	// maxScratchFloats bounds the float32 dequant scratch. It is overridable
+	// in tests to exercise the row-blocking path.
+	maxScratchFloats int
 }
 
 type buffer struct {

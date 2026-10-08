@@ -8,6 +8,7 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute/cpu"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute/vulkan"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
 
 func up(t *testing.T, b compute.Backend, dims []int, vals []float32) compute.Buffer {
@@ -174,4 +175,164 @@ func TestVulkanGatedDeltaNetFallback(t *testing.T) {
 	co, _ := cf(c)
 	vo, _ := cf(v)
 	compare(t, "gdn", down(t, v, vo), down(t, c, co))
+}
+
+// buildRaw creates pseudo-random storage bytes for a quantized type, with the
+// scale fields overwritten by finite values so the dequant result is finite.
+func buildRaw(typ quant.Type, blocks int, seed uint32, scaleOffsets []int) []byte {
+	ts := typ.TypeSize()
+	raw := make([]byte, blocks*ts)
+	x := seed
+	for i := range raw {
+		x = x*1664525 + 1013904223
+		raw[i] = byte(x >> 16)
+	}
+	for b := 0; b < blocks; b++ {
+		for k, off := range scaleOffsets {
+			var h float32 = 1.0
+			if k%2 == 1 {
+				h = 0.1
+			}
+			u := quant.F32ToF16(h)
+			raw[b*ts+off] = byte(u)
+			raw[b*ts+off+1] = byte(u >> 8)
+		}
+	}
+	return raw
+}
+
+func dequantShaderCase(typ quant.Type) (scaleOffsets []int, ok bool) {
+	switch typ {
+	case quant.TypeQ8_0, quant.TypeIQ4_XS, quant.TypeIQ4_NL, quant.TypeIQ3_S:
+		return []int{0}, true
+	case quant.TypeQ4_K, quant.TypeQ5_K:
+		return []int{0, 2}, true
+	case quant.TypeQ6_K:
+		return []int{208}, true
+	case quant.TypeQ3_K:
+		return []int{108}, true
+	}
+	return nil, false
+}
+
+func TestVulkanDequant(t *testing.T) {
+	_, v := newBackends(t)
+	types := []quant.Type{
+		quant.TypeQ8_0, quant.TypeQ4_K, quant.TypeQ5_K, quant.TypeQ6_K,
+		quant.TypeQ3_K, quant.TypeIQ4_XS, quant.TypeIQ4_NL, quant.TypeIQ3_S,
+	}
+	for _, typ := range types {
+		offs, ok := dequantShaderCase(typ)
+		if !ok {
+			continue
+		}
+		blocks := 3
+		raw := buildRaw(typ, blocks, uint32(typ)+1, offs)
+		n := int64(blocks * typ.BlockSize())
+		want, err := quant.Dequant(typ, raw, n)
+		if err != nil {
+			t.Fatalf("%s: %v", typ, err)
+		}
+		wb, err := v.UploadWeight(typ, raw, []int{int(n)})
+		if err != nil {
+			t.Fatalf("%s: upload: %v", typ, err)
+		}
+		db, err := v.DequantWeight(wb)
+		if err != nil {
+			t.Fatalf("%s: dequant: %v", typ, err)
+		}
+		got := down(t, v, db)
+		v.Free(wb)
+		v.Free(db)
+		if len(got) != len(want) {
+			t.Fatalf("%s: len %d != %d", typ, len(got), len(want))
+		}
+		for i := range want {
+			tol := 1e-3 + 1e-3*float32(math.Abs(float64(want[i])))
+			if float32(math.Abs(float64(got[i]-want[i]))) > tol {
+				t.Fatalf("%s[%d]: got %v want %v", typ, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+func TestVulkanMatMulWeight(t *testing.T) {
+	c, v := newBackends(t)
+	k, n, m := 32, 8, 4
+	data := make([]float32, k*n)
+	for i := range data {
+		data[i] = float32(math.Sin(float64(i))) * 2
+	}
+	raw, err := quant.Quantize(quant.TypeQ8_0, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := make([]float32, k*m)
+	for i := range x {
+		x[i] = float32(math.Cos(float64(i)))
+	}
+
+	wb, err := v.UploadWeight(quant.TypeQ8_0, raw, []int{k, n})
+	if err != nil {
+		t.Fatal(err)
+	}
+	xb := up(t, v, []int{k, m}, x)
+	got, err := v.MatMulWeight(wb, xb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// CPU reference: dequantize then matmul.
+	dq, _ := quant.Dequant(quant.TypeQ8_0, raw, int64(k*n))
+	wt := &compute.Tensor{Dims: []int{k, n}, F32: dq}
+	wantT, err := compute.MatMul(wt, &compute.Tensor{Dims: []int{k, m}, F32: x})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c
+	compare(t, "matmulweight", down(t, v, got), wantT.F32)
+}
+
+func TestVulkanMatMulWeightBlocked(t *testing.T) {
+	if !vulkan.Available() {
+		t.Skip("vulkan unavailable")
+	}
+	v, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer v.Close()
+	// Force a tiny scratch so the weight is processed in many row blocks.
+	v.SetMaxScratchFloats(64)
+
+	k, n, m := 32, 200, 3
+	data := make([]float32, k*n)
+	for i := range data {
+		data[i] = float32(math.Sin(float64(i)*0.3)) * 2
+	}
+	raw, err := quant.Quantize(quant.TypeQ8_0, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := make([]float32, k*m)
+	for i := range x {
+		x[i] = float32(math.Cos(float64(i) * 0.7))
+	}
+
+	wb, err := v.UploadWeight(quant.TypeQ8_0, raw, []int{k, n})
+	if err != nil {
+		t.Fatal(err)
+	}
+	xb := up(t, v, []int{k, m}, x)
+	got, err := v.MatMulWeight(wb, xb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dq, _ := quant.Dequant(quant.TypeQ8_0, raw, int64(k*n))
+	wantT, err := compute.MatMul(&compute.Tensor{Dims: []int{k, n}, F32: dq}, &compute.Tensor{Dims: []int{k, m}, F32: x})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare(t, "matmulweight-blocked", down(t, v, got), wantT.F32)
 }

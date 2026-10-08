@@ -1,0 +1,73 @@
+#version 450
+
+// Dequantizes Q3_K blocks (110 bytes / 256 elements) to float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint n; uint a; uint b; uint c; } p;
+
+uint getb(uint off) { return (data[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+float f16(uint off) { return unpackHalf2x16(getb(off) | (getb(off + 1u) << 8u)).x; }
+uint u32at(uint off) {
+    return getb(off) | (getb(off + 1u) << 8u) | (getb(off + 2u) << 16u) | (getb(off + 3u) << 24u);
+}
+
+const uint KMASK1 = 0x03030303u;
+const uint KMASK2 = 0x0f0f0f0fu;
+
+uint g_x0, g_x1, g_x2, g_x3;
+
+int scAt(uint i) {
+    uint g = i >> 2u;
+    uint k = i & 3u;
+    uint v = (g == 0u) ? g_x0 : (g == 1u) ? g_x1 : (g == 2u) ? g_x2 : g_x3;
+    v = (v >> (k * 8u)) & 0xFFu;
+    return (v >= 128u) ? int(v) - 256 : int(v);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.n) {
+        return;
+    }
+    uint inblk = p.a + gid;
+    uint oublk = p.b + gid;
+    uint base = inblk * 110u;
+    float d = f16(base + 108u);
+
+    uint a0 = u32at(base + 96u);
+    uint a1 = u32at(base + 100u);
+    uint tmp = u32at(base + 104u);
+    g_x0 = (a0 & KMASK2) | (((tmp >> 0u) & KMASK1) << 4u);
+    g_x1 = (a1 & KMASK2) | (((tmp >> 2u) & KMASK1) << 4u);
+    g_x2 = ((a0 >> 4u) & KMASK2) | (((tmp >> 4u) & KMASK1) << 4u);
+    g_x3 = ((a1 >> 4u) & KMASK2) | (((tmp >> 6u) & KMASK1) << 4u);
+
+    uint o = oublk * 256u;
+    uint q = base + 32u;
+    uint is = 0u;
+    uint m = 1u;
+    for (uint n = 0u; n < 256u; n += 128u) {
+        uint shift = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            float dl = d * float(scAt(is) - 32); is++;
+            for (uint l = 0u; l < 16u; l++) {
+                int v = int((getb(q + l) >> shift) & 3u);
+                if ((getb(base + l) & m) == 0u) { v -= 4; }
+                y[o] = dl * float(v); o++;
+            }
+            dl = d * float(scAt(is) - 32); is++;
+            for (uint l = 0u; l < 16u; l++) {
+                int v = int((getb(q + l + 16u) >> shift) & 3u);
+                if ((getb(base + l + 16u) & m) == 0u) { v -= 4; }
+                y[o] = dl * float(v); o++;
+            }
+            shift += 2u;
+            m <<= 1u;
+        }
+        q += 32u;
+    }
+}

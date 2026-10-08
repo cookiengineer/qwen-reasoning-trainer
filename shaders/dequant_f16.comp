@@ -1,0 +1,23 @@
+#version 450
+
+// Dequantizes F16 tensors (2 bytes per element) to float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint n; uint a; uint b; uint c; } p;
+
+uint getb(uint off) { return (data[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.n) {
+        return;
+    }
+    uint wi = p.a + gid;
+    uint i = p.b + gid;
+    uint off = wi * 2u;
+    y[i] = unpackHalf2x16(getb(off) | (getb(off + 1u) << 8u)).x;
+}

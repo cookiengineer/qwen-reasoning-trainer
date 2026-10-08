@@ -61,34 +61,38 @@ func TestReferenceNumpy(t *testing.T) {
 	doc.Config["IsRecurrent"] = rec
 
 	dumpT := func(name string, t *compute.Tensor) { doc.Tensors[name] = dumpTensor{Dims: t.Dims, Data: t.F32} }
-	dumpT("token_embd", w.TokenEmbd)
-	dumpT("output_norm", w.OutputNorm)
-	dumpT("output", w.Output)
+	dumpW := func(name string, w *Weight) { dumpT(name, w.Tensor()) }
+	dumpVec := func(name string, v []float32) {
+		doc.Tensors[name] = dumpTensor{Dims: []int{len(v)}, Data: v}
+	}
+	dumpW("token_embd", w.TokenEmbd)
+	dumpVec("output_norm", w.OutputNorm)
+	dumpW("output", w.Output)
 	for il, lw := range w.Layers {
 		p := "l" + itoa(il) + "."
-		dumpT(p+"attn_norm", lw.AttnNorm)
-		dumpT(p+"post_attn_norm", lw.PostAttnNorm)
+		dumpVec(p+"attn_norm", lw.AttnNorm)
+		dumpVec(p+"post_attn_norm", lw.PostAttnNorm)
 		if cfg.IsRecurrent(il) {
-			dumpT(p+"attn_qkv", lw.AttnQKV)
-			dumpT(p+"attn_gate", lw.AttnGate)
-			dumpT(p+"ssm_out", lw.SSMOut)
-			dumpT(p+"ssm_alpha", lw.SSMAlpha)
-			dumpT(p+"ssm_beta", lw.SSMBeta)
+			dumpW(p+"attn_qkv", lw.AttnQKV)
+			dumpW(p+"attn_gate", lw.AttnGate)
+			dumpW(p+"ssm_out", lw.SSMOut)
+			dumpW(p+"ssm_alpha", lw.SSMAlpha)
+			dumpW(p+"ssm_beta", lw.SSMBeta)
 			dumpT(p+"ssm_conv1d", lw.SSMConv1d)
-			dumpT(p+"ssm_norm", lw.SSMNorm)
-			dumpT(p+"ssm_a", lw.SSMA)
-			dumpT(p+"ssm_dt", lw.SSMDt)
+			dumpVec(p+"ssm_norm", lw.SSMNorm)
+			dumpVec(p+"ssm_a", lw.SSMA)
+			dumpVec(p+"ssm_dt", lw.SSMDt)
 		} else {
-			dumpT(p+"attn_q", lw.AttnQ)
-			dumpT(p+"attn_k", lw.AttnK)
-			dumpT(p+"attn_v", lw.AttnV)
-			dumpT(p+"attn_output", lw.AttnOutput)
-			dumpT(p+"attn_q_norm", lw.AttnQNorm)
-			dumpT(p+"attn_k_norm", lw.AttnKNorm)
+			dumpW(p+"attn_q", lw.AttnQ)
+			dumpW(p+"attn_k", lw.AttnK)
+			dumpW(p+"attn_v", lw.AttnV)
+			dumpW(p+"attn_output", lw.AttnOutput)
+			dumpVec(p+"attn_q_norm", lw.AttnQNorm)
+			dumpVec(p+"attn_k_norm", lw.AttnKNorm)
 		}
-		dumpT(p+"ffn_gate", lw.FfnGate)
-		dumpT(p+"ffn_up", lw.FfnUp)
-		dumpT(p+"ffn_down", lw.FfnDown)
+		dumpW(p+"ffn_gate", lw.FfnGate)
+		dumpW(p+"ffn_up", lw.FfnUp)
+		dumpW(p+"ffn_down", lw.FfnDown)
 	}
 
 	dir := t.TempDir()

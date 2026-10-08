@@ -301,3 +301,47 @@ func (b *Backend) Copy(dst, src compute.Buffer) error {
 	copy(td.F32, ts.F32)
 	return nil
 }
+
+// weightBuffer holds raw quantized weight bytes.
+type weightBuffer struct {
+	typ  quant.Type
+	dims []int
+	raw  []byte
+}
+
+func (w *weightBuffer) Dims() []int      { return w.dims }
+func (w *weightBuffer) Type() quant.Type { return w.typ }
+func (w *weightBuffer) NumElements() int {
+	n := 1
+	for _, d := range w.dims {
+		n *= d
+	}
+	return n
+}
+
+// UploadWeight implements compute.Backend.
+func (b *Backend) UploadWeight(t quant.Type, raw []byte, dims []int) (compute.Buffer, error) {
+	return &weightBuffer{typ: t, dims: append([]int(nil), dims...), raw: append([]byte(nil), raw...)}, nil
+}
+
+// DequantWeight implements compute.Backend.
+func (b *Backend) DequantWeight(w compute.Buffer) (compute.Buffer, error) {
+	wb, ok := w.(*weightBuffer)
+	if !ok {
+		return nil, fmt.Errorf("cpu: not a weight buffer")
+	}
+	f32, err := quant.Dequant(wb.typ, wb.raw, int64(wb.NumElements()))
+	if err != nil {
+		return nil, err
+	}
+	return wrap(&compute.Tensor{Dims: wb.dims, Type: quant.TypeF32, F32: f32}), nil
+}
+
+// MatMulWeight implements compute.Backend.
+func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
+	dq, err := b.DequantWeight(w)
+	if err != nil {
+		return nil, err
+	}
+	return b.MatMul(dq, x)
+}

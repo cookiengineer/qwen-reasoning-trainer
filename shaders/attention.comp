@@ -14,10 +14,11 @@ layout(push_constant) uniform P {
     uint  nHeadKV;
     float scale;
     uint  causal;
+    uint  base;
 } p;
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = p.base + gl_GlobalInvocationID.x;
     uint total = p.nHead * p.nTok;
     if (gid >= total) {
         return;

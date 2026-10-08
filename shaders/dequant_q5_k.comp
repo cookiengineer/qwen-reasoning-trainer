@@ -1,0 +1,62 @@
+#version 450
+
+// Dequantizes Q5_K blocks (176 bytes / 256 elements) to float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint n; uint a; uint b; uint c; } p;
+
+uint getb(uint off) { return (data[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+float f16(uint off) { return unpackHalf2x16(getb(off) | (getb(off + 1u) << 8u)).x; }
+
+void getScaleMin(uint j, uint sbase, out uint d, out uint m) {
+    if (j < 4u) {
+        d = getb(sbase + j) & 63u;
+        m = getb(sbase + j + 4u) & 63u;
+    } else {
+        d = (getb(sbase + j + 4u) & 0xFu) | ((getb(sbase + j - 4u) >> 6) << 4);
+        m = (getb(sbase + j + 4u) >> 4) | ((getb(sbase + j) >> 6) << 4);
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.n) {
+        return;
+    }
+    uint inblk = p.a + gid;
+    uint oublk = p.b + gid;
+    uint base = inblk * 176u;
+    uint sbase = base + 4u;
+    uint qhbase = base + 16u;
+    uint qlbase = base + 48u;
+    uint o = oublk * 256u;
+    float d = f16(base);
+    float mn = f16(base + 2u);
+
+    uint is = 0u;
+    uint u1 = 1u, u2 = 2u;
+    for (uint j = 0u; j < 256u; j += 64u) {
+        uint sc1, m1, sc2, m2;
+        getScaleMin(is, sbase, sc1, m1);
+        getScaleMin(is + 1u, sbase, sc2, m2);
+        float d1 = d * float(sc1), mn1 = mn * float(m1);
+        float d2 = d * float(sc2), mn2 = mn * float(m2);
+        uint qoff = qlbase + (j >> 1u);
+        for (uint l = 0u; l < 32u; l++) {
+            uint q = getb(qoff + l);
+            uint h = getb(qhbase + l);
+            uint lo = (q & 0xFu) + ((h & u1) != 0u ? 16u : 0u);
+            uint hi = (q >> 4) + ((h & u2) != 0u ? 16u : 0u);
+            y[o + l] = d1 * float(lo) - mn1;
+            y[o + 32u + l] = d2 * float(hi) - mn2;
+        }
+        o += 64u;
+        is += 2u;
+        u1 <<= 2u;
+        u2 <<= 2u;
+    }
+}

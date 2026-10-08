@@ -52,6 +52,9 @@ type ForwardOptions struct {
 	State *State
 	// Positions overrides the default 0..T-1 positions.
 	Positions []int32
+	// LastTokenOnly computes logits only for the last token, which is all that
+	// is needed for generation and avoids a full-vocabulary projection.
+	LastTokenOnly bool
 }
 
 // ForwardResult is the output of a forward pass.
@@ -72,7 +75,7 @@ func (m *Model) Forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 	if T == 0 {
 		return nil, fmt.Errorf("qwen38: empty prompt")
 	}
-	x, err := compute.GetRows(m.W.TokenEmbd, tokens)
+	x, err := m.W.TokenEmbd.GetRows(tokens)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +103,7 @@ func (m *Model) Forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 	for il := 0; il < cfg.TrunkLayers(); il++ {
 		lw := &m.W.Layers[il]
 
-		h := rms(x, lw.AttnNorm.F32, cfg.RmsEps)
+		h := rms(x, lw.AttnNorm, cfg.RmsEps)
 		var attnOut *compute.Tensor
 		if cfg.IsRecurrent(il) {
 			attnOut, err = m.linearAttn(lw, h, st, il)
@@ -115,7 +118,7 @@ func (m *Model) Forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 			return nil, err
 		}
 
-		h2 := rms(x, lw.PostAttnNorm.F32, cfg.RmsEps)
+		h2 := rms(x, lw.PostAttnNorm, cfg.RmsEps)
 		ffnOut, err := m.ffn(lw, h2)
 		if err != nil {
 			return nil, fmt.Errorf("qwen38: layer %d ffn: %w", il, err)
@@ -129,8 +132,15 @@ func (m *Model) Forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 		}
 	}
 
-	xn := rms(x, m.W.OutputNorm.F32, cfg.RmsEps)
-	logits, err := mm(m.W.Output, xn)
+	xn := rms(x, m.W.OutputNorm, cfg.RmsEps)
+	if opts.LastTokenOnly && T > 1 {
+		xn = &compute.Tensor{
+			Dims: []int{cfg.NEmbd, 1},
+			Type: xn.Type,
+			F32:  xn.F32[(T-1)*cfg.NEmbd : T*cfg.NEmbd],
+		}
+	}
+	logits, err := m.mm(m.W.Output, xn)
 	if err != nil {
 		return nil, err
 	}
@@ -141,11 +151,11 @@ func (m *Model) Forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 
 // ffn applies the SwiGLU feed-forward network to a normalized activation.
 func (m *Model) ffn(lw *LayerWeights, h *compute.Tensor) (*compute.Tensor, error) {
-	gate, err := mm(lw.FfnGate, h)
+	gate, err := m.mm(lw.FfnGate, h)
 	if err != nil {
 		return nil, err
 	}
-	up, err := mm(lw.FfnUp, h)
+	up, err := m.mm(lw.FfnUp, h)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +164,7 @@ func (m *Model) ffn(lw *LayerWeights, h *compute.Tensor) (*compute.Tensor, error
 	if err != nil {
 		return nil, err
 	}
-	return mm(lw.FfnDown, act)
+	return m.mm(lw.FfnDown, act)
 }
 
 // fullAttn runs a full-attention block on the normalized activation h, using
@@ -164,15 +174,15 @@ func (m *Model) fullAttn(lw *LayerWeights, h *compute.Tensor, positions []int32,
 	hd := cfg.HeadDim
 	T := h.Ne(1)
 
-	qg, err := mm(lw.AttnQ, h)
+	qg, err := m.mm(lw.AttnQ, h)
 	if err != nil {
 		return nil, err
 	}
-	kcur, err := mm(lw.AttnK, h)
+	kcur, err := m.mm(lw.AttnK, h)
 	if err != nil {
 		return nil, err
 	}
-	vcur, err := mm(lw.AttnV, h)
+	vcur, err := m.mm(lw.AttnV, h)
 	if err != nil {
 		return nil, err
 	}
@@ -194,12 +204,12 @@ func (m *Model) fullAttn(lw *LayerWeights, h *compute.Tensor, positions []int32,
 		}
 	}
 
-	qn := rms(q, lw.AttnQNorm.F32, cfg.RmsEps)
+	qn := rms(q, lw.AttnQNorm, cfg.RmsEps)
 	kn, err := reshape3(kcur, hd, cfg.NHeadKV, T)
 	if err != nil {
 		return nil, err
 	}
-	kn = rms(kn, lw.AttnKNorm.F32, cfg.RmsEps)
+	kn = rms(kn, lw.AttnKNorm, cfg.RmsEps)
 	vn, err := reshape3(vcur, hd, cfg.NHeadKV, T)
 	if err != nil {
 		return nil, err
@@ -235,7 +245,7 @@ func (m *Model) fullAttn(lw *LayerWeights, h *compute.Tensor, positions []int32,
 	// Attention output is [headDim, nHead, T]; the layout is identical to
 	// [nHead*headDim, T], which is what the output projection expects.
 	attnFlat := &compute.Tensor{Dims: []int{nHead * hd, T}, Type: attn.Type, F32: attn.F32}
-	return mm(lw.AttnOutput, attnFlat)
+	return m.mm(lw.AttnOutput, attnFlat)
 }
 
 // linearAttn runs a GatedDeltaNet block on the normalized activation h.
@@ -247,30 +257,30 @@ func (m *Model) linearAttn(lw *LayerWeights, h *compute.Tensor, st *State, il in
 	nK := cfg.GroupCount
 	headKDim := cfg.DState
 
-	qkv, err := mm(lw.AttnQKV, h) // [convDim, T]
+	qkv, err := m.mm(lw.AttnQKV, h) // [convDim, T]
 	if err != nil {
 		return nil, err
 	}
-	z, err := mm(lw.AttnGate, h) // [valueDim, T]
+	z, err := m.mm(lw.AttnGate, h) // [valueDim, T]
 	if err != nil {
 		return nil, err
 	}
 
-	betaRaw, err := mm(lw.SSMBeta, h) // [dtRank, T]
+	betaRaw, err := m.mm(lw.SSMBeta, h) // [dtRank, T]
 	if err != nil {
 		return nil, err
 	}
 	beta := sigmoidInto(betaRaw)
 
-	alpha, err := mm(lw.SSMAlpha, h) // [dtRank, T]
+	alpha, err := m.mm(lw.SSMAlpha, h) // [dtRank, T]
 	if err != nil {
 		return nil, err
 	}
 	gate := compute.NewF32(1, nV, T)
 	for t := 0; t < T; t++ {
 		for hh := 0; hh < nV; hh++ {
-			a := alpha.F32[hh+t*nV] + lw.SSMDt.F32[hh]
-			gate.F32[hh+t*nV] = softplus(a) * lw.SSMA.F32[hh]
+			a := alpha.F32[hh+t*nV] + lw.SSMDt[hh]
+			gate.F32[hh+t*nV] = softplus(a) * lw.SSMA[hh]
 		}
 	}
 	betaT := compute.NewF32(1, nV, T)
@@ -334,14 +344,14 @@ func (m *Model) linearAttn(lw *LayerWeights, h *compute.Tensor, st *State, il in
 	}
 
 	// Gated normalization: norm over head dim, times silu(z).
-	norm := rms(out, lw.SSMNorm.F32, cfg.RmsEps) // [headVDim, nV, T]
+	norm := rms(out, lw.SSMNorm, cfg.RmsEps) // [headVDim, nV, T]
 	zr := &compute.Tensor{Dims: []int{headVDim, nV, T}, F32: z.F32}
 	gated, err := compute.Mul(norm, siluInto(zr))
 	if err != nil {
 		return nil, err
 	}
 	flat := &compute.Tensor{Dims: []int{cfg.ValueDim(), T}, F32: gated.F32}
-	return mm(lw.SSMOut, flat)
+	return m.mm(lw.SSMOut, flat)
 }
 
 // reshape3 views a [d*h, T] tensor as [d, h, T]. Both use GGML layout with the
