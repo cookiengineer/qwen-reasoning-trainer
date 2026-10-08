@@ -180,39 +180,26 @@ func TestDeviceModelStepReducesLoss(t *testing.T) {
 		return s
 	}
 
+	m.Checkpoint = true
+	const lr = float32(0.02)
+	opt, err := NewDeviceAdamW(v, DefaultAdamW(lr), m.AdapterLins())
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	logits, ctx, err := m.Forward(tokens)
 	if err != nil {
 		t.Fatal(err)
 	}
 	l0 := lossOf(logits)
 
-	const lr = float32(0.02)
 	for step := 0; step < 5; step++ {
 		grads, err := m.Backward(ctx, cb)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, ag := range grads {
-			dA, err := v.Download(ag.dA)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dB, err := v.Download(ag.dB)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for i := range ag.lin.lora.A.F32 {
-				ag.lin.lora.A.F32[i] -= lr * dA.F32[i]
-			}
-			for i := range ag.lin.lora.B.F32 {
-				ag.lin.lora.B.F32[i] -= lr * dB.F32[i]
-			}
-			if ag.lin.a, err = uploadReplace(v, ag.lin.a, ag.lin.lora.A); err != nil {
-				t.Fatal(err)
-			}
-			if ag.lin.b, err = uploadReplace(v, ag.lin.b, ag.lin.lora.B); err != nil {
-				t.Fatal(err)
-			}
+		if err := opt.Step(grads, lr); err != nil {
+			t.Fatal(err)
 		}
 		logits, ctx, err = m.Forward(tokens)
 		if err != nil {
@@ -224,6 +211,51 @@ func TestDeviceModelStepReducesLoss(t *testing.T) {
 	if !(l1 < l0) {
 		t.Fatalf("loss did not decrease: %g -> %g", l0, l1)
 	}
+}
+
+// TestDeviceTrainerReducesLoss runs the resident DeviceTrainer with gradient
+// accumulation and global-norm clipping and checks the loss falls.
+func TestDeviceTrainerReducesLoss(t *testing.T) {
+	v, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer v.Close()
+
+	cfg := tinyCfg()
+	w := qwen38.NewRandom(cfg, 456)
+	loCfg := LoRAConfig{Rank: 3, Alpha: 6, Targets: DefaultLoRA().Targets}
+	m, err := NewDeviceModel(v, cfg, w, loCfg, 600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Checkpoint = true
+	opt, err := NewDeviceAdamW(v, DefaultAdamW(0.03), m.AdapterLins())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tokens := []int32{1, 2, 3, 4, 5, 6, 7, 8}
+	mask := make([]bool, len(tokens))
+	for i := range mask {
+		mask[i] = true
+	}
+	data := []Example{{Tokens: tokens, LossMask: mask}}
+
+	tr := &DeviceTrainer{Model: m, Opt: opt, Cfg: DeviceTrainerConfig{
+		Steps: 4, Accum: 2, MaxGradNorm: 1.0,
+	}}
+	hist, err := tr.Run(data, func(step int) float32 { return 0.03 }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 4 {
+		t.Fatalf("expected 4 steps, got %d", len(hist))
+	}
+	if !(hist[len(hist)-1] < hist[0]) {
+		t.Fatalf("loss did not decrease: %g -> %g", hist[0], hist[len(hist)-1])
+	}
+	t.Logf("trainer loss: %.5f -> %.5f", hist[0], hist[len(hist)-1])
 }
 
 func TestDeviceModelTiming(t *testing.T) {
@@ -475,4 +507,187 @@ func TestDeviceModel64Layers(t *testing.T) {
 		t.Fatalf("expected %d adapters, got %d", 48*6+16*7, len(grads))
 	}
 	t.Logf("64-layer model: loss=%.4f adapters=%d device_bytes=%.0fMB", loss, len(grads), float64(v.Stats().DeviceBytes)/1e6)
+}
+
+func TestDeviceModelCheckpointMemory(t *testing.T) {
+	cfg := midCfg()
+	cfg.NLayer = 8
+	types := make([]modelcfg.LayerType, 8)
+	for i := range types {
+		if (i+1)%4 == 0 {
+			types[i] = modelcfg.LayerFullAttention
+		} else {
+			types[i] = modelcfg.LayerLinearAttention
+		}
+	}
+	cfg.LayerTypes = types
+	w := qwen38.NewRandom(cfg, 111)
+	loCfg := LoRAConfig{Rank: 8, Alpha: 16, Targets: DefaultLoRA().Targets}
+
+	run := func(checkpoint bool) uint64 {
+		v, err := vulkan.New()
+		if err != nil {
+			t.Skipf("vulkan unavailable: %v", err)
+		}
+		defer v.Close()
+		m, err := NewDeviceModel(v, cfg, w, loCfg, 222)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.Checkpoint = checkpoint
+		const T = 64
+		tokens := make([]int32, T)
+		for i := range tokens {
+			tokens[i] = int32(1 + i%16)
+		}
+		targets := make([]int32, T)
+		for i := range targets {
+			targets[i] = int32((i + 2) % cfg.NVocab)
+		}
+		v.Sync()
+		v.ResetStats()
+		logits, ctx, err := m.Forward(tokens)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, dLogits, err := m.Loss(logits, targets, -100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Backward(ctx, dLogits); err != nil {
+			t.Fatal(err)
+		}
+		v.Sync()
+		return v.Stats().PeakDeviceBytes
+	}
+
+	plain := run(false)
+	ckpt := run(true)
+	t.Logf("peak device bytes: plain=%.2fMB checkpoint=%.2fMB", float64(plain)/1e6, float64(ckpt)/1e6)
+	if ckpt >= plain {
+		t.Fatalf("checkpoint did not reduce peak memory: %d >= %d", ckpt, plain)
+	}
+}
+
+// TestDeviceTrainMatchesHost runs one optimizer step on the resident device
+// path and the host autograd path from identical adapter parameters and checks
+// the loss and the updated parameters agree.
+func TestDeviceTrainMatchesHost(t *testing.T) {
+	v, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer v.Close()
+
+	cfg := tinyCfg()
+	w := qwen38.NewRandom(cfg, 246)
+	loCfg := LoRAConfig{Rank: 3, Alpha: 6, Targets: DefaultLoRA().Targets}
+	host := NewQwenModel(cfg, w, loCfg, 1)
+	dev, err := NewDeviceModel(v, cfg, w, loCfg, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev.Checkpoint = true
+
+	// Align the device adapters with the host adapters by weight pointer.
+	hadapt := host.Adapters()
+	for _, l := range dev.AdapterLins() {
+		hl := hadapt[l.w]
+		if hl == nil {
+			t.Fatalf("no host adapter for %s", l.name)
+		}
+		copy(l.lora.A.F32, hl.A.F32)
+		copy(l.lora.B.F32, hl.B.F32)
+		if l.a, err = uploadReplace(v, l.a, l.lora.A); err != nil {
+			t.Fatal(err)
+		}
+		if l.b, err = uploadReplace(v, l.b, l.lora.B); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tokens := []int32{1, 2, 3, 4, 5, 6}
+	mask := make([]bool, len(tokens))
+	for i := range mask {
+		mask[i] = true
+	}
+	ex := Example{Tokens: tokens, LossMask: mask}
+
+	const lr = float32(0.01)
+	hopt := NewAdamW(DefaultAdamW(lr), host.Params())
+	hloss, hgrads, err := host.ForwardBackward(ex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Validate the whole training forward+loss+backward against the host graph
+	// by comparing the gradients per adapter (tightly), before any update.
+	hp := host.Params()
+	hpos := map[*compute.Tensor]int{}
+	for i, p := range hp {
+		hpos[p] = i
+	}
+	tk, tg := exampleTargets(ex)
+	lg, cx, err := dev.Forward(tk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dloss, dlogits, err := dev.Loss(lg, tg, -100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := math.Abs(float64(dloss - hloss)); d > 1e-3 {
+		t.Fatalf("loss mismatch: device %g host %g", dloss, hloss)
+	}
+	dgrads, err := dev.Backward(cx, dlogits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string][2][]float32{}
+	for _, ag := range dgrads {
+		dA, _ := v.Download(ag.dA)
+		dB, _ := v.Download(ag.dB)
+		byName[ag.lin.name] = [2][]float32{dA.F32, dB.F32}
+	}
+	for _, l := range dev.AdapterLins() {
+		hl := hadapt[l.w]
+		g := byName[l.name]
+		if d := maxAbsDiff(g[0], hgrads[hpos[hl.A]].F32); d > 3e-3 {
+			t.Fatalf("%s.A gradient mismatch: %g", l.name, d)
+		}
+		if d := maxAbsDiff(g[1], hgrads[hpos[hl.B]].F32); d > 3e-3 {
+			t.Fatalf("%s.B gradient mismatch: %g", l.name, d)
+		}
+	}
+
+	// One optimizer step on both paths. Adam amplifies near-zero gradient
+	// entries to +-lr, so the post-step tolerance accommodates a sign flip.
+	hopt.Step(host.Params(), hgrads)
+	dopt, err := NewDeviceAdamW(v, DefaultAdamW(lr), dev.AdapterLins())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dtr := &DeviceTrainer{Model: dev, Opt: dopt, Cfg: DeviceTrainerConfig{Steps: 1, Accum: 1}}
+	hist, err := dtr.Run([]Example{ex}, func(int) float32 { return lr }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := math.Abs(float64(hist[0] - hloss)); d > 1e-3 {
+		t.Fatalf("step loss mismatch: device %g host %g", hist[0], hloss)
+	}
+	if err := dev.SyncAdapters(); err != nil {
+		t.Fatal(err)
+	}
+	tol := 3*float64(lr) + 1e-4
+	checked := 0
+	for _, l := range dev.AdapterLins() {
+		hl := hadapt[l.w]
+		if d := maxAbsDiff(hl.A.F32, l.lora.A.F32); d > tol {
+			t.Fatalf("%s.A mismatch after step: %g", l.name, d)
+		}
+		if d := maxAbsDiff(hl.B.F32, l.lora.B.F32); d > tol {
+			t.Fatalf("%s.B mismatch after step: %g", l.name, d)
+		}
+		checked++
+	}
+	t.Logf("device/host step match: loss %.5f, %d adapters", hist[0], checked)
 }

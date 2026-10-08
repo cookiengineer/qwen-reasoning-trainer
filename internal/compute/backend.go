@@ -86,6 +86,19 @@ func (b BinaryOp) String() string {
 	}
 }
 
+// AdamWParams holds the hyperparameters for one AdamW step plus the
+// bias-correction factors for the current step index t:
+// Beta1Hat = 1/(1-beta1^t), Beta2Hat = 1/(1-beta2^t).
+type AdamWParams struct {
+	Alpha       float32 // learning rate
+	Beta1       float32
+	Beta2       float32
+	Eps         float32
+	WeightDecay float32
+	Beta1Hat    float32
+	Beta2Hat    float32
+}
+
 // Buffer is an opaque handle to tensor storage owned by a Backend.
 type Buffer interface {
 	Dims() []int
@@ -105,6 +118,13 @@ type Backend interface {
 	Free(b Buffer)
 	Sync() error
 	Close() error
+
+	// BeginScope/EndScope bound the lifetime of temporary buffers. EndScope
+	// frees every buffer allocated since the matching BeginScope except the
+	// `keep` buffers. Backends without a device allocator implement them as
+	// no-ops.
+	BeginScope()
+	EndScope(keep ...Buffer)
 
 	Unary(op UnaryOp, a Buffer) (Buffer, error)
 	Binary(op BinaryOp, a, b Buffer) (Buffer, error)
@@ -175,4 +195,12 @@ type Backend interface {
 	// MatMulWeightGrad computes the weight gradient dW = x . dOut^T:
 	// x [In,M], dOut [Out,M] -> dW [In,Out].
 	MatMulWeightGrad(x, dOut Buffer) (Buffer, error)
+
+	// AdamWStep applies one decoupled-weight-decay AdamW update to param in
+	// place, updating the first/second moment buffers m and v. param, grad, m
+	// and v must have the same element count; grad is read-only.
+	AdamWStep(param, grad, m, v Buffer, p AdamWParams) error
+	// SumSquares adds sum(src[i]^2) to dst[0]. dst is a single-element float32
+	// buffer; src is read-only. Used for global gradient-norm clipping.
+	SumSquares(dst, src Buffer) error
 }

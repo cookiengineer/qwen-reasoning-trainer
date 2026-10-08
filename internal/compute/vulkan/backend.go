@@ -83,6 +83,12 @@ func (b *Backend) Free(buf compute.Buffer) {
 	if !ok || x == nil || x.shared {
 		return
 	}
+	// Drop the buffer from its allocation-scope log so EndScope does not free a
+	// buffer the owning op already released.
+	if x.scopeIdx >= 0 && x.scopeIdx < len(b.scopeLog) && b.scopeLog[x.scopeIdx] == x {
+		b.scopeLog[x.scopeIdx] = nil
+	}
+	x.scopeIdx = -1
 	if b.recording {
 		b.pending = append(b.pending, x)
 		return
@@ -203,6 +209,54 @@ func (b *Backend) Scale(a compute.Buffer, s float32) (compute.Buffer, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// AdamWStep implements compute.Backend.
+func (b *Backend) AdamWStep(param, grad, m, v compute.Buffer, p compute.AdamWParams) error {
+	x, err := asBuffer(param)
+	if err != nil {
+		return err
+	}
+	g, err := asBuffer(grad)
+	if err != nil {
+		return err
+	}
+	gm, err := asBuffer(m)
+	if err != nil {
+		return err
+	}
+	gv, err := asBuffer(v)
+	if err != nil {
+		return err
+	}
+	n := uint32(x.NumElements())
+	if g.NumElements() != int(n) || gm.NumElements() != int(n) || gv.NumElements() != int(n) {
+		return compute.ErrShape
+	}
+	groups := [3]uint32{ceilDiv(n, 64), 1, 1}
+	return b.dispatch("opt_step_adamw", []*buffer{x, g, gm, gv},
+		push(n, p.Alpha, p.Beta1, p.Beta2, p.Eps, p.WeightDecay, p.Beta1Hat, p.Beta2Hat), groups)
+}
+
+// SumSquares implements compute.Backend.
+func (b *Backend) SumSquares(dst, src compute.Buffer) error {
+	d, err := asBuffer(dst)
+	if err != nil {
+		return err
+	}
+	s, err := asBuffer(src)
+	if err != nil {
+		return err
+	}
+	if d.NumElements() < 1 {
+		return compute.ErrShape
+	}
+	n := uint32(s.NumElements())
+	groups := [3]uint32{ceilDiv(n, 256), 1, 1}
+	if groups[0] == 0 {
+		groups[0] = 1
+	}
+	return b.dispatch("sum_squares", []*buffer{s, d}, push(n, uint32(0)), groups)
 }
 
 // Binary implements compute.Backend.

@@ -596,6 +596,8 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	adapterOut := fs.String("adapter-out", "", "LoRA adapter checkpoint path")
 	valRatio := fs.Float64("val-ratio", 0.0, "validation split ratio (0 = train on all)")
 	subagents := fs.Bool("include-subagents", false, "include the subagents/ tree")
+	device := fs.Bool("device", false, "train with the device-resident Vulkan graph")
+	checkpoint := fs.Bool("checkpoint", true, "activation checkpointing (device path)")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
@@ -671,10 +673,19 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	}
 	trainSet, valSet := dataset.Split(exs, *valRatio)
 	data := toTrain(trainSet)
+	valData := toTrain(valSet)
 
 	loCfg := train.DefaultLoRA()
 	loCfg.Rank = *rank
 	loCfg.Alpha = float32(*alpha)
+
+	if *device {
+		return runDeviceTrain(cfg, g, w, loCfg, data, valData, stdout, stderr, deviceTrainOpts{
+			steps: *steps, accum: *accum, warmup: *warmup, maxGrad: *maxGrad, lr: *lr,
+			seed: *seed, checkpoint: *checkpoint, adapterOut: *adapterOut, out: *out,
+		})
+	}
+
 	tm := train.NewQwenModel(w.Cfg, w, loCfg, uint64(*seed))
 	fmt.Fprintf(stderr, "training: %d examples (%d val), %d adapters, %d trainable tensors\n",
 		len(data), len(valSet), len(tm.Adapters()), len(tm.Params()))
@@ -715,6 +726,92 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(stdout, "wrote merged model: %s\n", *out)
+	}
+	return 0
+}
+
+// deviceTrainOpts bundles the flags shared by the host and device train paths.
+type deviceTrainOpts struct {
+	steps, accum, warmup int
+	maxGrad, lr          float64
+	seed                 int64
+	checkpoint           bool
+	adapterOut, out      string
+}
+
+// deviceTrainHeadroomBytes is reserved on top of the model size when deciding
+// whether a GPU can host a resident training run (F32 adapters, their AdamW
+// moments and checkpointed activations).
+const deviceTrainHeadroomBytes = 3 << 30
+
+// runDeviceTrain runs the fully-resident Vulkan QLoRA training path.
+func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.LoRAConfig, data, valData []train.Example, stdout, stderr io.Writer, o deviceTrainOpts) int {
+	need := modelBytes(g) + deviceTrainHeadroomBytes
+	be := resolveGPU(need, cfg, stderr)
+	if be == nil {
+		fmt.Fprintf(stderr, "error: --device requested but no Vulkan device with ~%s of memory is available\n", humanBytes(int64(need)))
+		return 1
+	}
+	defer be.Close()
+
+	dm, err := train.NewDeviceModel(be, w.Cfg, w, loCfg, uint64(o.seed))
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	dm.Checkpoint = o.checkpoint
+	opt, err := train.NewDeviceAdamW(be, train.DefaultAdamW(float32(o.lr)), dm.AdapterLins())
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "device training: %d examples (%d val), %d adapters\n",
+		len(data), len(valData), len(dm.AdapterLins()))
+	if len(valData) > 0 {
+		if vl, err := dm.EvalLoss(valData); err == nil {
+			fmt.Fprintf(stderr, "val loss before: %.4f\n", vl)
+		}
+	}
+
+	tr := &train.DeviceTrainer{
+		Model: dm, Opt: opt,
+		Cfg: train.DeviceTrainerConfig{Steps: o.steps, Accum: o.accum, MaxGradNorm: float32(o.maxGrad)},
+	}
+	sched := train.CosineSchedule(float32(o.lr), float32(o.lr)*0.1, o.warmup, o.steps)
+	hist, err := tr.Run(data, sched, func(step int, loss float32) {
+		if cfg.LogLevel != "quiet" {
+			fmt.Fprintf(stderr, "step %d/%d: loss %.4f lr %.2e\n", step+1, o.steps, loss, sched(step))
+		}
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "steps: %d\n", len(hist))
+	fmt.Fprintf(stdout, "initial_loss: %.4f\n", hist[0])
+	fmt.Fprintf(stdout, "final_loss: %.4f\n", hist[len(hist)-1])
+	if len(valData) > 0 {
+		if vl, err := dm.EvalLoss(valData); err == nil {
+			fmt.Fprintf(stdout, "val_loss: %.4f\n", vl)
+		}
+	}
+	if o.adapterOut != "" {
+		if err := dm.SyncAdapters(); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		if err := train.SaveCheckpoint(o.adapterOut, dm.Params()); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "wrote adapters: %s\n", o.adapterOut)
+	}
+	if o.out != "" {
+		if err := dm.WriteMerged(g, o.out); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "wrote merged model: %s\n", o.out)
 	}
 	return 0
 }

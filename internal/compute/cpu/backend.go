@@ -54,6 +54,13 @@ func (b *Backend) Free(buf compute.Buffer) {}
 // Sync implements compute.Backend.
 func (b *Backend) Sync() error { return nil }
 
+// BeginScope implements compute.Backend. The CPU backend relies on Go garbage
+// collection, so scopes are no-ops.
+func (b *Backend) BeginScope() {}
+
+// EndScope implements compute.Backend.
+func (b *Backend) EndScope(keep ...compute.Buffer) {}
+
 // Close implements compute.Backend.
 func (b *Backend) Close() error { return nil }
 
@@ -1085,6 +1092,64 @@ func (b *Backend) GetRowsWeight(w compute.Buffer, indices []int32) (compute.Buff
 		}
 	}
 	return wrap(out), nil
+}
+
+// AdamWStep implements compute.Backend: the reference for the device optimizer.
+func (b *Backend) AdamWStep(param, grad, m, v compute.Buffer, p compute.AdamWParams) error {
+	tp, err := tensor(param)
+	if err != nil {
+		return err
+	}
+	tg, err := tensor(grad)
+	if err != nil {
+		return err
+	}
+	tm, err := tensor(m)
+	if err != nil {
+		return err
+	}
+	tv, err := tensor(v)
+	if err != nil {
+		return err
+	}
+	if len(tp.F32) != len(tg.F32) || len(tm.F32) != len(tg.F32) || len(tv.F32) != len(tg.F32) {
+		return compute.ErrShape
+	}
+	b1, b2 := float64(p.Beta1), float64(p.Beta2)
+	alpha, eps, wd := float64(p.Alpha), float64(p.Eps), float64(p.WeightDecay)
+	b1h, b2h := float64(p.Beta1Hat), float64(p.Beta2Hat)
+	for i := range tg.F32 {
+		gi := float64(tg.F32[i])
+		gmi := float64(tm.F32[i])*b1 + gi*(1-b1)
+		gvi := float64(tv.F32[i])*b2 + gi*gi*(1-b2)
+		tm.F32[i] = float32(gmi)
+		tv.F32[i] = float32(gvi)
+		mh := gmi * b1h
+		vh := math.Sqrt(gvi*b2h) + eps
+		tp.F32[i] = float32(float64(tp.F32[i])*(1-alpha*wd) - alpha*mh/vh)
+	}
+	return nil
+}
+
+// SumSquares implements compute.Backend.
+func (b *Backend) SumSquares(dst, src compute.Buffer) error {
+	td, err := tensor(dst)
+	if err != nil {
+		return err
+	}
+	ts, err := tensor(src)
+	if err != nil {
+		return err
+	}
+	if len(td.F32) < 1 {
+		return compute.ErrShape
+	}
+	var ss float64
+	for _, x := range ts.F32 {
+		ss += float64(x) * float64(x)
+	}
+	td.F32[0] += float32(ss)
+	return nil
 }
 
 // CrossEntropy implements compute.Backend.

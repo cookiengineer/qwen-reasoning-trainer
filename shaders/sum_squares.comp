@@ -1,0 +1,43 @@
+#version 450
+
+// Adds sum(x[i]^2) over the input to a single-element accumulator (atomicAdd).
+// Used to compute the global gradient norm for clipping without a host round
+// trip of the gradients.
+
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer In  { float x[];   };
+layout(binding = 1)          buffer Out { float sum[]; };
+
+layout(push_constant) uniform P {
+    uint n;
+    uint pad;
+} p;
+
+shared float red[256];
+
+void main() {
+    uint gid = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * 256u;
+
+    float acc = 0.0;
+    for (uint i = gid * 256u + lane; i < p.n; i += stride) {
+        float v = x[i];
+        acc += v * v;
+    }
+
+    red[lane] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] += red[lane + s];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        atomicAdd(sum[0], red[0]);
+    }
+}

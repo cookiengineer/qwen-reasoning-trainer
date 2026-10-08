@@ -585,6 +585,14 @@ type Backend struct {
 	pool        map[poolKey][]*buffer
 	poolBytes   uint64
 	deviceBytes uint64
+	peakBytes   uint64
+
+	// scope bounds the lifetime of temporary buffers. Buffers allocated while
+	// a scope is active are logged; EndScope frees the log tail except the
+	// retained buffers. Used to reclaim per-layer recompute temporaries.
+	scopeActive int
+	scopeMarks  []int
+	scopeLog    []*buffer
 
 	stats Stats
 }
@@ -600,6 +608,7 @@ type Stats struct {
 	BytesDownloaded uint64
 	PooledBytes     uint64
 	DeviceBytes     uint64
+	PeakDeviceBytes uint64
 }
 
 type poolKey struct {
@@ -625,9 +634,13 @@ type buffer struct {
 	// shared marks a non-owning view produced by Reshape; Free is a no-op and
 	// the underlying buffer is owned by the original allocation.
 	shared bool
-	size   uint64
-	dims   []int
-	typ    quant.Type
+	// scopeIdx is the buffer's slot in the active allocation scope log, or -1
+	// when it is not tracked. Free clears the slot so EndScope does not free a
+	// buffer the owning op already released.
+	scopeIdx int
+	size     uint64
+	dims     []int
+	typ      quant.Type
 }
 
 func (x *buffer) Dims() []int { return x.dims }
@@ -895,6 +908,8 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	if buf, ok := b.poolGet(poolKey{size: size, usage: usage, staging: hostOnly}); ok {
 		buf.dims = nil
 		buf.typ = quant.TypeF32
+		buf.scopeIdx = -1
+		b.trackAlloc(buf)
 		return buf, nil
 	}
 	b.stats.Allocs++
@@ -956,7 +971,58 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 		}
 	}
 	b.deviceBytes += req.size
-	return &buffer{b: b, buf: buf, mem: mem, mapped: mapped, hostVisible: hostVisible, usage: usage, staging: hostOnly, size: size, typ: quant.TypeF32}, nil
+	if b.deviceBytes > b.peakBytes {
+		b.peakBytes = b.deviceBytes
+	}
+	out := &buffer{b: b, buf: buf, mem: mem, mapped: mapped, hostVisible: hostVisible, usage: usage, staging: hostOnly, scopeIdx: -1, size: size, typ: quant.TypeF32}
+	b.trackAlloc(out)
+	return out, nil
+}
+
+// trackAlloc records a buffer allocated while a scope is active.
+func (b *Backend) trackAlloc(x *buffer) {
+	if b.scopeActive > 0 {
+		x.scopeIdx = len(b.scopeLog)
+		b.scopeLog = append(b.scopeLog, x)
+	}
+}
+
+// BeginScope implements compute.Backend.
+func (b *Backend) BeginScope() {
+	b.scopeMarks = append(b.scopeMarks, len(b.scopeLog))
+	b.scopeActive++
+}
+
+// EndScope implements compute.Backend. It frees every buffer allocated since
+// the matching BeginScope except those in keep. Buffers freed while recording
+// are released on the next flush; callers must Sync before relying on the
+// memory being reclaimed.
+func (b *Backend) EndScope(keep ...compute.Buffer) {
+	if b.scopeActive == 0 {
+		return
+	}
+	b.scopeActive--
+	mark := b.scopeMarks[len(b.scopeMarks)-1]
+	b.scopeMarks = b.scopeMarks[:len(b.scopeMarks)-1]
+	keepSet := make(map[*buffer]bool, len(keep))
+	for _, k := range keep {
+		if kb, ok := k.(*buffer); ok {
+			keepSet[kb] = true
+		}
+	}
+	victims := append([]*buffer(nil), b.scopeLog[mark:]...)
+	b.scopeLog = b.scopeLog[:mark]
+	for _, x := range victims {
+		if x == nil {
+			continue
+		}
+		if x.scopeIdx >= mark {
+			x.scopeIdx = -1
+		}
+		if !keepSet[x] {
+			b.Free(x)
+		}
+	}
 }
 
 // poolGet returns a recycled buffer of the given key, if any.
@@ -993,14 +1059,17 @@ func (b *Backend) Stats() Stats {
 	s := b.stats
 	s.PooledBytes = b.poolBytes
 	s.DeviceBytes = b.deviceBytes
+	s.PeakDeviceBytes = b.peakBytes
 	return s
 }
 
-// ResetStats clears the device activity counters.
+// ResetStats clears the device activity counters. The peak byte gauge is reset
+// to the current live size so subsequent measurements are relative to it.
 func (b *Backend) ResetStats() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.stats = Stats{}
+	b.peakBytes = b.deviceBytes
 }
 
 func (b *Backend) memoryType(bits, flags uint32) (uint32, bool) {

@@ -16,6 +16,9 @@ type devLin struct {
 	lora  *LoRA
 	a, b  compute.Buffer
 	scale float32
+	// name is the GGUF tensor name of the frozen base weight, used to key the
+	// merged overrides (e.g. "blk.3.attn_q.weight").
+	name string
 }
 
 func newDevLin(be compute.Backend, w *qwen38.Weight, loCfg LoRAConfig, seed uint64) (devLin, error) {

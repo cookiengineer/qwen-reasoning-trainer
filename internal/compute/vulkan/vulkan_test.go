@@ -1131,3 +1131,69 @@ func TestVulkanCrossEntropy(t *testing.T) {
 		t.Fatalf("dLogits vs oracle: max diff %g", d)
 	}
 }
+
+func TestVulkanAdamWStep(t *testing.T) {
+	c, v := newBackends(t)
+	const n = 137
+	param := make([]float32, n)
+	grad := make([]float32, n)
+	for i := range param {
+		param[i] = float32(i)*0.01 - 0.5
+		grad[i] = float32(math.Sin(float64(i))) * 0.3
+	}
+	p := compute.AdamWParams{
+		Alpha: 1e-3, Beta1: 0.9, Beta2: 0.999, Eps: 1e-8, WeightDecay: 0.01,
+		Beta1Hat: float32(1 / (1 - 0.9)), Beta2Hat: float32(1 / (1 - 0.999)),
+	}
+	run := func(b compute.Backend) (paramOut, m, vv []float32) {
+		pb := up(t, b, []int{n}, append([]float32(nil), param...))
+		gb := up(t, b, []int{n}, append([]float32(nil), grad...))
+		mb, err := b.Upload(compute.NewF32(n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		vb, err := b.Upload(compute.NewF32(n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.AdamWStep(pb, gb, mb, vb, p); err != nil {
+			t.Fatal(err)
+		}
+		return down(t, b, pb), down(t, b, mb), down(t, b, vb)
+	}
+	cP, cM, cV := run(c)
+	vP, vM, vV := run(v)
+	compare(t, "adamw param", vP, cP)
+	compare(t, "adamw m", vM, cM)
+	compare(t, "adamw v", vV, cV)
+}
+
+func TestVulkanSumSquares(t *testing.T) {
+	c, v := newBackends(t)
+	for _, n := range []int{1, 255, 256, 1000, 4097, 65536} {
+		data := make([]float32, n)
+		for i := range data {
+			data[i] = float32(math.Sin(float64(i) * 0.1))
+		}
+		run := func(b compute.Backend) float32 {
+			src := up(t, b, []int{n}, data)
+			dst, err := b.Upload(compute.NewF32(1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := b.SumSquares(dst, src); err != nil {
+				t.Fatal(err)
+			}
+			return down(t, b, dst)[0]
+		}
+		got := run(v)
+		want := run(c)
+		tol := 1e-3 * float32(math.Abs(float64(want)))
+		if tol < 1e-4 {
+			tol = 1e-4
+		}
+		if d := float32(math.Abs(float64(got - want))); d > tol {
+			t.Fatalf("sum_squares n=%d: got %v want %v (diff %v)", n, got, want, d)
+		}
+	}
+}
