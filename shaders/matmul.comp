@@ -1,6 +1,11 @@
 #version 450
 
-layout(local_size_x = 64) in;
+// Tiled float32 GEMM: C[n,m] = sum_k A[n,k] * B[m,k], where A is a weight
+// matrix [K,N] and B an activation [K,M] in GGML layout. Each 16x16 workgroup
+// stages tiles of A and B in shared memory so every loaded value is reused
+// across the opposite dimension.
+
+layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(binding = 0) readonly  buffer A { float a[]; };
 layout(binding = 1) readonly  buffer B { float b[]; };
@@ -10,22 +15,37 @@ layout(push_constant) uniform P {
     uint K;
     uint N;
     uint M;
-    uint base;
+    uint pad;
 } p;
 
+shared float As[16][17];
+shared float Bs[16][17];
+
 void main() {
-    uint idx = p.base + gl_GlobalInvocationID.x;
-    uint total = p.N * p.M;
-    if (idx >= total) {
-        return;
-    }
-    uint n = idx % p.N;
-    uint m = idx / p.N;
-    uint aBase = n * p.K;
-    uint bBase = m * p.K;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint n0 = gl_WorkGroupID.x * 16u;
+    uint m0 = gl_WorkGroupID.y * 16u;
+
     float acc = 0.0;
-    for (uint k = 0; k < p.K; k++) {
-        acc += a[aBase + k] * b[bBase + k];
+    for (uint k0 = 0u; k0 < p.K; k0 += 16u) {
+        uint n = n0 + ty;
+        uint k = k0 + tx;
+        As[ty][tx] = (n < p.N && k < p.K) ? a[n * p.K + k] : 0.0;
+
+        uint m = m0 + ty;
+        Bs[ty][tx] = (m < p.M && k < p.K) ? b[m * p.K + k] : 0.0;
+
+        barrier();
+        for (uint i = 0u; i < 16u; i++) {
+            acc += As[ty][i] * Bs[tx][i];
+        }
+        barrier();
     }
-    c[m * p.N + n] = acc;
+
+    uint n = n0 + ty;
+    uint m = m0 + tx;
+    if (n < p.N && m < p.M) {
+        c[m * p.N + n] = acc;
+    }
 }

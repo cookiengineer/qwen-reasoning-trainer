@@ -479,6 +479,12 @@ type Backend struct {
 	// maxScratchFloats bounds the float32 dequant scratch. It is overridable
 	// in tests to exercise the row-blocking path.
 	maxScratchFloats int
+
+	// recording is true while compute commands are being recorded into the
+	// command buffer but not yet submitted. pending holds buffers freed while
+	// recording; they are destroyed after the next flush.
+	recording bool
+	pending   []*buffer
 }
 
 type buffer struct {
@@ -692,11 +698,11 @@ func (b *Backend) setupDescriptors() error {
 		return fmt.Errorf("vulkan: create pipeline layout failed")
 	}
 
-	poolSize := descriptorPoolSize{typ: vkDescriptorTypeStorage, descriptorCount: 4}
+	poolSize := descriptorPoolSize{typ: vkDescriptorTypeStorage, descriptorCount: 4 * 8192}
 	dpci := descriptorPoolCreateInfo{
 		sType:         vkStructureDescriptorPoolCi,
 		flags:         vkDescriptorPoolFreeSet,
-		maxSets:       1,
+		maxSets:       8192,
 		poolSizeCount: 1,
 		pPoolSizes:    uintptr(unsafe.Pointer(&poolSize)),
 	}
@@ -802,16 +808,65 @@ func (b *Backend) pipeline(name string) (uintptr, error) {
 	return pipe, nil
 }
 
-// dispatch runs a compute pipeline with the given bindings and push constants.
+// beginBatch starts recording compute commands if not already recording.
+func (b *Backend) beginBatch() error {
+	if b.recording {
+		return nil
+	}
+	if res := vkCall(b.vk.ResetDescriptorPool, b.device, b.descPool, 0); res != vkSuccess {
+		return fmt.Errorf("vulkan: reset descriptor pool failed")
+	}
+	if res := vkCall(b.vk.ResetCommandBuffer, b.cmdBuffer, 0); res != vkSuccess {
+		return fmt.Errorf("vulkan: reset command buffer failed")
+	}
+	begin := commandBufferBeginInfo{sType: vkStructureCommandBufferBeginInfo, flags: vkCommandBufferUsageOneTime}
+	if res := vkCall(b.vk.BeginCommandBuffer, b.cmdBuffer, uintptr(unsafe.Pointer(&begin))); res != vkSuccess {
+		return fmt.Errorf("vulkan: begin command buffer failed")
+	}
+	b.recording = true
+	return nil
+}
+
+// flush submits and waits for all recorded commands, then releases buffers that
+// were freed during recording.
+func (b *Backend) flush() error {
+	if b.recording {
+		if res := vkCall(b.vk.EndCommandBuffer, b.cmdBuffer); res != vkSuccess {
+			return fmt.Errorf("vulkan: end command buffer failed")
+		}
+		submit := submitInfo{
+			sType:              vkStructureSubmitInfo,
+			commandBufferCount: 1,
+			pCommandBuffers:    uintptr(unsafe.Pointer(&b.cmdBuffer)),
+		}
+		if res := vkCall(b.vk.ResetFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence))); res != vkSuccess {
+			return fmt.Errorf("vulkan: reset fence failed")
+		}
+		if res := vkCall(b.vk.QueueSubmit, b.queue, 1, uintptr(unsafe.Pointer(&submit)), b.fence); res != vkSuccess {
+			return fmt.Errorf("vulkan: queue submit failed")
+		}
+		if res := vkCall(b.vk.WaitForFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence)), 1, ^uintptr(0)); res != vkSuccess {
+			return fmt.Errorf("vulkan: wait for fence failed")
+		}
+		b.recording = false
+	}
+	for _, x := range b.pending {
+		b.destroyBuffer(x)
+	}
+	b.pending = b.pending[:0]
+	return nil
+}
+
+// dispatch records a compute dispatch into the current batch.
 func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups [3]uint32) error {
 	pipe, err := b.pipeline(name)
 	if err != nil {
 		return err
 	}
-
-	if res := vkCall(b.vk.ResetDescriptorPool, b.device, b.descPool, 0); res != vkSuccess {
-		return fmt.Errorf("vulkan: reset descriptor pool failed")
+	if err := b.beginBatch(); err != nil {
+		return err
 	}
+
 	dsai := descriptorSetAllocateInfo{
 		sType:              vkStructureDescriptorSetAi,
 		descriptorPool:     b.descPool,
@@ -844,14 +899,6 @@ func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups 
 	}
 	vkCall(b.vk.UpdateDescriptorSets, b.device, uintptr(len(writes)), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
 
-	// Record.
-	if res := vkCall(b.vk.ResetCommandBuffer, b.cmdBuffer, 0); res != vkSuccess {
-		return fmt.Errorf("vulkan: reset command buffer failed")
-	}
-	begin := commandBufferBeginInfo{sType: vkStructureCommandBufferBeginInfo, flags: vkCommandBufferUsageOneTime}
-	if res := vkCall(b.vk.BeginCommandBuffer, b.cmdBuffer, uintptr(unsafe.Pointer(&begin))); res != vkSuccess {
-		return fmt.Errorf("vulkan: begin command buffer failed")
-	}
 	vkCall(b.vk.CmdBindPipeline, b.cmdBuffer, vkPipelineBindPointCompute, pipe)
 	vkCall(b.vk.CmdBindDescriptorSets, b.cmdBuffer, vkPipelineBindPointCompute, b.pipeLayout, 0, 1, uintptr(unsafe.Pointer(&set)), 0, 0)
 	if len(push) > 0 {
@@ -860,28 +907,64 @@ func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups 
 	vkCall(b.vk.CmdDispatch, b.cmdBuffer, uintptr(groups[0]), uintptr(groups[1]), uintptr(groups[2]))
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
-		srcAccessMask: vkAccessShaderWrite,
+		srcAccessMask: vkAccessShaderRead | vkAccessShaderWrite,
 		dstAccessMask: vkAccessShaderRead | vkAccessShaderWrite,
 	}
 	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageCompute, vkPipelineStageCompute, 0, 1, uintptr(unsafe.Pointer(&barrier)), 0, 0, 0, 0)
-	if res := vkCall(b.vk.EndCommandBuffer, b.cmdBuffer); res != vkSuccess {
-		return fmt.Errorf("vulkan: end command buffer failed")
-	}
+	return nil
+}
 
-	submit := submitInfo{
-		sType:              vkStructureSubmitInfo,
-		commandBufferCount: 1,
-		pCommandBuffers:    uintptr(unsafe.Pointer(&b.cmdBuffer)),
+// copyRows records a copy of a [rows,m] block into dst [outRows,m] starting at
+// row rowOffset.
+func (b *Backend) copyRows(dst, src *buffer, rows, m, outRows, rowOffset int) error {
+	if err := b.beginBatch(); err != nil {
+		return err
 	}
-	if res := vkCall(b.vk.ResetFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence))); res != vkSuccess {
-		return fmt.Errorf("vulkan: reset fence failed")
+	pipe, err := b.pipeline("copy_rows")
+	if err != nil {
+		return err
 	}
-	if res := vkCall(b.vk.QueueSubmit, b.queue, 1, uintptr(unsafe.Pointer(&submit)), b.fence); res != vkSuccess {
-		return fmt.Errorf("vulkan: queue submit failed")
+	dsai := descriptorSetAllocateInfo{
+		sType:              vkStructureDescriptorSetAi,
+		descriptorPool:     b.descPool,
+		descriptorSetCount: 1,
+		pSetLayouts:        uintptr(unsafe.Pointer(&b.descLayout)),
 	}
-	if res := vkCall(b.vk.WaitForFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence)), 1, ^uintptr(0)); res != vkSuccess {
-		return fmt.Errorf("vulkan: wait for fence failed")
+	var set uintptr
+	if res := vkCall(b.vk.AllocateDescriptorSets, b.device, uintptr(unsafe.Pointer(&dsai)), uintptr(unsafe.Pointer(&set))); res != vkSuccess {
+		return fmt.Errorf("vulkan: allocate descriptor set failed")
 	}
+	infos := [4]descriptorBufferInfo{
+		{buffer: src.buf, rng: src.size},
+		{buffer: dst.buf, rng: dst.size},
+		{buffer: b.dummy.buf, rng: b.dummy.size},
+		{buffer: b.dummy.buf, rng: b.dummy.size},
+	}
+	writes := make([]writeDescriptorSet, 4)
+	for i := 0; i < 4; i++ {
+		writes[i] = writeDescriptorSet{
+			sType:           vkStructureWriteDescriptorSet,
+			dstSet:          set,
+			dstBinding:      uint32(i),
+			descriptorCount: 1,
+			descriptorType:  vkDescriptorTypeStorage,
+			pBufferInfo:     uintptr(unsafe.Pointer(&infos[i])),
+		}
+	}
+	vkCall(b.vk.UpdateDescriptorSets, b.device, uintptr(len(writes)), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
+	total := uint32(rows * m)
+	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
+	vkCall(b.vk.CmdBindPipeline, b.cmdBuffer, vkPipelineBindPointCompute, pipe)
+	vkCall(b.vk.CmdBindDescriptorSets, b.cmdBuffer, vkPipelineBindPointCompute, b.pipeLayout, 0, 1, uintptr(unsafe.Pointer(&set)), 0, 0)
+	p := push(uint32(rows), uint32(m), uint32(outRows), uint32(rowOffset))
+	vkCall(b.vk.CmdPushConstants, b.cmdBuffer, b.pipeLayout, vkShaderStageComputeBit, 0, uintptr(len(p)), uintptr(unsafe.Pointer(&p[0])))
+	vkCall(b.vk.CmdDispatch, b.cmdBuffer, uintptr(groups[0]), uintptr(groups[1]), uintptr(groups[2]))
+	barrier := memoryBarrier{
+		sType:         vkStructureMemoryBarrier,
+		srcAccessMask: vkAccessShaderRead | vkAccessShaderWrite,
+		dstAccessMask: vkAccessShaderRead | vkAccessShaderWrite,
+	}
+	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageCompute, vkPipelineStageCompute, 0, 1, uintptr(unsafe.Pointer(&barrier)), 0, 0, 0, 0)
 	return nil
 }
 

@@ -57,15 +57,27 @@ func (b *Backend) Download(buf compute.Buffer) (*compute.Tensor, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := b.flush(); err != nil {
+		return nil, err
+	}
 	return b.downloadBuffer(x), nil
 }
 
-// Free implements compute.Backend.
+// Free implements compute.Backend. Buffers freed while commands are being
+// recorded are destroyed after the next flush.
 func (b *Backend) Free(buf compute.Buffer) {
 	x, ok := buf.(*buffer)
 	if !ok || x == nil {
 		return
 	}
+	if b.recording {
+		b.pending = append(b.pending, x)
+		return
+	}
+	b.destroyBuffer(x)
+}
+
+func (b *Backend) destroyBuffer(x *buffer) {
 	if x.mapped != nil {
 		vkCall(b.vk.UnmapMemory, b.device, x.mem)
 		x.mapped = nil
@@ -76,8 +88,7 @@ func (b *Backend) Free(buf compute.Buffer) {
 
 // Sync implements compute.Backend.
 func (b *Backend) Sync() error {
-	vkCall(b.vk.QueueWaitIdle, b.queue)
-	return nil
+	return b.flush()
 }
 
 // Close implements compute.Backend.
@@ -85,21 +96,20 @@ func (b *Backend) Close() error {
 	if b.closed {
 		return nil
 	}
+	if b.recording {
+		b.flush()
+	}
+	if b.dummy != nil {
+		b.destroyBuffer(b.dummy)
+		b.dummy = nil
+	}
 	b.closed = true
 	if b.device != 0 {
 		vkCall(b.vk.DeviceWaitIdle, b.device)
-		for _, p := range b.pipelines {
-			// Pipelines are destroyed with the device.
-			_ = p
-		}
 		vkCall(b.vk.DestroyDevice, b.device, 0)
 	}
 	if b.instance != 0 {
 		vkCall(b.vk.DestroyInstance, b.instance, 0)
-	}
-	if b.lib != 0 {
-		// Deliberately keep the library loaded for process lifetime; unloading
-		// while other instances may exist is unsafe.
 	}
 	return nil
 }
@@ -197,19 +207,17 @@ func (b *Backend) MatMul(a, c compute.Buffer) (compute.Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Chunk the dispatch to stay below the per-dimension group limit.
-	const maxPerDispatch = 65535 * 64
-	total := uint32(n * m)
-	for start := uint32(0); start < total; start += maxPerDispatch {
-		chunk := total - start
-		if chunk > maxPerDispatch {
-			chunk = maxPerDispatch
-		}
-		groups := [3]uint32{ceilDiv(chunk, 64), 1, 1}
-		if err := b.dispatch("matmul", []*buffer{x, y, out}, push(uint32(k), uint32(n), uint32(m), start), groups); err != nil {
-			b.Free(out)
-			return nil, err
-		}
+	// Tiled GEMM: one 16x16 workgroup tile per output block.
+	gx := ceilDiv(uint32(n), 16)
+	gy := ceilDiv(uint32(m), 16)
+	if gx > 65535 || gy > 65535 {
+		b.Free(out)
+		return nil, fmt.Errorf("vulkan: matmul dimensions too large (%d x %d)", n, m)
+	}
+	groups := [3]uint32{gx, gy, 1}
+	if err := b.dispatch("matmul", []*buffer{x, y, out}, push(uint32(k), uint32(n), uint32(m), uint32(0)), groups); err != nil {
+		b.Free(out)
+		return nil, err
 	}
 	return out, nil
 }
@@ -428,26 +436,11 @@ func (b *Backend) Copy(dst, src compute.Buffer) error {
 	if d.size < s.size {
 		return compute.ErrShape
 	}
-	if res := vkCall(b.vk.ResetCommandBuffer, b.cmdBuffer, 0); res != vkSuccess {
-		return fmt.Errorf("vulkan: reset command buffer failed")
-	}
-	begin := commandBufferBeginInfo{sType: vkStructureCommandBufferBeginInfo, flags: vkCommandBufferUsageOneTime}
-	if res := vkCall(b.vk.BeginCommandBuffer, b.cmdBuffer, uintptr(unsafe.Pointer(&begin))); res != vkSuccess {
-		return fmt.Errorf("vulkan: begin command buffer failed")
+	if err := b.beginBatch(); err != nil {
+		return err
 	}
 	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: s.size}
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, s.buf, d.buf, 1, uintptr(unsafe.Pointer(&region)))
-	if res := vkCall(b.vk.EndCommandBuffer, b.cmdBuffer); res != vkSuccess {
-		return fmt.Errorf("vulkan: end command buffer failed")
-	}
-	submit := submitInfo{sType: vkStructureSubmitInfo, commandBufferCount: 1, pCommandBuffers: uintptr(unsafe.Pointer(&b.cmdBuffer))}
-	vkCall(b.vk.ResetFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence)))
-	if res := vkCall(b.vk.QueueSubmit, b.queue, 1, uintptr(unsafe.Pointer(&submit)), b.fence); res != vkSuccess {
-		return fmt.Errorf("vulkan: queue submit failed")
-	}
-	if res := vkCall(b.vk.WaitForFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence)), 1, ^uintptr(0)); res != vkSuccess {
-		return fmt.Errorf("vulkan: wait for fence failed")
-	}
 	return nil
 }
 
@@ -605,7 +598,10 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 		rowBlock = 1
 	}
 
-	outHost := compute.NewF32(n, m)
+	outDev, err := b.newF32Buffer(n, m)
+	if err != nil {
+		return nil, err
+	}
 	for n0 := 0; n0 < n; n0 += rowBlock {
 		rows := rowBlock
 		if n0+rows > n {
@@ -622,16 +618,13 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 		if err != nil {
 			return nil, err
 		}
-		bt, err := b.Download(blockOut)
-		b.Free(blockOut)
-		if err != nil {
+		if err := b.copyRows(outDev, blockOut.(*buffer), rows, m, n, n0); err != nil {
+			b.Free(blockOut)
 			return nil, err
 		}
-		for c := 0; c < m; c++ {
-			copy(outHost.F32[n0+c*n:n0+rows+c*n], bt.F32[c*rows:(c+1)*rows])
-		}
+		b.Free(blockOut)
 	}
-	return b.Upload(outHost)
+	return outDev, nil
 }
 
 func (b *Backend) matMulHostDequant(w *buffer, x compute.Buffer) (compute.Buffer, error) {

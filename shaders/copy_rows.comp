@@ -1,0 +1,27 @@
+#version 450
+
+// Copies a [rows, m] block (GGML layout, element (r,c) at r + c*rows) into a
+// larger [outRows, m] buffer at a given row offset.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer I { float i[]; };
+layout(binding = 1) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint rows;
+    uint m;
+    uint outRows;
+    uint rowOffset;
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.rows * p.m;
+    if (idx >= total) {
+        return;
+    }
+    uint r = idx % p.rows;
+    uint c = idx / p.rows;
+    o[(p.rowOffset + r) + c * p.outRows] = i[idx];
+}
