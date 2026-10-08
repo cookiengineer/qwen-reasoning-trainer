@@ -1,0 +1,54 @@
+#version 450
+
+// Weight-gradient GEMM for a linear layer y = W x: given the activation x and
+// the output gradient dOut, produce dW.
+//
+//   dW[i,n] = sum_m x[i,m] * dOut[n,m]
+//
+// x is [In, m], dOut is [Out, m] (both GGML layout), dW is [In, Out] (element
+// (i,n) at i + n*In). 16x16 shared-memory tiles over (i,n).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer D { float dout[]; };
+layout(binding = 2) writeonly buffer W { float dw[]; };
+
+layout(push_constant) uniform P {
+    uint In;
+    uint Out;
+    uint m;
+    uint pad;
+} p;
+
+shared float Xs[16][17];
+shared float Ds[16][17];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint i0 = gl_WorkGroupID.x * 16u;
+    uint n0 = gl_WorkGroupID.y * 16u;
+
+    float acc = 0.0;
+    for (uint m0 = 0u; m0 < p.m; m0 += 16u) {
+        uint i = i0 + ty;
+        uint mm = m0 + tx;
+        Xs[ty][tx] = (i < p.In && mm < p.m) ? x[i + mm * p.In] : 0.0;
+
+        uint n = n0 + ty;
+        Ds[ty][tx] = (n < p.Out && mm < p.m) ? dout[n + mm * p.Out] : 0.0;
+
+        barrier();
+        for (uint k = 0u; k < 16u; k++) {
+            acc += Xs[ty][k] * Ds[tx][k];
+        }
+        barrier();
+    }
+
+    uint i = i0 + ty;
+    uint n = n0 + tx;
+    if (i < p.In && n < p.Out) {
+        dw[i + n * p.In] = acc;
+    }
+}

@@ -568,3 +568,120 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 	}
 	return wrap(out), nil
 }
+
+// MatMulWeightGrad implements compute.Backend. It is the reference for the
+// device dW = x . dOut^T kernel: x [In,M], dOut [Out,M] -> dW [In,Out].
+func (b *Backend) MatMulWeightGrad(x, dOut compute.Buffer) (compute.Buffer, error) {
+	tx, err := tensor(x)
+	if err != nil {
+		return nil, err
+	}
+	td, err := tensor(dOut)
+	if err != nil {
+		return nil, err
+	}
+	in := tx.Ne(0)
+	out := td.Ne(0)
+	m := tx.Ne(1)
+	if td.Ne(1) != m {
+		return nil, compute.ErrShape
+	}
+	dw := compute.NewF32(in, out)
+	for mm := 0; mm < m; mm++ {
+		xbase := mm * in
+		dbase := mm * out
+		for n := 0; n < out; n++ {
+			g := td.F32[dbase+n]
+			if g == 0 {
+				continue
+			}
+			wbase := n * in
+			for i := 0; i < in; i++ {
+				dw.F32[wbase+i] += tx.F32[xbase+i] * g
+			}
+		}
+	}
+	return wrap(dw), nil
+}
+
+// AttentionBackward implements compute.Backend. It mirrors
+// autograd.AttentionBackward: GQA with optional causality.
+func (b *Backend) AttentionBackward(q, k, v, dOut compute.Buffer, nHead, nHeadKV int, scale float32, causal bool) (compute.Buffer, compute.Buffer, compute.Buffer, error) {
+	tq, err := tensor(q)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	tk, err := tensor(k)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	tv, err := tensor(v)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	td, err := tensor(dOut)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	hd := tq.Ne(0)
+	nQ := tq.Ne(2)
+	nKV := tk.Ne(2)
+	group := nHead / nHeadKV
+	dQ := compute.NewF32(hd, nHead, nQ)
+	dK := compute.NewF32(hd, nHeadKV, nKV)
+	dV := compute.NewF32(hd, nHeadKV, nKV)
+	logits := make([]float64, nKV)
+	dp := make([]float64, nKV)
+	for h := 0; h < nHead; h++ {
+		kv := h / group
+		for i := 0; i < nQ; i++ {
+			qb := (i*nHead + h) * hd
+			maxJ := nKV
+			if causal && nQ == nKV {
+				maxJ = i + 1
+			}
+			best := math.Inf(-1)
+			for j := 0; j < maxJ; j++ {
+				kb := (j*nHeadKV + kv) * hd
+				var dot float64
+				for d := 0; d < hd; d++ {
+					dot += float64(tq.F32[qb+d]) * float64(tk.F32[kb+d])
+				}
+				dot *= float64(scale)
+				logits[j] = dot
+				if dot > best {
+					best = dot
+				}
+			}
+			var sum float64
+			for j := 0; j < maxJ; j++ {
+				e := math.Exp(logits[j] - best)
+				logits[j] = e
+				sum += e
+			}
+			for j := 0; j < maxJ; j++ {
+				logits[j] /= sum
+			}
+			var pd float64
+			for j := 0; j < maxJ; j++ {
+				vb := (j*nHeadKV + kv) * hd
+				var acc float64
+				for d := 0; d < hd; d++ {
+					acc += float64(td.F32[qb+d]) * float64(tv.F32[vb+d])
+				}
+				dp[j] = acc
+				pd += logits[j] * acc
+			}
+			for j := 0; j < maxJ; j++ {
+				vb := (j*nHeadKV + kv) * hd
+				dDot := logits[j] * (dp[j] - pd) * float64(scale)
+				for d := 0; d < hd; d++ {
+					dQ.F32[qb+d] += float32(dDot * float64(tk.F32[vb+d]))
+					dK.F32[vb+d] += float32(dDot * float64(tq.F32[qb+d]))
+					dV.F32[vb+d] += float32(logits[j] * float64(td.F32[qb+d]))
+				}
+			}
+		}
+	}
+	return wrap(dQ), wrap(dK), wrap(dV), nil
+}

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/autograd"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute/cpu"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute/vulkan"
@@ -861,4 +862,106 @@ func TestVulkanSoftmaxBack(t *testing.T) {
 			t.Fatalf("soft_max_back FD[%d]: numeric %g vs kernel %g", j, num, got[j])
 		}
 	}
+}
+
+func TestVulkanMatMulWeightGrad(t *testing.T) {
+	c, v := newBackends(t)
+	const In, Out, m = 5, 4, 3
+	x := make([]float32, In*m)
+	w := make([]float32, In*Out)
+	dout := make([]float32, Out*m)
+	for i := range x {
+		x[i] = float32((i%7)-3) * 0.3
+	}
+	for i := range w {
+		w[i] = float32((i%5)-2) * 0.2
+	}
+	for i := range dout {
+		dout[i] = float32((i%6)-2) * 0.4
+	}
+	cv, err := c.MatMulWeightGrad(up(t, c, []int{In, m}, append([]float32(nil), x...)), up(t, c, []int{Out, m}, append([]float32(nil), dout...)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vv, err := v.MatMulWeightGrad(up(t, v, []int{In, m}, append([]float32(nil), x...)), up(t, v, []int{Out, m}, append([]float32(nil), dout...)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := down(t, v, vv)
+	compare(t, "matmul_wg", got, down(t, c, cv))
+
+	// GPU finite differences: f(W) = sum(W x * dOut), W [In,Out].
+	step := float32(1e-2)
+	for j := range w {
+		wp := append([]float32(nil), w...)
+		wp[j] += step
+		wm := append([]float32(nil), w...)
+		wm[j] -= step
+		yp, _ := v.MatMul(up(t, v, []int{In, Out}, wp), up(t, v, []int{In, m}, x))
+		ym, _ := v.MatMul(up(t, v, []int{In, Out}, wm), up(t, v, []int{In, m}, x))
+		num := (vecDot(down(t, v, yp), dout) - vecDot(down(t, v, ym), dout)) / float64(2*step)
+		if d := math.Abs(num - float64(got[j])); d > 2e-2+2e-2*math.Abs(num) {
+			t.Fatalf("matmul_wg FD[%d]: numeric %g vs kernel %g", j, num, got[j])
+		}
+	}
+}
+
+func TestVulkanAttentionBackward(t *testing.T) {
+	c, v := newBackends(t)
+	scale := float32(1.0 / math.Sqrt(3))
+
+	run := func(be compute.Backend, hd, nHead, nHeadKV, nQ, nKV int, causal bool) (dq, dk, dv []float32) {
+		q := autograd.Random(50, 1.0, hd, nHead, nQ)
+		k := autograd.Random(51, 1.0, hd, nHeadKV, nKV)
+		vv := autograd.Random(52, 1.0, hd, nHeadKV, nKV)
+		dO := autograd.Random(53, 1.0, hd, nHead, nQ)
+		a, b, d, err := be.AttentionBackward(
+			up(t, be, q.Dims, q.F32), up(t, be, k.Dims, k.F32),
+			up(t, be, vv.Dims, vv.F32), up(t, be, dO.Dims, dO.F32),
+			nHead, nHeadKV, scale, causal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return down(t, be, a), down(t, be, b), down(t, be, d)
+	}
+
+	// Causal GQA.
+	cq, ck, cv := run(c, 3, 2, 1, 3, 3, true)
+	vq, vk, vv := run(v, 3, 2, 1, 3, 3, true)
+	compare(t, "attn_back dQ causal", vq, cq)
+	compare(t, "attn_back dK causal", vk, ck)
+	compare(t, "attn_back dV causal", vv, cv)
+
+	// Non-causal GQA (nQ != nKV).
+	cq2, ck2, cv2 := run(c, 2, 2, 1, 2, 3, false)
+	vq2, vk2, vv2 := run(v, 2, 2, 1, 2, 3, false)
+	compare(t, "attn_back dQ noncausal", vq2, cq2)
+	compare(t, "attn_back dK noncausal", vk2, ck2)
+	compare(t, "attn_back dV noncausal", vv2, cv2)
+
+	// Independent oracle: autograd.AttentionBackward on the same causal inputs
+	// (seeds match the first run above).
+	q := autograd.Random(50, 1.0, 3, 2, 3)
+	k := autograd.Random(51, 1.0, 3, 1, 3)
+	vvv := autograd.Random(52, 1.0, 3, 1, 3)
+	dO := autograd.Random(53, 1.0, 3, 2, 3)
+	hdq, hdk, hdv := autograd.AttentionBackward(q, k, vvv, dO, 2, 1, scale, true)
+	if maxAbsDiffLocal(vq, hdq.F32) > 1e-4 || maxAbsDiffLocal(vk, hdk.F32) > 1e-4 || maxAbsDiffLocal(vv, hdv.F32) > 1e-4 {
+		t.Fatalf("device attention backward disagrees with autograd oracle: dQ %g dK %g dV %g",
+			maxAbsDiffLocal(vq, hdq.F32), maxAbsDiffLocal(vk, hdk.F32), maxAbsDiffLocal(vv, hdv.F32))
+	}
+}
+
+func maxAbsDiffLocal(a, b []float32) float64 {
+	if len(a) != len(b) {
+		return math.Inf(1)
+	}
+	var m float64
+	for i := range a {
+		d := math.Abs(float64(a[i] - b[i]))
+		if d > m {
+			m = d
+		}
+	}
+	return m
 }

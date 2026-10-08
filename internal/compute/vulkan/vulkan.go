@@ -1231,6 +1231,12 @@ func (b *Backend) downloadBuffer(x *buffer) (*compute.Tensor, error) {
 	return out, nil
 }
 
+// vkCall invokes a Vulkan entry point. The uintptrescapes directive makes the
+// compiler keep any pointer passed as uintptr alive and off the moving stack
+// for the duration of the call; without it a goroutine stack growth during the
+// cgo call corrupts the argument/result structs passed to the driver.
+//
+//go:uintptrescapes
 func vkCall(fn uintptr, args ...uintptr) uintptr {
 	r, _, _ := purego.SyscallN(fn, args...)
 	return r

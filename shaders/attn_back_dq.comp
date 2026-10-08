@@ -1,0 +1,98 @@
+#version 450
+
+// Attention backward, pass 1 (per query): computes dQ, plus the per-query
+// statistics needed by pass 2 (max logit m, softmax sum l, and
+// pd = sum_j p_ij * (dOut_i . v_j)).
+//
+// One invocation per (head h, query i). Stats are stored in a single buffer:
+// stats[0*N + h*nQ+i] = m, stats[1*N + ...] = l, stats[2*N + ...] = pd, N = nHead*nQ.
+//
+// Matches compute.Attention / autograd.AttentionBackward: GQA (nHead query heads
+// share nHeadKV KV heads) and causal masking when causal && nQ == nKV.
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly buffer Q     { float q[];     };
+layout(binding = 1) readonly buffer K     { float k[];     };
+layout(binding = 2) readonly buffer V     { float v[];     };
+layout(binding = 3) readonly buffer DOut  { float dout[];  };
+layout(binding = 4)          buffer Stats { float stats[]; };
+layout(binding = 5)          buffer DQ    { float dq[];    };
+
+layout(push_constant) uniform P {
+    uint  hd;
+    uint  nQ;
+    uint  nKV;
+    uint  nHead;
+    uint  nHeadKV;
+    uint  causal;
+    float scale;
+} p;
+
+float qdotk(uint h, uint kv, uint i, uint j) {
+    uint qb = (i * p.nHead + h) * p.hd;
+    uint kb = (j * p.nHeadKV + kv) * p.hd;
+    float s = 0.0;
+    for (uint d = 0u; d < p.hd; d++) {
+        s += q[qb + d] * k[kb + d];
+    }
+    return s;
+}
+
+float dOutDotV(uint h, uint kv, uint i, uint j) {
+    uint ob = (i * p.nHead + h) * p.hd;
+    uint vb = (j * p.nHeadKV + kv) * p.hd;
+    float s = 0.0;
+    for (uint d = 0u; d < p.hd; d++) {
+        s += dout[ob + d] * v[vb + d];
+    }
+    return s;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint n = p.nHead * p.nQ;
+    if (gid >= n) {
+        return;
+    }
+    uint h = gid / p.nQ;
+    uint i = gid % p.nQ;
+    uint group = p.nHead / p.nHeadKV;
+    uint kv = h / group;
+
+    uint maxJ = p.nKV;
+    if (p.causal == 1u && p.nQ == p.nKV) {
+        maxJ = i + 1u;
+    }
+
+    float m = -1e30;
+    for (uint j = 0u; j < maxJ; j++) {
+        float lg = qdotk(h, kv, i, j) * p.scale;
+        m = max(m, lg);
+    }
+    float l = 0.0;
+    for (uint j = 0u; j < maxJ; j++) {
+        l += exp(qdotk(h, kv, i, j) * p.scale - m);
+    }
+    float pd = 0.0;
+    for (uint j = 0u; j < maxJ; j++) {
+        float pj = exp(qdotk(h, kv, i, j) * p.scale - m) / l;
+        pd += pj * dOutDotV(h, kv, i, j);
+    }
+    stats[gid] = m;
+    stats[n + gid] = l;
+    stats[2u * n + gid] = pd;
+
+    uint qb = (i * p.nHead + h) * p.hd;
+    for (uint d = 0u; d < p.hd; d++) {
+        dq[qb + d] = 0.0;
+    }
+    for (uint j = 0u; j < maxJ; j++) {
+        float pj = exp(qdotk(h, kv, i, j) * p.scale - m) / l;
+        float dd = pj * (dOutDotV(h, kv, i, j) - pd) * p.scale;
+        uint kb = (j * p.nHeadKV + kv) * p.hd;
+        for (uint d = 0u; d < p.hd; d++) {
+            dq[qb + d] += dd * k[kb + d];
+        }
+    }
+}

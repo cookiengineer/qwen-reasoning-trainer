@@ -1,6 +1,7 @@
 package autograd
 
 import (
+	"math"
 	"testing"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
@@ -121,4 +122,53 @@ func TestGatedDeltaNetBackwardKDAGate(t *testing.T) {
 	inputs := []*compute.Tensor{q, k, v, g, beta, state}
 	grads := []*compute.Tensor{dQ, dK, dV, dG, dBeta, dState}
 	check(t, inputs, grads, obj, 5e-3)
+}
+
+func closeAll(t *testing.T, name string, a, b *compute.Tensor) {
+	t.Helper()
+	if a == nil || b == nil || len(a.F32) != len(b.F32) {
+		t.Fatalf("%s: shape mismatch", name)
+	}
+	for i := range a.F32 {
+		d := math.Abs(float64(a.F32[i] - b.F32[i]))
+		if d > 1e-4+1e-4*math.Abs(float64(b.F32[i])) {
+			t.Fatalf("%s[%d]: chunked %g vs naive %g", name, i, a.F32[i], b.F32[i])
+		}
+	}
+}
+
+func TestGatedDeltaNetBackwardChunked(t *testing.T) {
+	for _, kda := range []bool{false, true} {
+		sv, h, nTok := 3, 2, 7
+		q := Random(70, 1.0, sv, h, nTok)
+		k := Random(71, 1.0, sv, h, nTok)
+		v := Random(72, 1.0, sv, h, nTok)
+		var g *compute.Tensor
+		if kda {
+			g = Random(73, 0.3, sv, h, nTok)
+		} else {
+			g = Random(73, 0.3, 1, h, nTok)
+		}
+		beta := Random(74, 0.5, 1, h, nTok)
+		state := Random(75, 0.5, sv, sv, h)
+		dOut := Random(76, 1.0, sv, h, nTok)
+		dNew := Random(77, 1.0, sv, sv, h)
+
+		nQ, nK, nV, nG, nB, nS, err := GatedDeltaNetBackward(q, k, v, g, beta, state, dOut, dNew)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, chunk := range []int{1, 2, 3, 4, 7, 100} {
+			cQ, cK, cV, cG, cB, cS, err := GatedDeltaNetBackwardChunked(q, k, v, g, beta, state, dOut, dNew, chunk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeAll(t, "dQ", cQ, nQ)
+			closeAll(t, "dK", cK, nK)
+			closeAll(t, "dV", cV, nV)
+			closeAll(t, "dG", cG, nG)
+			closeAll(t, "dBeta", cB, nB)
+			closeAll(t, "dState", cS, nS)
+		}
+	}
 }

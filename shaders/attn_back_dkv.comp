@@ -1,0 +1,79 @@
+#version 450
+
+// Attention backward, pass 2 (per key/value): computes dK and dV. Uses the
+// per-query stats written by attn_back_dq. One invocation per (KV head, key j),
+// accumulating over the query heads sharing that KV head and all queries.
+// Atomic-free: each invocation owns dK[j,:] and dV[j,:].
+
+layout(local_size_x = 1) in;
+
+#define MAX_HD 256
+
+layout(binding = 0) readonly buffer Q     { float q[];     };
+layout(binding = 1) readonly buffer K     { float k[];     };
+layout(binding = 2) readonly buffer V     { float v[];     };
+layout(binding = 3) readonly buffer DOut  { float dout[];  };
+layout(binding = 4) readonly buffer Stats { float stats[]; };
+layout(binding = 5)          buffer DK    { float dk[];    };
+layout(binding = 6)          buffer DV    { float dv[];    };
+
+layout(push_constant) uniform P {
+    uint  hd;
+    uint  nQ;
+    uint  nKV;
+    uint  nHead;
+    uint  nHeadKV;
+    uint  causal;
+    float scale;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.nHeadKV * p.nKV || p.hd > MAX_HD) {
+        return;
+    }
+    uint kv = gid / p.nKV;
+    uint j = gid % p.nKV;
+    uint group = p.nHead / p.nHeadKV;
+    uint n = p.nHead * p.nQ;
+
+    float accK[MAX_HD];
+    float accV[MAX_HD];
+    for (uint d = 0u; d < p.hd; d++) {
+        accK[d] = 0.0;
+        accV[d] = 0.0;
+    }
+
+    uint kb = (j * p.nHeadKV + kv) * p.hd;
+    for (uint hi = 0u; hi < group; hi++) {
+        uint h = kv * group + hi;
+        for (uint i = 0u; i < p.nQ; i++) {
+            uint maxJ = p.nKV;
+            if (p.causal == 1u && p.nQ == p.nKV) {
+                maxJ = i + 1u;
+            }
+            if (j >= maxJ) {
+                continue;
+            }
+            uint qb = (i * p.nHead + h) * p.hd;
+            uint ob = qb;
+            float logit = 0.0;
+            float dp = 0.0;
+            for (uint d = 0u; d < p.hd; d++) {
+                logit += q[qb + d] * k[kb + d];
+                dp += dout[ob + d] * v[kb + d];
+            }
+            float pj = exp(logit * p.scale - stats[h * p.nQ + i]) / stats[n + h * p.nQ + i];
+            float dd = pj * (dp - stats[2u * n + h * p.nQ + i]) * p.scale;
+            for (uint d = 0u; d < p.hd; d++) {
+                accK[d] += dd * q[qb + d];
+                accV[d] += pj * dout[ob + d];
+            }
+        }
+    }
+
+    for (uint d = 0u; d < p.hd; d++) {
+        dk[kb + d] = accK[d];
+        dv[kb + d] = accV[d];
+    }
+}

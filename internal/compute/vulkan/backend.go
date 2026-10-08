@@ -526,6 +526,71 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 	return out, nil
 }
 
+// AttentionBackward implements compute.Backend with the two-pass atomic-free
+// attention backward (attn_back_dq, then attn_back_dkv).
+func (b *Backend) AttentionBackward(q, k, v, dOut compute.Buffer, nHead, nHeadKV int, scale float32, causal bool) (compute.Buffer, compute.Buffer, compute.Buffer, error) {
+	qb, err := asBuffer(q)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	kb, err := asBuffer(k)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	vb, err := asBuffer(v)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	db, err := asBuffer(dOut)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	hd := qb.Ne0()
+	nQ := dimOr1(qb.dims, 2)
+	nKV := dimOr1(kb.dims, 2)
+	if nHeadKV <= 0 || nHead%nHeadKV != 0 {
+		return nil, nil, nil, compute.ErrShape
+	}
+	stats, err := b.newF32Buffer(3 * nHead * nQ)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer b.Free(stats)
+	dQ, err := b.newF32Buffer(hd, nHead, nQ)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	dK, err := b.newF32Buffer(hd, nHeadKV, nKV)
+	if err != nil {
+		b.Free(dQ)
+		return nil, nil, nil, err
+	}
+	dV, err := b.newF32Buffer(hd, nHeadKV, nKV)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		return nil, nil, nil, err
+	}
+	c := uint32(0)
+	if causal {
+		c = 1
+	}
+	pc := push(uint32(hd), uint32(nQ), uint32(nKV), uint32(nHead), uint32(nHeadKV), c, scale)
+	if err := b.dispatch("attn_back_dq", []*buffer{qb, kb, vb, db, stats, dQ}, pc, [3]uint32{uint32(nHead * nQ), 1, 1}); err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		return nil, nil, nil, err
+	}
+	if err := b.dispatch("attn_back_dkv", []*buffer{qb, kb, vb, db, stats, dK, dV}, pc, [3]uint32{uint32(nHeadKV * nKV), 1, 1}); err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		return nil, nil, nil, err
+	}
+	return dQ, dK, dV, nil
+}
+
 // SSMConv implements compute.Backend with the causal conv1d shader. Only
 // single-sequence inputs are supported on device; others fall back to the host.
 func (b *Backend) SSMConv(sx, c compute.Buffer) (compute.Buffer, error) {
@@ -1095,6 +1160,41 @@ func (b *Backend) matmulTransposeHostDequant(wb, db, out *buffer, k, n, m int) (
 		return nil, err
 	}
 	return out, nil
+}
+
+// MatMulWeightGrad computes the weight gradient dW = x . dOut^T on the device:
+// x [In,M], dOut [Out,M] -> dW [In,Out]. Used for LoRA adapter gradients.
+func (b *Backend) MatMulWeightGrad(x, dOut compute.Buffer) (compute.Buffer, error) {
+	xa, err := asBuffer(x)
+	if err != nil {
+		return nil, err
+	}
+	da, err := asBuffer(dOut)
+	if err != nil {
+		return nil, err
+	}
+	in := xa.Ne0()
+	out := da.Ne0()
+	m := dimOr1(xa.dims, 1)
+	if dimOr1(da.dims, 1) != m {
+		return nil, compute.ErrShape
+	}
+	dw, err := b.newF32Buffer(in, out)
+	if err != nil {
+		return nil, err
+	}
+	gx := ceilDiv(uint32(in), 16)
+	gy := ceilDiv(uint32(out), 16)
+	if gx > 65535 || gy > 65535 {
+		b.Free(dw)
+		return nil, fmt.Errorf("vulkan: matmul_wg dimensions too large (%d x %d)", in, out)
+	}
+	groups := [3]uint32{gx, gy, 1}
+	if err := b.dispatch("matmul_wg", []*buffer{xa, da, dw}, push(uint32(in), uint32(out), uint32(m), uint32(0)), groups); err != nil {
+		b.Free(dw)
+		return nil, err
+	}
+	return dw, nil
 }
 
 func (b *Backend) matMulHostDequant(w *buffer, x compute.Buffer) (compute.Buffer, error) {

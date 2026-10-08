@@ -119,6 +119,9 @@ type Backend interface {
 	GetRows(table Buffer, indices []int32) (Buffer, error)
 	RoPE(a Buffer, positions []int32, theta float64, nDims int) (Buffer, error)
 	Attention(q, k, v Buffer, nHead, nHeadKV int, scale float32, causal bool) (Buffer, error)
+	// AttentionBackward computes gradients of Attention w.r.t. q, k, v.
+	// dOut has the same shape as the attention output [hd, nHead, nQ].
+	AttentionBackward(q, k, v, dOut Buffer, nHead, nHeadKV int, scale float32, causal bool) (dQ, dK, dV Buffer, err error)
 	SSMConv(sx, c Buffer) (Buffer, error)
 	// SSMConvBack computes gradients of SSMConv with respect to sx and c.
 	SSMConvBack(sx, c, dOut Buffer) (dSx, dC Buffer, err error)
@@ -134,4 +137,7 @@ type Backend interface {
 	// MatMulWeightTranspose computes the frozen-weight activation gradient
 	// dX = W^T dY: w [K,N], dY [N,M] -> [K,M].
 	MatMulWeightTranspose(w Buffer, dY Buffer) (Buffer, error)
+	// MatMulWeightGrad computes the weight gradient dW = x . dOut^T:
+	// x [In,M], dOut [Out,M] -> dW [In,Out].
+	MatMulWeightGrad(x, dOut Buffer) (Buffer, error)
 }
