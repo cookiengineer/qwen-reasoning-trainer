@@ -1,0 +1,46 @@
+#version 450
+
+// RMSNorm backward. For each row:
+//   mean = ss/rowLen; inv = 1/sqrt(mean+eps)
+//   dyhat_i = dOut_i * w_i
+//   dx_i = dyhat_i*inv - (inv^3/rowLen) * x_i * sum_j(dyhat_j * x_j)
+// One invocation per row, matching rms_norm.comp.
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly buffer X    { float x[];    };
+layout(binding = 1) readonly buffer W    { float w[];    };
+layout(binding = 2) readonly buffer DOut { float dout[]; };
+layout(binding = 3) writeonly buffer DX  { float dx[];   };
+
+layout(push_constant) uniform P {
+    uint  rowLen;
+    uint  rows;
+    float eps;
+    uint  hasW;
+} p;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) {
+        return;
+    }
+    uint base = r * p.rowLen;
+    float ss = 0.0;
+    for (uint i = 0u; i < p.rowLen; i++) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    float inv = 1.0 / sqrt(ss / float(p.rowLen) + p.eps);
+    float dot = 0.0;
+    for (uint i = 0u; i < p.rowLen; i++) {
+        float wv = (p.hasW == 1u) ? w[i] : 1.0;
+        dot += dout[base + i] * wv * x[base + i];
+    }
+    float c = inv * inv * inv / float(p.rowLen);
+    for (uint i = 0u; i < p.rowLen; i++) {
+        float wv = (p.hasW == 1u) ? w[i] : 1.0;
+        float dyhat = dout[base + i] * wv;
+        dx[base + i] = dyhat * inv - c * x[base + i] * dot;
+    }
+}

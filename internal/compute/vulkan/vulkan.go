@@ -27,6 +27,10 @@ import (
 //go:embed spirv/*.spv
 var shaderFS embed.FS
 
+// maxBindings is the number of storage-buffer bindings in the shared
+// descriptor set layout. Shaders use a subset; GatedDeltaNet needs eight.
+const maxBindings = 8
+
 // Available reports whether a Vulkan loader can be opened.
 func Available() bool {
 	lib, err := purego.Dlopen("libvulkan.so.1", purego.RTLD_NOW|purego.RTLD_LOCAL)
@@ -480,6 +484,10 @@ type Backend struct {
 	// in tests to exercise the row-blocking path.
 	maxScratchFloats int
 
+	// forceStaging makes allocation prefer a device-local buffer that is not
+	// host-visible, exercising the staging transfer path. Tests only.
+	forceStaging bool
+
 	// recording is true while compute commands are being recorded into the
 	// command buffer but not yet submitted. pending holds buffers freed while
 	// recording; they are destroyed after the next flush.
@@ -492,9 +500,13 @@ type buffer struct {
 	buf    uintptr
 	mem    uintptr
 	mapped unsafe.Pointer
-	size   uint64
-	dims   []int
-	typ    quant.Type
+	// hostVisible reports whether the memory is mapped and can be accessed
+	// directly from the host. Device-local buffers on discrete GPUs are not,
+	// and require staging copies.
+	hostVisible bool
+	size        uint64
+	dims        []int
+	typ         quant.Type
 }
 
 func (x *buffer) Dims() []int { return x.dims }
@@ -669,7 +681,7 @@ func pickComputeQueue(v *vk, pd uintptr) (uint32, bool) {
 }
 
 func (b *Backend) setupDescriptors() error {
-	bindings := [4]descriptorSetLayoutBinding{}
+	bindings := [maxBindings]descriptorSetLayoutBinding{}
 	for i := range bindings {
 		bindings[i] = descriptorSetLayoutBinding{
 			binding:         uint32(i),
@@ -699,7 +711,7 @@ func (b *Backend) setupDescriptors() error {
 		return fmt.Errorf("vulkan: create pipeline layout failed")
 	}
 
-	poolSize := descriptorPoolSize{typ: vkDescriptorTypeStorage, descriptorCount: 4 * 8192}
+	poolSize := descriptorPoolSize{typ: vkDescriptorTypeStorage, descriptorCount: maxBindings * 8192}
 	dpci := descriptorPoolCreateInfo{
 		sType:         vkStructureDescriptorPoolCi,
 		flags:         vkDescriptorPoolFreeSet,
@@ -714,6 +726,22 @@ func (b *Backend) setupDescriptors() error {
 }
 
 func (b *Backend) allocBuffer(size uint64, usage uint32) (*buffer, error) {
+	return b.allocBufferOpt(size, usage, false)
+}
+
+// allocHostBuffer allocates a host-visible, host-coherent buffer used as a
+// staging area for transfers to and from device-local memory.
+func (b *Backend) allocHostBuffer(size uint64, usage uint32) (*buffer, error) {
+	return b.allocBufferOpt(size, usage, true)
+}
+
+// allocBufferOpt creates a buffer. Unless hostOnly is set, it prefers
+// device-local memory (mappable when the device exposes a device-local
+// host-visible type, as on integrated GPUs) and falls back to any host-visible
+// coherent type. On discrete GPUs, where the large device-local heap is not
+// host-visible, the returned buffer is not mapped and transfers must go through
+// allocHostBuffer staging.
+func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buffer, error) {
 	if size == 0 {
 		size = 4
 	}
@@ -730,15 +758,29 @@ func (b *Backend) allocBuffer(size uint64, usage uint32) (*buffer, error) {
 	var req memoryRequirements
 	vkCall(b.vk.GetBufferMemoryRequirements, b.device, buf, uintptr(unsafe.Pointer(&req)))
 
-	// Prefer device-local memory that is still mappable; fall back to any
-	// host-visible coherent type.
-	idx, ok := b.memoryType(req.memoryTypeBits, vkMemoryPropertyDevice|vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
-	if !ok {
+	var idx uint32
+	var ok bool
+	if hostOnly {
 		idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
+	} else if b.forceStaging {
+		idx, ok = b.memoryTypeExclude(req.memoryTypeBits, vkMemoryPropertyDevice, vkMemoryPropertyHostVisible)
+		if !ok {
+			idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyDevice)
+		}
+	} else {
+		// Prefer device-local mappable; then device-local (staging); then any
+		// host-visible coherent.
+		idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyDevice|vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
+		if !ok {
+			idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyDevice)
+		}
+		if !ok {
+			idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
+		}
 	}
 	if !ok {
 		vkCall(b.vk.DestroyBuffer, b.device, buf, 0)
-		return nil, errors.New("vulkan: no host visible memory type")
+		return nil, errors.New("vulkan: no suitable memory type")
 	}
 	mai := memoryAllocateInfo{sType: vkStructureMemoryAllocateInfo, allocationSize: req.size, memoryTypeIndex: idx}
 	var mem uintptr
@@ -751,13 +793,16 @@ func (b *Backend) allocBuffer(size uint64, usage uint32) (*buffer, error) {
 		vkCall(b.vk.DestroyBuffer, b.device, buf, 0)
 		return nil, fmt.Errorf("vulkan: bind buffer memory failed")
 	}
+	hostVisible := b.memProps.memoryTypes[idx].propertyFlags&vkMemoryPropertyHostVisible != 0
 	var mapped unsafe.Pointer
-	if res := vkCall(b.vk.MapMemory, b.device, mem, 0, uintptr(size), 0, uintptr(unsafe.Pointer(&mapped))); res != vkSuccess {
-		vkCall(b.vk.FreeMemory, b.device, mem, 0)
-		vkCall(b.vk.DestroyBuffer, b.device, buf, 0)
-		return nil, fmt.Errorf("vulkan: map memory failed")
+	if hostVisible {
+		if res := vkCall(b.vk.MapMemory, b.device, mem, 0, uintptr(size), 0, uintptr(unsafe.Pointer(&mapped))); res != vkSuccess {
+			vkCall(b.vk.FreeMemory, b.device, mem, 0)
+			vkCall(b.vk.DestroyBuffer, b.device, buf, 0)
+			return nil, fmt.Errorf("vulkan: map memory failed")
+		}
 	}
-	return &buffer{b: b, buf: buf, mem: mem, mapped: mapped, size: size, typ: quant.TypeF32}, nil
+	return &buffer{b: b, buf: buf, mem: mem, mapped: mapped, hostVisible: hostVisible, size: size, typ: quant.TypeF32}, nil
 }
 
 func (b *Backend) memoryType(bits, flags uint32) (uint32, bool) {
@@ -768,6 +813,18 @@ func (b *Backend) memoryType(bits, flags uint32) (uint32, bool) {
 		if b.memProps.memoryTypes[i].propertyFlags&flags == flags {
 			return i, true
 		}
+	}
+	return 0, false
+}
+
+// memoryTypeExclude finds a memory type matching flags but without exclude set.
+func (b *Backend) memoryTypeExclude(bits, flags, exclude uint32) (uint32, bool) {
+	for i := uint32(0); i < b.memProps.memoryTypeCount && i < 32; i++ {
+		pf := b.memProps.memoryTypes[i].propertyFlags
+		if bits&(1<<i) == 0 || pf&exclude != 0 || pf&flags != flags {
+			continue
+		}
+		return i, true
 	}
 	return 0, false
 }
@@ -904,16 +961,16 @@ func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups 
 		return fmt.Errorf("vulkan: allocate descriptor set failed")
 	}
 
-	var infos [4]descriptorBufferInfo
-	for i := 0; i < 4; i++ {
+	var infos [maxBindings]descriptorBufferInfo
+	for i := 0; i < maxBindings; i++ {
 		buf := b.dummy
 		if i < len(bindings) && bindings[i] != nil {
 			buf = bindings[i]
 		}
 		infos[i] = descriptorBufferInfo{buffer: buf.buf, offset: 0, rng: buf.size}
 	}
-	writes := make([]writeDescriptorSet, 4)
-	for i := 0; i < 4; i++ {
+	writes := make([]writeDescriptorSet, maxBindings)
+	for i := 0; i < maxBindings; i++ {
 		writes[i] = writeDescriptorSet{
 			sType:           vkStructureWriteDescriptorSet,
 			dstSet:          set,
@@ -1013,6 +1070,59 @@ func push(puts ...any) []byte {
 	return buf
 }
 
+// writeBytes copies src into a buffer, through a host-visible staging buffer
+// and a recorded copy when the destination is device-local and not mapped. The
+// staging buffer is released on the next flush.
+func (b *Backend) writeBytes(x *buffer, src []byte) error {
+	if len(src) == 0 {
+		return nil
+	}
+	if x.mapped != nil {
+		copy(unsafe.Slice((*byte)(x.mapped), len(src)), src)
+		return nil
+	}
+	staging, err := b.allocHostBuffer(uint64(len(src)), vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
+	if err != nil {
+		return err
+	}
+	copy(unsafe.Slice((*byte)(staging.mapped), len(src)), src)
+	if err := b.beginBatch(); err != nil {
+		b.destroyBuffer(staging)
+		return err
+	}
+	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: uint64(len(src))}
+	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, staging.buf, x.buf, 1, uintptr(unsafe.Pointer(&region)))
+	b.Free(staging) // deferred until the flush submits the copy
+	return nil
+}
+
+// readBytes returns a host copy of the buffer's contents, through a staging
+// buffer when the source is not host-visible. It flushes pending commands.
+func (b *Backend) readBytes(x *buffer, n int) ([]byte, error) {
+	if x.mapped != nil {
+		out := make([]byte, n)
+		copy(out, unsafe.Slice((*byte)(x.mapped), n))
+		return out, nil
+	}
+	if err := b.beginBatch(); err != nil {
+		return nil, err
+	}
+	staging, err := b.allocHostBuffer(uint64(n), vkBufferUsageTransferDst|vkBufferUsageTransferSrc)
+	if err != nil {
+		return nil, err
+	}
+	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: uint64(n)}
+	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, x.buf, staging.buf, 1, uintptr(unsafe.Pointer(&region)))
+	if err := b.flush(); err != nil {
+		b.destroyBuffer(staging)
+		return nil, err
+	}
+	out := make([]byte, n)
+	copy(out, unsafe.Slice((*byte)(staging.mapped), n))
+	b.destroyBuffer(staging)
+	return out, nil
+}
+
 func (b *Backend) uploadTensor(t *compute.Tensor) (*buffer, error) {
 	buf, err := b.allocBuffer(uint64(len(t.F32))*4, vkBufferUsageStorage|vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
 	if err != nil {
@@ -1020,19 +1130,21 @@ func (b *Backend) uploadTensor(t *compute.Tensor) (*buffer, error) {
 	}
 	buf.dims = append([]int(nil), t.Dims...)
 	buf.typ = t.Type
-	src := unsafe.Slice((*byte)(unsafe.Pointer(&t.F32[0])), len(t.F32)*4)
-	dst := unsafe.Slice((*byte)(buf.mapped), int(buf.size))
-	copy(dst, src)
+	if err := b.writeBytes(buf, unsafe.Slice((*byte)(unsafe.Pointer(&t.F32[0])), len(t.F32)*4)); err != nil {
+		return nil, err
+	}
 	return buf, nil
 }
 
-func (b *Backend) downloadBuffer(x *buffer) *compute.Tensor {
+func (b *Backend) downloadBuffer(x *buffer) (*compute.Tensor, error) {
 	n := x.NumElements()
+	raw, err := b.readBytes(x, n*4)
+	if err != nil {
+		return nil, err
+	}
 	out := &compute.Tensor{Dims: append([]int(nil), x.dims...), Type: x.typ, F32: make([]float32, n)}
-	src := unsafe.Slice((*byte)(x.mapped), n*4)
-	dst := unsafe.Slice((*byte)(unsafe.Pointer(&out.F32[0])), n*4)
-	copy(dst, src)
-	return out
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(&out.F32[0])), n*4), raw)
+	return out, nil
 }
 
 func vkCall(fn uintptr, args ...uintptr) uintptr {

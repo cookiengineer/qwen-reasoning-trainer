@@ -1,0 +1,63 @@
+#version 450
+
+// Transposed GEMM used for the frozen-weight activation gradient dX = W^T dY.
+//
+//   O[k,m] = sum_r Ws[r,k] * D[n0 + r, m]
+//
+// Ws is a float32 weight block [K, rows] in GGML layout (row r contiguous,
+// element (k,r) at r*K + k). D is dY [N, M] in GGML layout (element (n,m) at
+// n + m*N). O is [K, M] (element (k,m) at k + m*K). When acc == 1 the partial
+// result is added to O instead of overwriting it, so a quantized weight can be
+// dequantized and multiplied in row blocks without a host round-trip.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) readonly buffer W { float w[]; };
+layout(binding = 1) readonly buffer D { float d[]; };
+layout(binding = 2)          buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint M;
+    uint n0;
+    uint rows;
+    uint acc;
+} p;
+
+shared float Ws[16][17];
+shared float Ds[16][17];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint k0 = gl_WorkGroupID.x * 16u;
+    uint m0 = gl_WorkGroupID.y * 16u;
+
+    float acc = 0.0;
+    for (uint r0 = 0u; r0 < p.rows; r0 += 16u) {
+        uint r = r0 + ty;
+        uint k = k0 + tx;
+        Ws[ty][tx] = (r < p.rows && k < p.K) ? w[r * p.K + k] : 0.0;
+
+        uint m = m0 + tx;
+        Ds[ty][tx] = (r < p.rows && m < p.M) ? d[(p.n0 + r) + m * p.N] : 0.0;
+
+        barrier();
+        for (uint i = 0u; i < 16u; i++) {
+            acc += Ws[i][ty] * Ds[i][tx];
+        }
+        barrier();
+    }
+
+    uint k = k0 + ty;
+    uint m = m0 + tx;
+    if (k < p.K && m < p.M) {
+        uint idx = k + m * p.K;
+        if (p.acc == 1u) {
+            o[idx] += acc;
+        } else {
+            o[idx] = acc;
+        }
+    }
+}

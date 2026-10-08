@@ -1,0 +1,33 @@
+#version 450
+
+// SSM conv1d backward w.r.t. the kernel c (single sequence).
+//   dc[i,ch] = sum_t dOut[ch,t] * sx[t+i, ch]
+// One invocation per kernel element (i, ch): no atomics.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer SX   { float sx[];   };
+layout(binding = 1) readonly buffer DOut { float dout[]; };
+layout(binding = 2) writeonly buffer DC  { float dc[];   };
+
+layout(push_constant) uniform P {
+    uint dConv;
+    uint dInner;
+    uint ncs;
+    uint nT;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.dInner * p.dConv) {
+        return;
+    }
+    uint ch = gid / p.dConv;
+    uint i = gid % p.dConv;
+    uint sbase = ch * p.ncs;
+    float s = 0.0;
+    for (uint t = 0u; t < p.nT; t++) {
+        s += dout[ch + t * p.dInner] * sx[(t + i) + sbase];
+    }
+    dc[gid] = s;
+}

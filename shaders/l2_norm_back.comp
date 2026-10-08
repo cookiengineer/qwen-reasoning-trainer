@@ -1,0 +1,39 @@
+#version 450
+
+// L2 norm backward. With out_i = x_i * inv and c = sum_i dOut_i * out_i,
+// dx_i = inv * (dOut_i - c * out_i). inv = 1/sqrt(ss+eps). One invocation per row.
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly buffer X    { float x[];    };
+layout(binding = 1) readonly buffer DOut { float dout[]; };
+layout(binding = 2) writeonly buffer DX  { float dx[];   };
+
+layout(push_constant) uniform P {
+    uint  rowLen;
+    uint  rows;
+    float eps;
+    uint  pad0;
+} p;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) {
+        return;
+    }
+    uint base = r * p.rowLen;
+    float ss = 0.0;
+    for (uint i = 0u; i < p.rowLen; i++) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    float inv = 1.0 / sqrt(ss + p.eps);
+    float c = 0.0;
+    for (uint i = 0u; i < p.rowLen; i++) {
+        c += dout[base + i] * x[base + i] * inv;
+    }
+    for (uint i = 0u; i < p.rowLen; i++) {
+        float outv = x[base + i] * inv;
+        dx[base + i] = inv * (dout[base + i] - c * outv);
+    }
+}

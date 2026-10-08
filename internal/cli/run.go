@@ -22,6 +22,7 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/tokenizer"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/train"
 )
 
 const usage = `qwen-trainer - Qwen3.8-27B reasoning trainer
@@ -37,6 +38,7 @@ Commands:
   abliterate Remove refusal directions and write an abliterated GGUF
   evaluate   Score a model's refusal rate and KL divergence from a base
   dataset    Build tokenized, loss-masked examples from extractor JSONL
+  train      QLoRA fine-tune on the extractor dataset (reference host path)
   help       Show this help
 
 Global flags:
@@ -79,6 +81,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return cmdEvaluate(cfg, stdout, stderr)
 	case "dataset":
 		return cmdDataset(cfg, stdout, stderr)
+	case "train":
+		return cmdTrain(cfg, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", cfg.Command)
 		fmt.Fprint(stderr, usage)
@@ -569,6 +573,165 @@ func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "mask ratio:     %.4f\n", ratio(dataset.TotalLossTokens(exs), dataset.TotalTokens(exs)))
 	fmt.Fprintf(stdout, "split:          train=%d val=%d\n", len(train), len(val))
 	return 0
+}
+
+// cmdTrain runs QLoRA fine-tuning on the extractor dataset. This is the
+// reference host path: the quantized base is frozen and only F32 LoRA adapters
+// are trained. It is correct-first and slow on the real 27B; the device-resident
+// Vulkan graph is future work.
+func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("train", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	input := fs.String("input", "", "extractor output directory")
+	steps := fs.Int("steps", 50, "optimizer steps")
+	seqLen := fs.Int("seq-len", 512, "max sequence length (front truncation)")
+	lr := fs.Float64("lr", 1e-4, "peak learning rate")
+	rank := fs.Int("rank", 16, "LoRA rank")
+	alpha := fs.Float64("alpha", 32, "LoRA alpha")
+	accum := fs.Int("accum", 1, "gradient accumulation steps")
+	warmup := fs.Int("warmup", 10, "warmup steps")
+	maxGrad := fs.Float64("max-grad-norm", 1.0, "gradient clipping norm (0 = off)")
+	seed := fs.Int64("seed", 1, "seed")
+	out := fs.String("out", "", "output merged GGUF path")
+	adapterOut := fs.String("adapter-out", "", "LoRA adapter checkpoint path")
+	valRatio := fs.Float64("val-ratio", 0.0, "validation split ratio (0 = train on all)")
+	subagents := fs.Bool("include-subagents", false, "include the subagents/ tree")
+	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if *input == "" {
+		fmt.Fprintln(stderr, "error: --input is required")
+		return 2
+	}
+	if *rank <= 0 || *alpha <= 0 {
+		fmt.Fprintln(stderr, "error: --rank and --alpha must be positive")
+		return 2
+	}
+
+	path, err := resolveModel(cfg, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	g, err := gguf.Open(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	defer g.Close()
+	mc, err := modelcfg.FromGGUF(g)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	vocab, err := tokenizer.FromGGUF(g)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "loading weights from %s...\n", path)
+	w, err := qwen38.LoadFromGGUF(g, mc)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+
+	d, err := dataset.Open(*input, dataset.WithSubagents(*subagents))
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	recs, err := d.Sessions()
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	bo := dataset.DefaultBuildOptions()
+	bo.MaxSeqLen = *seqLen
+	bo.Render.Tools = d.Manifest.Tools
+	exs, err := dataset.BuildExamples(vocab, recs, bo)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if len(exs) == 0 {
+		fmt.Fprintln(stderr, "error: no training examples built")
+		return 1
+	}
+	toTrain := func(src []dataset.Example) []train.Example {
+		out := make([]train.Example, len(src))
+		for i, e := range src {
+			mask := make([]bool, len(e.Mask))
+			for j, m := range e.Mask {
+				mask[j] = m != 0
+			}
+			out[i] = train.Example{Tokens: e.IDs, LossMask: mask}
+		}
+		return out
+	}
+	trainSet, valSet := dataset.Split(exs, *valRatio)
+	data := toTrain(trainSet)
+
+	loCfg := train.DefaultLoRA()
+	loCfg.Rank = *rank
+	loCfg.Alpha = float32(*alpha)
+	tm := train.NewQwenModel(w.Cfg, w, loCfg, uint64(*seed))
+	fmt.Fprintf(stderr, "training: %d examples (%d val), %d adapters, %d trainable tensors\n",
+		len(data), len(valSet), len(tm.Adapters()), len(tm.Params()))
+
+	if len(valSet) > 0 {
+		fmt.Fprintf(stderr, "val loss before: %.4f\n", meanLoss(tm, toTrain(valSet)))
+	}
+
+	params := tm.Params()
+	o := train.NewAdamW(train.DefaultAdamW(float32(*lr)), params)
+	sched := train.CosineSchedule(float32(*lr), float32(*lr)*0.1, *warmup, *steps)
+	tr := &train.Trainer{Cfg: train.TrainerConfig{Steps: *steps, Accum: *accum, MaxGradNorm: float32(*maxGrad), LogEvery: 1, Seed: uint64(*seed)}}
+	hist, err := tr.Run(tm, o, sched, data, func(step int, loss float32) {
+		if cfg.LogLevel != "quiet" {
+			fmt.Fprintf(stderr, "step %d/%d: loss %.4f lr %.2e\n", step+1, *steps, loss, sched(step))
+		}
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "steps: %d\n", len(hist))
+	fmt.Fprintf(stdout, "initial_loss: %.4f\n", hist[0])
+	fmt.Fprintf(stdout, "final_loss: %.4f\n", hist[len(hist)-1])
+	if len(valSet) > 0 {
+		fmt.Fprintf(stdout, "val_loss: %.4f\n", meanLoss(tm, toTrain(valSet)))
+	}
+	if *adapterOut != "" {
+		if err := train.SaveCheckpoint(*adapterOut, params); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "wrote adapters: %s\n", *adapterOut)
+	}
+	if *out != "" {
+		if err := tm.WriteMerged(g, *out); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "wrote merged model: %s\n", *out)
+	}
+	return 0
+}
+
+func meanLoss(tm *train.QwenModel, data []train.Example) float32 {
+	if len(data) == 0 {
+		return 0
+	}
+	var sum float32
+	for _, ex := range data {
+		l, _, err := tm.ForwardBackward(ex)
+		if err != nil {
+			continue
+		}
+		sum += l
+	}
+	return sum / float32(len(data))
 }
 
 func avg(n, d int) float64 {

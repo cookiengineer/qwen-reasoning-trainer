@@ -3,6 +3,7 @@ package vulkan
 import (
 	"errors"
 	"fmt"
+	"math"
 	"unsafe"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
@@ -72,7 +73,7 @@ func (b *Backend) Download(buf compute.Buffer) (*compute.Tensor, error) {
 	if err := b.flush(); err != nil {
 		return nil, err
 	}
-	return b.downloadBuffer(x), nil
+	return b.downloadBuffer(x)
 }
 
 // Free implements compute.Backend. Buffers freed while commands are being
@@ -133,8 +134,10 @@ func (b *Backend) uploadInt32(vals []int32) (*buffer, error) {
 	}
 	buf.dims = []int{len(vals)}
 	src := unsafe.Slice((*byte)(unsafe.Pointer(&vals[0])), len(vals)*4)
-	dst := unsafe.Slice((*byte)(buf.mapped), int(buf.size))
-	copy(dst, src)
+	if err := b.writeBytes(buf, src); err != nil {
+		b.destroyBuffer(buf)
+		return nil, err
+	}
 	return buf, nil
 }
 
@@ -262,6 +265,106 @@ func (b *Backend) RMSNorm(a, w compute.Buffer, eps float32) (compute.Buffer, err
 	return out, nil
 }
 
+// RMSNormBack implements compute.Backend.
+func (b *Backend) RMSNormBack(a, w, dOut compute.Buffer, eps float32) (compute.Buffer, error) {
+	x, err := asBuffer(a)
+	if err != nil {
+		return nil, err
+	}
+	d, err := asBuffer(dOut)
+	if err != nil {
+		return nil, err
+	}
+	out, err := b.newF32Buffer(x.dims...)
+	if err != nil {
+		return nil, err
+	}
+	rowLen := x.Ne0()
+	rows := x.NumElements() / rowLen
+	var wb *buffer
+	hasW := uint32(0)
+	if w != nil {
+		wb, err = asBuffer(w)
+		if err != nil {
+			return nil, err
+		}
+		hasW = 1
+	}
+	groups := [3]uint32{uint32(rows), 1, 1}
+	if err := b.dispatch("rms_norm_back", []*buffer{x, wb, d, out}, push(uint32(rowLen), uint32(rows), eps, hasW), groups); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// SiluBack implements compute.Backend.
+func (b *Backend) SiluBack(x, dOut compute.Buffer) (compute.Buffer, error) {
+	xa, err := asBuffer(x)
+	if err != nil {
+		return nil, err
+	}
+	da, err := asBuffer(dOut)
+	if err != nil {
+		return nil, err
+	}
+	out, err := b.newF32Buffer(xa.dims...)
+	if err != nil {
+		return nil, err
+	}
+	n := uint32(xa.NumElements())
+	groups := [3]uint32{ceilDiv(n, 64), 1, 1}
+	if err := b.dispatch("silu_back", []*buffer{xa, da, out}, push(n), groups); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// L2Norm implements compute.Backend.
+func (b *Backend) L2Norm(a compute.Buffer, eps float32) (compute.Buffer, error) {
+	x, err := asBuffer(a)
+	if err != nil {
+		return nil, err
+	}
+	out, err := b.newF32Buffer(x.dims...)
+	if err != nil {
+		return nil, err
+	}
+	rowLen := x.Ne0()
+	rows := x.NumElements() / rowLen
+	groups := [3]uint32{uint32(rows), 1, 1}
+	if err := b.dispatch("l2_norm", []*buffer{x, out}, push(uint32(rowLen), uint32(rows), eps, uint32(0)), groups); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// L2NormBack implements compute.Backend.
+func (b *Backend) L2NormBack(a, dOut compute.Buffer, eps float32) (compute.Buffer, error) {
+	x, err := asBuffer(a)
+	if err != nil {
+		return nil, err
+	}
+	d, err := asBuffer(dOut)
+	if err != nil {
+		return nil, err
+	}
+	out, err := b.newF32Buffer(x.dims...)
+	if err != nil {
+		return nil, err
+	}
+	rowLen := x.Ne0()
+	rows := x.NumElements() / rowLen
+	groups := [3]uint32{uint32(rows), 1, 1}
+	if err := b.dispatch("l2_norm_back", []*buffer{x, d, out}, push(uint32(rowLen), uint32(rows), eps, uint32(0)), groups); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
 // Softmax implements compute.Backend.
 func (b *Backend) Softmax(a compute.Buffer) (compute.Buffer, error) {
 	x, err := asBuffer(a)
@@ -279,6 +382,30 @@ func (b *Backend) Softmax(a compute.Buffer) (compute.Buffer, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// SoftmaxBack implements compute.Backend.
+func (b *Backend) SoftmaxBack(out, dOut compute.Buffer) (compute.Buffer, error) {
+	o, err := asBuffer(out)
+	if err != nil {
+		return nil, err
+	}
+	d, err := asBuffer(dOut)
+	if err != nil {
+		return nil, err
+	}
+	dx, err := b.newF32Buffer(o.dims...)
+	if err != nil {
+		return nil, err
+	}
+	rowLen := o.Ne0()
+	rows := o.NumElements() / rowLen
+	groups := [3]uint32{uint32(rows), 1, 1}
+	if err := b.dispatch("soft_max_back", []*buffer{o, d, dx}, push(uint32(rowLen), uint32(rows)), groups); err != nil {
+		b.Free(dx)
+		return nil, err
+	}
+	return dx, nil
 }
 
 // GetRows implements compute.Backend.
@@ -377,8 +504,42 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 	return out, nil
 }
 
-// SSMConv implements compute.Backend using host fallback.
+// SSMConv implements compute.Backend with the causal conv1d shader. Only
+// single-sequence inputs are supported on device; others fall back to the host.
 func (b *Backend) SSMConv(sx, c compute.Buffer) (compute.Buffer, error) {
+	s, err := asBuffer(sx)
+	if err != nil {
+		return nil, err
+	}
+	cc, err := asBuffer(c)
+	if err != nil {
+		return nil, err
+	}
+	if dimOr1(s.dims, 2) != 1 {
+		return b.ssmConvHost(sx, c)
+	}
+	dConv := cc.Ne0()
+	dInner := dimOr1(cc.dims, 1)
+	ncs := s.Ne0()
+	nT := ncs - dConv + 1
+	if nT < 0 || dimOr1(s.dims, 1) != dInner {
+		return nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(dInner, nT, 1)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(dInner * nT)
+	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
+	if err := b.dispatch("ssm_conv", []*buffer{s, cc, out}, push(uint32(dConv), uint32(dInner), uint32(ncs), uint32(nT)), groups); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// ESSMConvHost is the multi-sequence host fallback.
+func (b *Backend) ssmConvHost(sx, c compute.Buffer) (compute.Buffer, error) {
 	ts, err := b.Download(sx)
 	if err != nil {
 		return nil, err
@@ -394,8 +555,118 @@ func (b *Backend) SSMConv(sx, c compute.Buffer) (compute.Buffer, error) {
 	return b.Upload(out)
 }
 
-// GatedDeltaNet implements compute.Backend using host fallback.
+// SSMConvBack implements compute.Backend with two atomic-free dispatches
+// (one per gradient). Single-sequence only.
+func (b *Backend) SSMConvBack(sx, c, dOut compute.Buffer) (compute.Buffer, compute.Buffer, error) {
+	s, err := asBuffer(sx)
+	if err != nil {
+		return nil, nil, err
+	}
+	cc, err := asBuffer(c)
+	if err != nil {
+		return nil, nil, err
+	}
+	d, err := asBuffer(dOut)
+	if err != nil {
+		return nil, nil, err
+	}
+	if dimOr1(s.dims, 2) != 1 {
+		return nil, nil, fmt.Errorf("vulkan: SSMConvBack supports a single sequence")
+	}
+	dConv := cc.Ne0()
+	dInner := dimOr1(cc.dims, 1)
+	ncs := s.Ne0()
+	nT := ncs - dConv + 1
+	if nT < 0 || dimOr1(s.dims, 1) != dInner {
+		return nil, nil, compute.ErrShape
+	}
+	dSx, err := b.newF32Buffer(ncs, dInner, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	dC, err := b.newF32Buffer(dConv, dInner)
+	if err != nil {
+		b.Free(dSx)
+		return nil, nil, err
+	}
+	pc := push(uint32(dConv), uint32(dInner), uint32(ncs), uint32(nT))
+	gx := ceilDiv(uint32(dInner*ncs), 64)
+	if err := b.dispatch("ssm_conv_back_sx", []*buffer{cc, d, dSx}, pc, [3]uint32{gx, 1, 1}); err != nil {
+		b.Free(dSx)
+		b.Free(dC)
+		return nil, nil, err
+	}
+	gc := ceilDiv(uint32(dInner*dConv), 64)
+	if err := b.dispatch("ssm_conv_back_c", []*buffer{s, d, dC}, pc, [3]uint32{gc, 1, 1}); err != nil {
+		b.Free(dSx)
+		b.Free(dC)
+		return nil, nil, err
+	}
+	return dSx, dC, nil
+}
+
+// GatedDeltaNet implements compute.Backend with the fused recurrence shader.
+// Inputs with S_v > 256 fall back to the host.
 func (b *Backend) GatedDeltaNet(q, k, v, g, beta, state compute.Buffer) (compute.Buffer, compute.Buffer, error) {
+	tq, err := asBuffer(q)
+	if err != nil {
+		return nil, nil, err
+	}
+	tk, err := asBuffer(k)
+	if err != nil {
+		return nil, nil, err
+	}
+	tv, err := asBuffer(v)
+	if err != nil {
+		return nil, nil, err
+	}
+	tg, err := asBuffer(g)
+	if err != nil {
+		return nil, nil, err
+	}
+	tb, err := asBuffer(beta)
+	if err != nil {
+		return nil, nil, err
+	}
+	ts, err := asBuffer(state)
+	if err != nil {
+		return nil, nil, err
+	}
+	sv := tq.Ne0()
+	h := dimOr1(tq.dims, 1)
+	nTok := dimOr1(tq.dims, 2)
+	gstride := tg.Ne0()
+	if sv > 256 || tv.Ne0() != sv || ts.Ne0() != sv {
+		return b.gatedDeltaNetHost(q, k, v, g, beta, state)
+	}
+	kda := uint32(0)
+	if gstride == sv {
+		kda = 1
+	} else if gstride != 1 {
+		return nil, nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(sv, h, nTok)
+	if err != nil {
+		return nil, nil, err
+	}
+	ns, err := b.newF32Buffer(sv, sv, h)
+	if err != nil {
+		b.Free(out)
+		return nil, nil, err
+	}
+	scale := float32(1 / math.Sqrt(float64(sv)))
+	groups := [3]uint32{uint32(h * sv), 1, 1}
+	if err := b.dispatch("gated_delta_net", []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda), groups); err != nil {
+		b.Free(out)
+		b.Free(ns)
+		return nil, nil, err
+	}
+	return out, ns, nil
+}
+
+// gatedDeltaNetHost is the fallback used when the dimensions exceed the shader.
+func (b *Backend) gatedDeltaNetHost(q, k, v, g, beta, state compute.Buffer) (compute.Buffer, compute.Buffer, error) {
 	dq, err := b.Download(q)
 	if err != nil {
 		return nil, nil, err
@@ -488,17 +759,22 @@ func (b *Backend) UploadWeight(t quant.Type, raw []byte, dims []int) (compute.Bu
 	}
 	buf.dims = append([]int(nil), dims...)
 	buf.typ = t
-	dst := unsafe.Slice((*byte)(buf.mapped), int(size))
-	for i := range dst {
-		dst[i] = 0
+	padded := make([]byte, size)
+	copy(padded, raw)
+	if err := b.writeBytes(buf, padded); err != nil {
+		b.destroyBuffer(buf)
+		return nil, err
 	}
-	copy(dst, raw)
 	return buf, nil
 }
 
 // SetMaxScratchFloats overrides the row-block size used by MatMulWeight. It is
 // intended for tests that need to force multiple row blocks.
 func (b *Backend) SetMaxScratchFloats(n int) { b.maxScratchFloats = n }
+
+// SetForceStaging makes buffer allocation prefer non-host-visible device-local
+// memory so tests exercise the staging transfer path.
+func (b *Backend) SetForceStaging(v bool) { b.forceStaging = v }
 
 // dequantRange dequantizes count blocks starting at input block inBase into a
 // float32 buffer, writing from output block outBase. outDims are the dims of the
@@ -673,8 +949,137 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	return outDev, nil
 }
 
+// MatMulWeightTranspose computes the frozen-weight activation gradient
+// dX = W^T dY on the device: w [K,N], dY [N,M] -> [K,M]. A quantized weight is
+// dequantized in row blocks; each block runs the transposed GEMM and
+// accumulates into the output, all in one batched submit.
+func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, error) {
+	wb, err := asBuffer(w)
+	if err != nil {
+		return nil, err
+	}
+	db, err := asBuffer(dY)
+	if err != nil {
+		return nil, err
+	}
+	k := wb.Ne0()
+	n := dimOr1(wb.dims, 1)
+	m := dimOr1(db.dims, 1)
+	if db.Ne0() != n {
+		return nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(k, m)
+	if err != nil {
+		return nil, err
+	}
+
+	if wb.typ == quant.TypeF32 {
+		if err := b.matmulT(wb, db, out, uint32(k), uint32(n), uint32(m), 0, uint32(n), false); err != nil {
+			b.Free(out)
+			return nil, err
+		}
+		return out, nil
+	}
+
+	sh, ok := dequantShaders[wb.typ]
+	if !ok {
+		return b.matmulTransposeHostDequant(wb, db, out, k, n, m)
+	}
+	if sh.blockElems > 1 && k%sh.blockElems != 0 {
+		b.Free(out)
+		return nil, fmt.Errorf("vulkan: row length %d not a multiple of block %d", k, sh.blockElems)
+	}
+
+	maxFloats := b.maxScratchFloats
+	if maxFloats <= 0 {
+		maxFloats = 64 * 1024 * 1024
+	}
+	const maxBlocks = 65535 * 64
+	rowBlock := n
+	if k > 0 && rowBlock*k > maxFloats {
+		rowBlock = maxFloats / k
+	}
+	if sh.blockElems > 1 {
+		if rb := int(maxBlocks) * sh.blockElems / k; rb < rowBlock {
+			rowBlock = rb
+		}
+	} else {
+		if rb := int(maxBlocks) / k; rb < rowBlock {
+			rowBlock = rb
+		}
+	}
+	if rowBlock < 1 {
+		rowBlock = 1
+	}
+
+	for n0 := 0; n0 < n; n0 += rowBlock {
+		rows := rowBlock
+		if n0+rows > n {
+			rows = n - n0
+		}
+		inBase := uint32(n0 * k / sh.blockElems)
+		count := uint32(rows * k / sh.blockElems)
+		scratch, err := b.dequantRange(wb, inBase, 0, count, []int{k, rows})
+		if err != nil {
+			b.Free(out)
+			return nil, err
+		}
+		if err := b.matmulT(scratch, db, out, uint32(k), uint32(n), uint32(m), uint32(n0), uint32(rows), n0 > 0); err != nil {
+			b.Free(scratch)
+			b.Free(out)
+			return nil, err
+		}
+		b.Free(scratch)
+	}
+	return out, nil
+}
+
+// matmulT dispatches the transposed GEMM tile shader for one weight row block.
+func (b *Backend) matmulT(w, d, out *buffer, K, N, M, n0, rows uint32, acc bool) error {
+	gx := ceilDiv(K, 16)
+	gy := ceilDiv(M, 16)
+	if gx > 65535 || gy > 65535 {
+		return fmt.Errorf("vulkan: matmul_t dimensions too large (%d x %d)", K, M)
+	}
+	a := uint32(0)
+	if acc {
+		a = 1
+	}
+	groups := [3]uint32{gx, gy, 1}
+	return b.dispatch("matmul_t", []*buffer{w, d, out}, push(K, N, M, n0, rows, a), groups)
+}
+
+// matmulTransposeHostDequant is the fallback for weight types without a dequant
+// shader: dequantize on the host, upload, and run the transposed GEMM.
+func (b *Backend) matmulTransposeHostDequant(wb, db, out *buffer, k, n, m int) (compute.Buffer, error) {
+	raw, err := b.readBytes(wb, int(wb.size))
+	if err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	f32, err := quant.Dequant(wb.typ, raw, int64(wb.NumElements()))
+	if err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	tmp, err := b.Upload(&compute.Tensor{Dims: wb.dims, Type: quant.TypeF32, F32: f32})
+	if err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	defer b.Free(tmp)
+	if err := b.matmulT(tmp.(*buffer), db, out, uint32(k), uint32(n), uint32(m), 0, uint32(n), false); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
 func (b *Backend) matMulHostDequant(w *buffer, x compute.Buffer) (compute.Buffer, error) {
-	raw := unsafe.Slice((*byte)(w.mapped), int(w.size))
+	raw, err := b.readBytes(w, int(w.size))
+	if err != nil {
+		return nil, err
+	}
 	f32, err := quant.Dequant(w.typ, raw, int64(w.NumElements()))
 	if err != nil {
 		return nil, err

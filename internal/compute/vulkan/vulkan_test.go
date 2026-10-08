@@ -378,3 +378,487 @@ func TestVulkanGemvFused(t *testing.T) {
 		}
 	}
 }
+
+func TestVulkanStagingRoundTrip(t *testing.T) {
+	v, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer v.Close()
+	// Force non-host-visible device-local allocation when the device exposes
+	// such a type; otherwise this still validates the host-visible path.
+	v.SetForceStaging(true)
+
+	dims := []int{8, 5}
+	vals := make([]float32, 40)
+	for i := range vals {
+		vals[i] = float32(i) * 0.25
+	}
+	buf, err := v.Upload(&compute.Tensor{Dims: dims, F32: append([]float32(nil), vals...)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum, err := v.Binary(compute.BinaryAdd, buf, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := v.Download(sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]float32, len(vals))
+	for i := range vals {
+		want[i] = vals[i] * 2
+	}
+	compare(t, "staging-add", got.F32, want)
+
+	// Weight upload through staging plus a dequant dispatch.
+	K, N := 32, 4
+	wf := make([]float32, K*N)
+	for i := range wf {
+		wf[i] = float32(i%7) - 3
+	}
+	raw, err := quant.Quantize(quant.TypeQ8_0, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := v.UploadWeight(quant.TypeQ8_0, raw, []int{K, N})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dq, err := v.DequantWeight(wb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotW, err := v.Download(dq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refW, err := quant.Dequant(quant.TypeQ8_0, raw, int64(K*N))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare(t, "staging-dequant", gotW.F32, refW)
+}
+
+// hostTransposeReference computes dX = W^T dY on the host from a dequantized
+// weight, independent of both backends.
+func hostTransposeReference(wf []float32, dy *compute.Tensor, k, n, m int) []float32 {
+	out := make([]float32, k*m)
+	for ni := 0; ni < n; ni++ {
+		for mi := 0; mi < m; mi++ {
+			g := dy.F32[ni+mi*n]
+			if g == 0 {
+				continue
+			}
+			base := ni * k
+			for ki := 0; ki < k; ki++ {
+				out[ki+mi*k] += wf[base+ki] * g
+			}
+		}
+	}
+	return out
+}
+
+func TestVulkanMatMulWeightTranspose(t *testing.T) {
+	c, v := newBackends(t)
+	const K, N, M = 256, 8, 3
+	wf := make([]float32, K*N)
+	for i := range wf {
+		wf[i] = float32((i%13)-6) * 0.1
+	}
+	dy := compute.NewF32(N, M)
+	for i := range dy.F32 {
+		dy.F32[i] = float32((i%7)-3) * 0.2
+	}
+
+	types := []quant.Type{
+		quant.TypeF32, quant.TypeF16, quant.TypeQ8_0,
+		quant.TypeQ4_K, quant.TypeQ5_K, quant.TypeQ6_K, quant.TypeQ3_K,
+		quant.TypeIQ4_XS, quant.TypeIQ4_NL, quant.TypeIQ3_S,
+	}
+	for _, typ := range types {
+		raw, err := quant.Quantize(typ, wf)
+		if err != nil {
+			t.Fatalf("%s: quantize: %v", typ, err)
+		}
+		cw, err := c.UploadWeight(typ, raw, []int{K, N})
+		if err != nil {
+			t.Fatalf("%s: cpu upload: %v", typ, err)
+		}
+		vw, err := v.UploadWeight(typ, raw, []int{K, N})
+		if err != nil {
+			t.Fatalf("%s: vk upload: %v", typ, err)
+		}
+		cdy := up(t, c, []int{N, M}, append([]float32(nil), dy.F32...))
+		vdy := up(t, v, []int{N, M}, append([]float32(nil), dy.F32...))
+
+		cout, err := c.MatMulWeightTranspose(cw, cdy)
+		if err != nil {
+			t.Fatalf("%s: cpu: %v", typ, err)
+		}
+		vout, err := v.MatMulWeightTranspose(vw, vdy)
+		if err != nil {
+			t.Fatalf("%s: vk: %v", typ, err)
+		}
+		got := down(t, v, vout)
+		want := down(t, c, cout)
+		compare(t, "dX "+typ.String(), got, want)
+
+		deq, err := quant.Dequant(typ, raw, int64(K*N))
+		if err != nil {
+			t.Fatalf("%s: dequant: %v", typ, err)
+		}
+		ref := hostTransposeReference(deq, dy, K, N, M)
+		compare(t, "dX-host "+typ.String(), got, ref)
+	}
+}
+
+func TestVulkanMatMulWeightTransposeBlocked(t *testing.T) {
+	const K, N, M = 256, 16, 4
+	c := cpu.New()
+	v, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer v.Close()
+	// Force small row blocks so the accumulation path runs several times.
+	v.SetMaxScratchFloats(K * 2)
+
+	wf := make([]float32, K*N)
+	for i := range wf {
+		wf[i] = float32((i%11)-5) * 0.13
+	}
+	dy := compute.NewF32(N, M)
+	for i := range dy.F32 {
+		dy.F32[i] = float32((i%9)-4) * 0.21
+	}
+	for _, typ := range []quant.Type{quant.TypeQ8_0, quant.TypeQ4_K, quant.TypeIQ4_XS} {
+		raw, err := quant.Quantize(typ, wf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cw, _ := c.UploadWeight(typ, raw, []int{K, N})
+		vw, _ := v.UploadWeight(typ, raw, []int{K, N})
+		cdy := up(t, c, []int{N, M}, append([]float32(nil), dy.F32...))
+		vdy := up(t, v, []int{N, M}, append([]float32(nil), dy.F32...))
+		cout, err := c.MatMulWeightTranspose(cw, cdy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vout, err := v.MatMulWeightTranspose(vw, vdy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		compare(t, "blocked dX "+typ.String(), down(t, v, vout), down(t, c, cout))
+	}
+}
+
+func vecDot(a, b []float32) float64 {
+	var s float64
+	for i := range a {
+		s += float64(a[i]) * float64(b[i])
+	}
+	return s
+}
+
+func TestVulkanSiluBack(t *testing.T) {
+	c, v := newBackends(t)
+	const n = 37
+	x := make([]float32, n)
+	dout := make([]float32, n)
+	for i := range x {
+		x[i] = float32((i%9)-4) * 0.4
+		dout[i] = float32((i%5)-2) * 0.3
+	}
+	cv, err := c.SiluBack(up(t, c, []int{n}, append([]float32(nil), x...)), up(t, c, []int{n}, append([]float32(nil), dout...)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vv, err := v.SiluBack(up(t, v, []int{n}, append([]float32(nil), x...)), up(t, v, []int{n}, append([]float32(nil), dout...)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := down(t, v, vv)
+	compare(t, "silu_back", got, down(t, c, cv))
+
+	// GPU finite differences: f(x) = sum(silu(x) * dOut).
+	const eps = 1e-2
+	for j := 0; j < n; j++ {
+		xp := append([]float32(nil), x...)
+		xp[j] += eps
+		xm := append([]float32(nil), x...)
+		xm[j] -= eps
+		fp, _ := v.Unary(compute.UnarySilu, up(t, v, []int{n}, xp))
+		fm, _ := v.Unary(compute.UnarySilu, up(t, v, []int{n}, xm))
+		num := (vecDot(down(t, v, fp), dout) - vecDot(down(t, v, fm), dout)) / (2 * eps)
+		if d := math.Abs(num - float64(got[j])); d > 1e-2+1e-2*math.Abs(num) {
+			t.Fatalf("silu_back FD[%d]: numeric %g vs kernel %g", j, num, got[j])
+		}
+	}
+}
+
+func TestVulkanRMSNormBack(t *testing.T) {
+	c, v := newBackends(t)
+	const D, rows = 8, 3
+	n := D * rows
+	x := make([]float32, n)
+	w := make([]float32, D)
+	dout := make([]float32, n)
+	for i := range x {
+		x[i] = float32((i%7)-3) * 0.3
+	}
+	for i := range w {
+		w[i] = 0.5 + 0.1*float32(i)
+	}
+	for i := range dout {
+		dout[i] = float32((i%6)-2) * 0.25
+	}
+	const eps = 1e-6
+
+	cv, err := c.RMSNormBack(up(t, c, []int{D, rows}, append([]float32(nil), x...)), up(t, c, []int{D}, w), up(t, c, []int{D, rows}, append([]float32(nil), dout...)), eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vv, err := v.RMSNormBack(up(t, v, []int{D, rows}, append([]float32(nil), x...)), up(t, v, []int{D}, w), up(t, v, []int{D, rows}, append([]float32(nil), dout...)), eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := down(t, v, vv)
+	compare(t, "rms_norm_back", got, down(t, c, cv))
+
+	// nil weight path parity.
+	cv2, _ := c.RMSNormBack(up(t, c, []int{D, rows}, append([]float32(nil), x...)), nil, up(t, c, []int{D, rows}, append([]float32(nil), dout...)), eps)
+	vv2, _ := v.RMSNormBack(up(t, v, []int{D, rows}, append([]float32(nil), x...)), nil, up(t, v, []int{D, rows}, append([]float32(nil), dout...)), eps)
+	compare(t, "rms_norm_back_nilw", down(t, v, vv2), down(t, c, cv2))
+
+	// GPU finite differences on the weighted case.
+	step := float32(1e-2)
+	for j := 0; j < n; j++ {
+		xp := append([]float32(nil), x...)
+		xp[j] += step
+		xm := append([]float32(nil), x...)
+		xm[j] -= step
+		op, _ := v.RMSNorm(up(t, v, []int{D, rows}, xp), up(t, v, []int{D}, w), eps)
+		om, _ := v.RMSNorm(up(t, v, []int{D, rows}, xm), up(t, v, []int{D}, w), eps)
+		num := (vecDot(down(t, v, op), dout) - vecDot(down(t, v, om), dout)) / float64(2*step)
+		if d := math.Abs(num - float64(got[j])); d > 2e-2+2e-2*math.Abs(num) {
+			t.Fatalf("rms_norm_back FD[%d]: numeric %g vs kernel %g", j, num, got[j])
+		}
+	}
+}
+
+func TestVulkanL2NormBack(t *testing.T) {
+	c, v := newBackends(t)
+	const D, rows = 6, 3
+	n := D * rows
+	x := make([]float32, n)
+	dout := make([]float32, n)
+	for i := range x {
+		x[i] = float32((i%7)-3) * 0.5
+	}
+	for i := range dout {
+		dout[i] = float32((i%5)-2) * 0.4
+	}
+	const eps = 1e-6
+
+	// Forward parity.
+	fc, err := c.L2Norm(up(t, c, []int{D, rows}, append([]float32(nil), x...)), eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fv, err := v.L2Norm(up(t, v, []int{D, rows}, append([]float32(nil), x...)), eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare(t, "l2_norm", down(t, v, fv), down(t, c, fc))
+
+	// Backward parity.
+	bc, _ := c.L2NormBack(up(t, c, []int{D, rows}, append([]float32(nil), x...)), up(t, c, []int{D, rows}, append([]float32(nil), dout...)), eps)
+	bv, _ := v.L2NormBack(up(t, v, []int{D, rows}, append([]float32(nil), x...)), up(t, v, []int{D, rows}, append([]float32(nil), dout...)), eps)
+	got := down(t, v, bv)
+	compare(t, "l2_norm_back", got, down(t, c, bc))
+
+	// GPU finite differences.
+	step := float32(1e-2)
+	for j := 0; j < n; j++ {
+		xp := append([]float32(nil), x...)
+		xp[j] += step
+		xm := append([]float32(nil), x...)
+		xm[j] -= step
+		op, _ := v.L2Norm(up(t, v, []int{D, rows}, xp), eps)
+		om, _ := v.L2Norm(up(t, v, []int{D, rows}, xm), eps)
+		num := (vecDot(down(t, v, op), dout) - vecDot(down(t, v, om), dout)) / float64(2*step)
+		if d := math.Abs(num - float64(got[j])); d > 2e-2+2e-2*math.Abs(num) {
+			t.Fatalf("l2_norm_back FD[%d]: numeric %g vs kernel %g", j, num, got[j])
+		}
+	}
+}
+
+func TestVulkanSSMConvBack(t *testing.T) {
+	c, v := newBackends(t)
+	const dConv, dInner, nT = 3, 4, 5
+	ncs := dConv - 1 + nT
+	sx := make([]float32, ncs*dInner)
+	cc := make([]float32, dConv*dInner)
+	for i := range sx {
+		sx[i] = float32((i%7)-3) * 0.3
+	}
+	for i := range cc {
+		cc[i] = float32((i%5)-2) * 0.4
+	}
+	dout := make([]float32, dInner*nT)
+	for i := range dout {
+		dout[i] = float32((i%6)-2) * 0.5
+	}
+	sxDims := []int{ncs, dInner, 1}
+	cDims := []int{dConv, dInner}
+	outDims := []int{dInner, nT, 1}
+
+	fc, err := c.SSMConv(up(t, c, sxDims, append([]float32(nil), sx...)), up(t, c, cDims, cc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fv, err := v.SSMConv(up(t, v, sxDims, append([]float32(nil), sx...)), up(t, v, cDims, cc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare(t, "ssm_conv", down(t, v, fv), down(t, c, fc))
+
+	bsxC, bcC, err := c.SSMConvBack(up(t, c, sxDims, append([]float32(nil), sx...)), up(t, c, cDims, cc), up(t, c, outDims, dout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bsxV, bcV, err := v.SSMConvBack(up(t, v, sxDims, append([]float32(nil), sx...)), up(t, v, cDims, cc), up(t, v, outDims, dout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsx := down(t, v, bsxV)
+	dc := down(t, v, bcV)
+	compare(t, "ssm_conv_back_sx", dsx, down(t, c, bsxC))
+	compare(t, "ssm_conv_back_c", dc, down(t, c, bcC))
+
+	// GPU finite differences.
+	step := float32(1e-2)
+	for j := range sx {
+		xp := append([]float32(nil), sx...)
+		xp[j] += step
+		xm := append([]float32(nil), sx...)
+		xm[j] -= step
+		op, _ := v.SSMConv(up(t, v, sxDims, xp), up(t, v, cDims, cc))
+		om, _ := v.SSMConv(up(t, v, sxDims, xm), up(t, v, cDims, cc))
+		num := (vecDot(down(t, v, op), dout) - vecDot(down(t, v, om), dout)) / float64(2*step)
+		if dd := math.Abs(num - float64(dsx[j])); dd > 2e-2+2e-2*math.Abs(num) {
+			t.Fatalf("ssm_conv_back_sx FD[%d]: numeric %g vs kernel %g", j, num, dsx[j])
+		}
+	}
+	for j := range cc {
+		cp := append([]float32(nil), cc...)
+		cp[j] += step
+		cm := append([]float32(nil), cc...)
+		cm[j] -= step
+		op, _ := v.SSMConv(up(t, v, sxDims, sx), up(t, v, cDims, cp))
+		om, _ := v.SSMConv(up(t, v, sxDims, sx), up(t, v, cDims, cm))
+		num := (vecDot(down(t, v, op), dout) - vecDot(down(t, v, om), dout)) / float64(2*step)
+		if dd := math.Abs(num - float64(dc[j])); dd > 2e-2+2e-2*math.Abs(num) {
+			t.Fatalf("ssm_conv_back_c FD[%d]: numeric %g vs kernel %g", j, num, dc[j])
+		}
+	}
+}
+
+func TestVulkanGatedDeltaNetForward(t *testing.T) {
+	c, v := newBackends(t)
+	const sv, h, nTok = 3, 2, 4
+	q := make([]float32, sv*h*nTok)
+	k := make([]float32, sv*h*nTok)
+	vv := make([]float32, sv*h*nTok)
+	for i := range q {
+		q[i] = float32((i%7)-3) * 0.3
+		k[i] = float32((i%5)-2) * 0.25
+		vv[i] = float32((i%9)-4) * 0.2
+	}
+	beta := make([]float32, h*nTok)
+	for i := range beta {
+		beta[i] = 0.3 + 0.1*float32(i%4)
+	}
+	state := make([]float32, sv*sv*h)
+	for i := range state {
+		state[i] = float32((i%11)-5) * 0.05
+	}
+
+	run := func(be compute.Backend, gate []float32, gdims []int) ([]float32, []float32) {
+		qb := up(t, be, []int{sv, h, nTok}, append([]float32(nil), q...))
+		kb := up(t, be, []int{sv, h, nTok}, append([]float32(nil), k...))
+		vb := up(t, be, []int{sv, h, nTok}, append([]float32(nil), vv...))
+		gb := up(t, be, gdims, append([]float32(nil), gate...))
+		beb := up(t, be, []int{1, h, nTok}, beta)
+		sb := up(t, be, []int{sv, sv, h}, append([]float32(nil), state...))
+		out, ns, err := be.GatedDeltaNet(qb, kb, vb, gb, beb, sb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return down(t, be, out), down(t, be, ns)
+	}
+
+	// Scalar gate.
+	scalar := make([]float32, h*nTok)
+	for i := range scalar {
+		scalar[i] = float32(i%3) * 0.2
+	}
+	oc, nc := run(c, scalar, []int{1, h, nTok})
+	ov, nv := run(v, scalar, []int{1, h, nTok})
+	compare(t, "gdn-out-scalar", ov, oc)
+	compare(t, "gdn-state-scalar", nv, nc)
+
+	// Per-element (KDA) gate.
+	kda := make([]float32, sv*h*nTok)
+	for i := range kda {
+		kda[i] = float32((i%4)-1) * 0.15
+	}
+	oc2, nc2 := run(c, kda, []int{sv, h, nTok})
+	ov2, nv2 := run(v, kda, []int{sv, h, nTok})
+	compare(t, "gdn-out-kda", ov2, oc2)
+	compare(t, "gdn-state-kda", nv2, nc2)
+}
+
+func TestVulkanSoftmaxBack(t *testing.T) {
+	c, v := newBackends(t)
+	const row, rows = 5, 3
+	n := row * rows
+	x := make([]float32, n)
+	for i := range x {
+		x[i] = float32((i%7)-3) * 0.6
+	}
+	dout := make([]float32, n)
+	for i := range dout {
+		dout[i] = float32((i%5)-2) * 0.4
+	}
+	// Forward softmax on both backends to get `out`.
+	smC, _ := c.Softmax(up(t, c, []int{row, rows}, append([]float32(nil), x...)))
+	smV, _ := v.Softmax(up(t, v, []int{row, rows}, append([]float32(nil), x...)))
+	bc, err := c.SoftmaxBack(smC, up(t, c, []int{row, rows}, append([]float32(nil), dout...)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bv, err := v.SoftmaxBack(smV, up(t, v, []int{row, rows}, append([]float32(nil), dout...)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := down(t, v, bv)
+	compare(t, "soft_max_back", got, down(t, c, bc))
+
+	// GPU finite differences: f(x) = sum(softmax(x) * dOut).
+	step := float32(1e-2)
+	for j := 0; j < n; j++ {
+		xp := append([]float32(nil), x...)
+		xp[j] += step
+		xm := append([]float32(nil), x...)
+		xm[j] -= step
+		op, _ := v.Softmax(up(t, v, []int{row, rows}, xp))
+		om, _ := v.Softmax(up(t, v, []int{row, rows}, xm))
+		num := (vecDot(down(t, v, op), dout) - vecDot(down(t, v, om), dout)) / float64(2*step)
+		if d := math.Abs(num - float64(got[j])); d > 2e-2+2e-2*math.Abs(num) {
+			t.Fatalf("soft_max_back FD[%d]: numeric %g vs kernel %g", j, num, got[j])
+		}
+	}
+}

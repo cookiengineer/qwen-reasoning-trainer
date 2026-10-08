@@ -1,0 +1,35 @@
+#version 450
+
+// SSM conv1d backward w.r.t. the input sx (single sequence).
+//   dsx[j,ch] = sum_t dOut[ch,t] * c[j-t, ch]  for t in [j-dConv+1, j]
+// One invocation per sx element (j, ch): no atomics.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer C    { float c[];    };
+layout(binding = 1) readonly buffer DOut { float dout[]; };
+layout(binding = 2) writeonly buffer DSX { float dsx[];  };
+
+layout(push_constant) uniform P {
+    uint dConv;
+    uint dInner;
+    uint ncs;
+    uint nT;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.dInner * p.ncs) {
+        return;
+    }
+    uint ch = gid / p.ncs;
+    uint j = gid % p.ncs;
+    uint cbase = ch * p.dConv;
+    int tmax = min(int(j), int(p.nT) - 1);
+    int tmin = max(0, int(j) - int(p.dConv) + 1);
+    float s = 0.0;
+    for (int t = tmin; t <= tmax; t++) {
+        s += dout[ch + uint(t) * p.dInner] * c[uint(int(j) - t) + cbase];
+    }
+    dsx[gid] = s;
+}

@@ -147,6 +147,57 @@ func (w *Weight) MatMul(x *compute.Tensor) (*compute.Tensor, error) {
 	return out, nil
 }
 
+// MatMulTranspose computes W^T * dY: w [K,N], dY [N,M] -> [K,M]. It is the
+// activation gradient of MatMul when the weight is frozen and used by the
+// training autograd. The weight is dequantized in row blocks so peak host
+// memory stays bounded.
+func (w *Weight) MatMulTranspose(dY *compute.Tensor) (*compute.Tensor, error) {
+	k := w.In()
+	n := w.Out()
+	m := dY.Ne(1)
+	if dY.Ne(0) != n {
+		return nil, compute.ErrShape
+	}
+	rb, err := w.rowBytes()
+	if err != nil {
+		return nil, err
+	}
+	out := compute.NewF32(k, m)
+	const block = 1024
+	sub := make([]float32, 0)
+	for n0 := 0; n0 < n; n0 += block {
+		rows := block
+		if n0+rows > n {
+			rows = n - n0
+		}
+		need := rows * k
+		if cap(sub) < need {
+			sub = make([]float32, need)
+		}
+		sub = sub[:need]
+		for r := 0; r < rows; r++ {
+			row := w.Raw[(n0+r)*rb : (n0+r+1)*rb]
+			if err := quant.DequantTo(w.Typ, row, sub[r*k:(r+1)*k]); err != nil {
+				return nil, err
+			}
+		}
+		for r := 0; r < rows; r++ {
+			wrow := sub[r*k : r*k+k]
+			for mm := 0; mm < m; mm++ {
+				g := dY.F32[(n0+r)+mm*n]
+				if g == 0 {
+					continue
+				}
+				base := mm * k
+				for kk := 0; kk < k; kk++ {
+					out.F32[base+kk] += wrow[kk] * g
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 // loadWeightFromGGUF reads a weight without dequantizing it.
 func loadWeightFromGGUF(g *gguf.File, name string) (*Weight, error) {
 	ti, ok := g.Tensor(name)

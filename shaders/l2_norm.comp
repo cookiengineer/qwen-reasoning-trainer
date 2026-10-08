@@ -1,0 +1,33 @@
+#version 450
+
+// L2 normalization over each contiguous row of length rowLen: y = x / sqrt(ss+eps).
+// One invocation per row.
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint  rowLen;
+    uint  rows;
+    float eps;
+    uint  pad0;
+} p;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) {
+        return;
+    }
+    uint base = r * p.rowLen;
+    float ss = 0.0;
+    for (uint i = 0u; i < p.rowLen; i++) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    float inv = 1.0 / sqrt(ss + p.eps);
+    for (uint i = 0u; i < p.rowLen; i++) {
+        y[base + i] = x[base + i] * inv;
+    }
+}

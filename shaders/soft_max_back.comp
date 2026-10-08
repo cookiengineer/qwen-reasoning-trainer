@@ -1,0 +1,32 @@
+#version 450
+
+// Softmax backward: given the forward output `out` and dOut,
+//   dx_i = out_i * (dOut_i - sum_j dOut_j * out_j)
+// One invocation per row.
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly buffer Out  { float outv[]; };
+layout(binding = 1) readonly buffer DOut { float dout[]; };
+layout(binding = 2) writeonly buffer DX  { float dx[];   };
+
+layout(push_constant) uniform P {
+    uint rowLen;
+    uint rows;
+} p;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) {
+        return;
+    }
+    uint base = r * p.rowLen;
+    float dot = 0.0;
+    for (uint i = 0u; i < p.rowLen; i++) {
+        dot += dout[base + i] * outv[base + i];
+    }
+    for (uint i = 0u; i < p.rowLen; i++) {
+        float o = outv[base + i];
+        dx[base + i] = o * (dout[base + i] - dot);
+    }
+}

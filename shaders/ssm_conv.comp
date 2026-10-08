@@ -1,0 +1,34 @@
+#version 450
+
+// Causal depthwise conv1d forward (single sequence). sx is [dConv-1+nT, dInner, 1]
+// and c is [dConv, dInner]; out is [dInner, nT, 1]. One invocation per output
+// element (ch, t).
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer SX  { float sx[];  };
+layout(binding = 1) readonly buffer C   { float c[];   };
+layout(binding = 2) writeonly buffer OUT { float outv[]; };
+
+layout(push_constant) uniform P {
+    uint dConv;
+    uint dInner;
+    uint ncs;
+    uint nT;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.dInner * p.nT) {
+        return;
+    }
+    uint ch = gid % p.dInner;
+    uint t = gid / p.dInner;
+    uint sbase = ch * p.ncs;
+    uint cbase = ch * p.dConv;
+    float s = 0.0;
+    for (uint i = 0u; i < p.dConv; i++) {
+        s += sx[sbase + t + i] * c[cbase + i];
+    }
+    outv[gid] = s;
+}

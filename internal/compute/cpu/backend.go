@@ -177,6 +177,119 @@ func (b *Backend) RMSNorm(a, w compute.Buffer, eps float32) (compute.Buffer, err
 	return wrap(compute.RMSNorm(ta, weight, eps)), nil
 }
 
+// RMSNormBack implements compute.Backend.
+func (b *Backend) RMSNormBack(a, w, dOut compute.Buffer, eps float32) (compute.Buffer, error) {
+	tx, err := tensor(a)
+	if err != nil {
+		return nil, err
+	}
+	td, err := tensor(dOut)
+	if err != nil {
+		return nil, err
+	}
+	var weight []float32
+	if w != nil {
+		tw, err := tensor(w)
+		if err != nil {
+			return nil, err
+		}
+		weight = tw.F32
+	}
+	row := tx.Ne(0)
+	rows := len(tx.F32) / row
+	out := compute.NewF32(tx.Dims...)
+	for r := 0; r < rows; r++ {
+		base := r * row
+		var ss float64
+		for i := 0; i < row; i++ {
+			v := float64(tx.F32[base+i])
+			ss += v * v
+		}
+		inv := 1 / math.Sqrt(ss/float64(row)+float64(eps))
+		var dot float64
+		for i := 0; i < row; i++ {
+			wv := 1.0
+			if weight != nil {
+				wv = float64(weight[i])
+			}
+			dot += float64(td.F32[base+i]) * wv * float64(tx.F32[base+i])
+		}
+		c := inv * inv * inv / float64(row)
+		for i := 0; i < row; i++ {
+			wv := 1.0
+			if weight != nil {
+				wv = float64(weight[i])
+			}
+			dyhat := float64(td.F32[base+i]) * wv
+			out.F32[base+i] = float32(dyhat*inv - c*float64(tx.F32[base+i])*dot)
+		}
+	}
+	return wrap(out), nil
+}
+
+// SiluBack implements compute.Backend.
+func (b *Backend) SiluBack(x, dOut compute.Buffer) (compute.Buffer, error) {
+	tx, err := tensor(x)
+	if err != nil {
+		return nil, err
+	}
+	td, err := tensor(dOut)
+	if err != nil {
+		return nil, err
+	}
+	if len(tx.F32) != len(td.F32) {
+		return nil, compute.ErrShape
+	}
+	out := compute.NewF32(tx.Dims...)
+	for i, v := range tx.F32 {
+		s := float64(compute.Sigmoid(v))
+		out.F32[i] = float32(float64(td.F32[i]) * s * (1 + float64(v)*(1-s)))
+	}
+	return wrap(out), nil
+}
+
+// L2Norm implements compute.Backend.
+func (b *Backend) L2Norm(a compute.Buffer, eps float32) (compute.Buffer, error) {
+	ta, err := tensor(a)
+	if err != nil {
+		return nil, err
+	}
+	return wrap(compute.L2Norm(ta, eps)), nil
+}
+
+// L2NormBack implements compute.Backend.
+func (b *Backend) L2NormBack(a, dOut compute.Buffer, eps float32) (compute.Buffer, error) {
+	tx, err := tensor(a)
+	if err != nil {
+		return nil, err
+	}
+	td, err := tensor(dOut)
+	if err != nil {
+		return nil, err
+	}
+	row := tx.Ne(0)
+	rows := len(tx.F32) / row
+	out := compute.NewF32(tx.Dims...)
+	for r := 0; r < rows; r++ {
+		base := r * row
+		var ss float64
+		for i := 0; i < row; i++ {
+			v := float64(tx.F32[base+i])
+			ss += v * v
+		}
+		inv := 1 / math.Sqrt(ss+float64(eps))
+		var c float64
+		for i := 0; i < row; i++ {
+			c += float64(td.F32[base+i]) * float64(tx.F32[base+i]) * inv
+		}
+		for i := 0; i < row; i++ {
+			outv := float64(tx.F32[base+i]) * inv
+			out.F32[base+i] = float32(inv * (float64(td.F32[base+i]) - c*outv))
+		}
+	}
+	return wrap(out), nil
+}
+
 // Softmax implements compute.Backend.
 func (b *Backend) Softmax(a compute.Buffer) (compute.Buffer, error) {
 	ta, err := tensor(a)
@@ -186,6 +299,33 @@ func (b *Backend) Softmax(a compute.Buffer) (compute.Buffer, error) {
 	out := ta.Clone()
 	compute.Softmax(out)
 	return wrap(out), nil
+}
+
+// SoftmaxBack implements compute.Backend.
+func (b *Backend) SoftmaxBack(out, dOut compute.Buffer) (compute.Buffer, error) {
+	to, err := tensor(out)
+	if err != nil {
+		return nil, err
+	}
+	td, err := tensor(dOut)
+	if err != nil {
+		return nil, err
+	}
+	row := to.Ne(0)
+	rows := len(to.F32) / row
+	dx := compute.NewF32(to.Dims...)
+	for r := 0; r < rows; r++ {
+		base := r * row
+		var dot float64
+		for i := 0; i < row; i++ {
+			dot += float64(td.F32[base+i]) * float64(to.F32[base+i])
+		}
+		for i := 0; i < row; i++ {
+			o := float64(to.F32[base+i])
+			dx.F32[base+i] = float32(o * (float64(td.F32[base+i]) - dot))
+		}
+	}
+	return wrap(dx), nil
 }
 
 // GetRows implements compute.Backend.
@@ -250,6 +390,49 @@ func (b *Backend) SSMConv(sx, c compute.Buffer) (compute.Buffer, error) {
 		return nil, err
 	}
 	return wrap(out), nil
+}
+
+// SSMConvBack implements compute.Backend.
+func (b *Backend) SSMConvBack(sx, c, dOut compute.Buffer) (compute.Buffer, compute.Buffer, error) {
+	ts, err := tensor(sx)
+	if err != nil {
+		return nil, nil, err
+	}
+	tc, err := tensor(c)
+	if err != nil {
+		return nil, nil, err
+	}
+	td, err := tensor(dOut)
+	if err != nil {
+		return nil, nil, err
+	}
+	dConv := tc.Ne(0)
+	dInner := tc.Ne(1)
+	ncs := ts.Ne(0)
+	nT := ncs - dConv + 1
+	nSeq := ts.Ne(2)
+	if ts.Ne(1) != dInner || nT < 0 {
+		return nil, nil, compute.ErrShape
+	}
+	dSx := compute.NewF32(ts.Dims...)
+	dC := compute.NewF32(tc.Dims...)
+	for s := 0; s < nSeq; s++ {
+		for t := 0; t < nT; t++ {
+			for ch := 0; ch < dInner; ch++ {
+				g := float64(td.F32[(s*nT+t)*dInner+ch])
+				if g == 0 {
+					continue
+				}
+				sOff := ch*ncs + t
+				cOff := ch * dConv
+				for i := 0; i < dConv; i++ {
+					dSx.F32[sOff+i] += float32(g * float64(tc.F32[cOff+i]))
+					dC.F32[cOff+i] += float32(g * float64(ts.F32[sOff+i]))
+				}
+			}
+		}
+	}
+	return wrap(dSx), wrap(dC), nil
 }
 
 // GatedDeltaNet implements compute.Backend.
@@ -344,4 +527,44 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 		return nil, err
 	}
 	return b.MatMul(dq, x)
+}
+
+// MatMulWeightTranspose implements compute.Backend. It is the reference for the
+// device dX = W^T dY kernel: w [K,N], dY [N,M] -> [K,M].
+func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, error) {
+	wb, ok := w.(*weightBuffer)
+	if !ok {
+		return nil, fmt.Errorf("cpu: not a weight buffer")
+	}
+	td, err := tensor(dY)
+	if err != nil {
+		return nil, err
+	}
+	k := wb.dims[0]
+	n := 1
+	if len(wb.dims) > 1 {
+		n = wb.dims[1]
+	}
+	m := td.Ne(1)
+	if td.Ne(0) != n {
+		return nil, compute.ErrShape
+	}
+	f32, err := quant.Dequant(wb.typ, wb.raw, int64(wb.NumElements()))
+	if err != nil {
+		return nil, err
+	}
+	out := compute.NewF32(k, m)
+	for ni := 0; ni < n; ni++ {
+		base := ni * k
+		for mi := 0; mi < m; mi++ {
+			g := td.F32[ni+mi*n]
+			if g == 0 {
+				continue
+			}
+			for ki := 0; ki < k; ki++ {
+				out.F32[ki+mi*k] += f32[base+ki] * g
+			}
+		}
+	}
+	return wrap(out), nil
 }

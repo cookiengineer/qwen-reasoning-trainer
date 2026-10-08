@@ -1,0 +1,76 @@
+#version 450
+
+// GatedDeltaNet forward (single sequence). q,k,v are [S_v, H, T]; g is
+// [gstride, H, T] (gstride 1 = scalar gate, S_v = per-element gate); beta is
+// [1, H, T]; state/newState are [S_v, S_v, H].
+//
+// Each state row j is independent of the others, so one invocation per (head, j)
+// recomputes the whole sequence for that row.
+
+layout(local_size_x = 1) in;
+
+#define MAX_SV 256
+
+layout(binding = 0) readonly  buffer Q   { float q[];   };
+layout(binding = 1) readonly  buffer K   { float k[];   };
+layout(binding = 2) readonly  buffer V   { float v[];   };
+layout(binding = 3) readonly  buffer G   { float g[];   };
+layout(binding = 4) readonly  buffer Beta { float beta[]; };
+layout(binding = 5) readonly  buffer State { float state[]; };
+layout(binding = 6)           buffer Out  { float outv[];  };
+layout(binding = 7)           buffer NState { float nstate[]; };
+
+layout(push_constant) uniform P {
+    uint  sv;
+    uint  h;
+    uint  nTok;
+    uint  gstride;
+    float scale;
+    uint  kda;
+} p;
+
+float row[MAX_SV];
+
+void main() {
+    uint gid = gl_WorkGroupID.x;
+    uint hh = gid / p.sv;
+    uint j = gid % p.sv;
+    if (hh >= p.h || j >= p.sv || p.sv > MAX_SV) {
+        return;
+    }
+    uint rbase = hh * p.sv * p.sv + j * p.sv;
+    for (uint i = 0u; i < p.sv; i++) {
+        row[i] = state[rbase + i];
+    }
+    for (uint t = 0u; t < p.nTok; t++) {
+        uint base = (t * p.h + hh) * p.sv;
+        uint gOff = (t * p.h + hh) * p.gstride;
+        float b = beta[t * p.h + hh];
+        if (p.kda == 1u) {
+            for (uint i = 0u; i < p.sv; i++) {
+                row[i] *= exp(g[gOff + i]);
+            }
+        } else {
+            float dec = exp(g[gOff]);
+            for (uint i = 0u; i < p.sv; i++) {
+                row[i] *= dec;
+            }
+        }
+        float kv = 0.0;
+        for (uint i = 0u; i < p.sv; i++) {
+            kv += row[i] * k[base + i];
+        }
+        float delta = (v[base + j] - kv) * b;
+        for (uint i = 0u; i < p.sv; i++) {
+            row[i] += k[base + i] * delta;
+        }
+        float acc = 0.0;
+        for (uint i = 0u; i < p.sv; i++) {
+            acc += row[i] * q[base + i];
+        }
+        outv[(t * p.h + hh) * p.sv + j] = acc * p.scale;
+    }
+    for (uint i = 0u; i < p.sv; i++) {
+        nstate[rbase + i] = row[i];
+    }
+}
