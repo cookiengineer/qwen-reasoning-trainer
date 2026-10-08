@@ -1,0 +1,34 @@
+#version 450
+
+// Split the fused Q+gate projection. qg is [2*hd*nHead, T]; each (token, head)
+// contributes hd query values then hd gate values. q and gate both have
+// hd*nHead*T elements, laid out [hd,nHead,T] (element d + hh*hd + t*nHead*hd).
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer QG   { float qg[];   };
+layout(binding = 1) writeonly buffer Q    { float q[];    };
+layout(binding = 2) writeonly buffer Gate { float gate[]; };
+
+layout(push_constant) uniform P {
+    uint hd;
+    uint nHead;
+    uint T;
+    uint pad;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = p.hd * p.nHead * p.T;
+    if (gid >= total) {
+        return;
+    }
+    uint row = p.nHead * p.hd;
+    uint t = gid / row;
+    uint rem = gid % row;
+    uint hh = rem / p.hd;
+    uint d = rem % p.hd;
+    uint src = t * (2u * row) + hh * 2u * p.hd + d;
+    q[gid] = qg[src];
+    gate[gid] = qg[src + p.hd];
+}

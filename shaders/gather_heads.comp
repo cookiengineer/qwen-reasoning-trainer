@@ -1,0 +1,16 @@
+#version 450
+// Gather head-structured channels from a conv output [convDim,T] into
+// [headDim,nHead,T]. Channel c = offset + head*headDim + d.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer ConvOut { float cv[]; };
+layout(binding = 1) writeonly buffer Out     { float o[];  };
+layout(push_constant) uniform P { uint offset; uint headDim; uint nHead; uint T; uint convDim; uint pad; } p;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.headDim * p.nHead * p.T) { return; }
+    uint d = gid % p.headDim;
+    uint rem = gid / p.headDim;
+    uint hh = rem % p.nHead;
+    uint t = rem / p.nHead;
+    o[gid] = cv[(p.offset + hh * p.headDim + d) + t * p.convDim];
+}

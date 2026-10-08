@@ -20,6 +20,7 @@ void main() {
     if (p.op == 0u)      r = a[i] + b[i];
     else if (p.op == 1u) r = a[i] - b[i];
     else if (p.op == 2u) r = a[i] * b[i];
-    else                 r = a[i] / b[i];
+    else if (p.op == 3u) r = a[i] / b[i];
+    else                 r = a[i] * (1.0 - a[i]) * b[i];
     o[i] = r;
 }

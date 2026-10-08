@@ -4,10 +4,13 @@ import "github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 
 // Capabilities describes a backend's device limits and supported features.
 type Capabilities struct {
-	Name          string
-	FP16          bool
-	BF16          bool
-	MaxBufferSize uint64
+	Name string
+	FP16 bool
+	BF16 bool
+	// Float32Atomics reports support for shader float32 buffer atomicAdd
+	// (VK_EXT_shader_atomic_float), needed by the atomic GatedDeltaNet backward.
+	Float32Atomics bool
+	MaxBufferSize  uint64
 	// MemoryBytes is the size of the memory the backend allocates from (the
 	// host-visible coherent heap for the Vulkan backend). Zero means unknown.
 	MemoryBytes uint64
@@ -63,6 +66,9 @@ const (
 	BinarySub
 	BinaryMul
 	BinaryDiv
+	// BinarySigmoidBack computes a*(1-a)*b where a is the sigmoid forward
+	// output and b the upstream gradient.
+	BinarySigmoidBack
 )
 
 func (b BinaryOp) String() string {
@@ -116,7 +122,33 @@ type Backend interface {
 	Softmax(a Buffer) (Buffer, error)
 	// SoftmaxBack computes the softmax input gradient given the forward output.
 	SoftmaxBack(out, dOut Buffer) (Buffer, error)
+	// CrossEntropy computes the mean cross-entropy loss over logits [V,T]
+	// against per-token targets (ignoreIndex entries skipped) and its gradient.
+	// It returns the loss in a scalar [1] buffer and dLogits [V,T].
+	CrossEntropy(logits Buffer, targets []int32, ignoreIndex int) (loss, dLogits Buffer, err error)
 	GetRows(table Buffer, indices []int32) (Buffer, error)
+	// GetRowsWeight gathers rows from a quantized weight table and dequantizes
+	// them on the device into a float32 [rowLen, len(indices)] tensor.
+	GetRowsWeight(w Buffer, indices []int32) (Buffer, error)
+	// SplitQG splits a fused Q+gate projection qg [2*hd*nHead, T] into
+	// q [hd,nHead,T] and gate [nHead*hd,T].
+	SplitQG(qg Buffer, hd, nHead, T int) (q, gate Buffer, err error)
+	// SplitQGBack scatters dq and dgate back into the fused layout.
+	SplitQGBack(dq, dgate Buffer) (dqg Buffer, err error)
+	// Reshape returns a non-owning view of b with new dims (same element count).
+	Reshape(b Buffer, dims []int) (Buffer, error)
+
+	// ConvInput builds the causal-conv input [dConv-1+T, convDim, 1] from a qkv
+	// projection [convDim, T] (zero history rows). ConvInputBack is its gradient.
+	ConvInput(qkv Buffer, dConv, convDim, T int) (Buffer, error)
+	ConvInputBack(dConvIn Buffer, dConv, convDim, T int) (Buffer, error)
+	// GatherHeads extracts head-structured channels from [convDim,T] into
+	// [headDim,nHead,T]; GatherHeadsBack scatters back.
+	GatherHeads(convOut Buffer, offset, headDim, nHead, T, convDim int) (Buffer, error)
+	GatherHeadsBack(dOut Buffer, offset, headDim, nHead, T, convDim int) (Buffer, error)
+	// RepeatHeads repeats q/k heads from nIn to nOut; RepeatHeadsBack sums back.
+	RepeatHeads(x Buffer, headDim, nIn, nOut, T int) (Buffer, error)
+	RepeatHeadsBack(dOut Buffer, headDim, nIn, nOut, T int) (Buffer, error)
 	RoPE(a Buffer, positions []int32, theta float64, nDims int) (Buffer, error)
 	Attention(q, k, v Buffer, nHead, nHeadKV int, scale float32, causal bool) (Buffer, error)
 	// AttentionBackward computes gradients of Attention w.r.t. q, k, v.
@@ -126,6 +158,9 @@ type Backend interface {
 	// SSMConvBack computes gradients of SSMConv with respect to sx and c.
 	SSMConvBack(sx, c, dOut Buffer) (dSx, dC Buffer, err error)
 	GatedDeltaNet(q, k, v, g, beta, state Buffer) (out, newState Buffer, err error)
+	// GatedDeltaNetBackward computes gradients of GatedDeltaNet w.r.t. all inputs.
+	// dOut and dNewState are the upstream gradients of the output and new state.
+	GatedDeltaNetBackward(q, k, v, g, beta, state, dOut, dNewState Buffer) (dQ, dK, dV, dG, dBeta, dState Buffer, err error)
 	Copy(dst, src Buffer) error
 
 	// UploadWeight stores a raw quantized weight [dims] of type t on the device.

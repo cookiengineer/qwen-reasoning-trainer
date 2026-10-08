@@ -1,0 +1,159 @@
+#version 450
+
+// GatedDeltaNet backward with float32 buffer atomics (VK_EXT_shader_atomic_float).
+//
+// One invocation per (head, state row j). The state recurrence is row-independent,
+// so each invocation recomputes its row for the whole sequence (into the global
+// scratch buffer) and then runs the reverse recurrence. dV[j] and dState[j,:] are
+// owned by this invocation and written directly; dQ, dK, dG and dBeta are reduced
+// across rows with atomicAdd.
+//
+// Scratch layout: scratch[(gid*(nTok+1) + t)*sv + i] = S_t[j][i], gid = h*sv+j.
+
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 1) in;
+
+#define MAX_SV 256
+
+layout(binding = 0)  readonly  buffer Q        { float q[];        };
+layout(binding = 1)  readonly  buffer K        { float k[];        };
+layout(binding = 2)  readonly  buffer V        { float v[];        };
+layout(binding = 3)  readonly  buffer G        { float g[];        };
+layout(binding = 4)  readonly  buffer Beta     { float beta[];     };
+layout(binding = 5)  readonly  buffer State    { float state[];    };
+layout(binding = 6)  readonly  buffer DOut     { float dout[];     };
+layout(binding = 7)  readonly  buffer DNewState{ float dnewstate[];};
+layout(binding = 8)            buffer Scratch  { float scratch[];  };
+layout(binding = 9)            buffer DQ       { float dq[];       };
+layout(binding = 10)           buffer DK       { float dk[];       };
+layout(binding = 11)           buffer DV       { float dv[];       };
+layout(binding = 12)           buffer DG       { float dg[];       };
+layout(binding = 13)           buffer DBeta    { float dbeta[];    };
+layout(binding = 14)           buffer DState   { float dstate[];   };
+
+layout(push_constant) uniform P {
+    uint  sv;
+    uint  h;
+    uint  nTok;
+    uint  gstride;
+    float scale;
+    uint  kda;
+} p;
+
+float row[MAX_SV];
+float dS[MAX_SV];
+float dA[MAX_SV];
+float decay[MAX_SV];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.h * p.sv || p.sv > MAX_SV) {
+        return;
+    }
+    uint hh = gid / p.sv;
+    uint j = gid % p.sv;
+    uint sbase = gid * (p.nTok + 1u) * p.sv;
+
+    for (uint i = 0u; i < p.sv; i++) {
+        row[i] = state[hh * p.sv * p.sv + j * p.sv + i];
+    }
+    for (uint t = 0u; t < p.nTok; t++) {
+        for (uint i = 0u; i < p.sv; i++) {
+            scratch[sbase + t * p.sv + i] = row[i];
+        }
+        uint off = (t * p.h + hh) * p.sv;
+        uint gOff = (t * p.h + hh) * p.gstride;
+        float b = beta[t * p.h + hh];
+        if (p.kda == 1u) {
+            for (uint i = 0u; i < p.sv; i++) {
+                row[i] *= exp(g[gOff + i]);
+            }
+        } else {
+            float dec = exp(g[gOff]);
+            for (uint i = 0u; i < p.sv; i++) {
+                row[i] *= dec;
+            }
+        }
+        float kv = 0.0;
+        for (uint i = 0u; i < p.sv; i++) {
+            kv += row[i] * k[off + i];
+        }
+        float delta = (v[off + j] - kv) * b;
+        for (uint i = 0u; i < p.sv; i++) {
+            row[i] += k[off + i] * delta;
+        }
+    }
+    for (uint i = 0u; i < p.sv; i++) {
+        scratch[sbase + p.nTok * p.sv + i] = row[i];
+    }
+
+    for (uint i = 0u; i < p.sv; i++) {
+        dS[i] = dnewstate[hh * p.sv * p.sv + j * p.sv + i];
+    }
+    for (int t = int(p.nTok) - 1; t >= 0; t--) {
+        uint ut = uint(t);
+        uint off = (ut * p.h + hh) * p.sv;
+        uint gOff = (ut * p.h + hh) * p.gstride;
+        uint bOff = ut * p.h + hh;
+        float b = beta[bOff];
+        if (p.kda == 1u) {
+            for (uint i = 0u; i < p.sv; i++) {
+                decay[i] = exp(g[gOff + i]);
+            }
+        } else {
+            float dec = exp(g[gOff]);
+            for (uint i = 0u; i < p.sv; i++) {
+                decay[i] = dec;
+            }
+        }
+        uint st = sbase + ut * p.sv;
+        uint st1 = sbase + (ut + 1u) * p.sv;
+        float dOutJ = dout[off + j];
+
+        // Step 4: out = scale * S_{t+1} q.
+        for (uint i = 0u; i < p.sv; i++) {
+            atomicAdd(dq[off + i], p.scale * dOutJ * scratch[st1 + i]);
+            dS[i] += p.scale * dOutJ * q[off + i];
+        }
+        // delta_j uses A = S_t * decay.
+        float kv = 0.0;
+        for (uint i = 0u; i < p.sv; i++) {
+            kv += scratch[st + i] * decay[i] * k[off + i];
+        }
+        float delta = (v[off + j] - kv) * b;
+        // Step 3: S_{t+1} = A + k x delta.
+        for (uint i = 0u; i < p.sv; i++) {
+            dA[i] = dS[i];
+            atomicAdd(dk[off + i], dS[i] * delta);
+        }
+        float ddelta = 0.0;
+        for (uint i = 0u; i < p.sv; i++) {
+            ddelta += dS[i] * k[off + i];
+        }
+        // Step 2: delta = beta * (v - A k).
+        float r = v[off + j] - kv;
+        dv[off + j] = b * ddelta;
+        atomicAdd(dbeta[bOff], ddelta * r);
+        for (uint i = 0u; i < p.sv; i++) {
+            dA[i] -= b * ddelta * k[off + i];
+            atomicAdd(dk[off + i], -b * ddelta * scratch[st + i] * decay[i]);
+        }
+        // Step 1: A = S_t * decay.
+        float gsum = 0.0;
+        for (uint i = 0u; i < p.sv; i++) {
+            dS[i] = dA[i] * decay[i];
+            gsum += dA[i] * scratch[st + i];
+        }
+        if (p.kda == 1u) {
+            for (uint i = 0u; i < p.sv; i++) {
+                atomicAdd(dg[gOff + i], dA[i] * scratch[st + i] * decay[i]);
+            }
+        } else {
+            atomicAdd(dg[gOff], gsum * decay[0]);
+        }
+    }
+    for (uint i = 0u; i < p.sv; i++) {
+        dstate[hh * p.sv * p.sv + j * p.sv + i] = dS[i];
+    }
+}

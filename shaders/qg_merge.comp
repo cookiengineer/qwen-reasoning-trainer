@@ -1,0 +1,33 @@
+#version 450
+
+// Scatter the Q and gate gradients back into the fused Q+gate layout. Inverse of
+// qg_split.comp; the mapping is one-to-one so no atomics are needed.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer DQ    { float dq[];    };
+layout(binding = 1) readonly  buffer DGate { float dgate[]; };
+layout(binding = 2) writeonly buffer DQG   { float dqg[];   };
+
+layout(push_constant) uniform P {
+    uint hd;
+    uint nHead;
+    uint T;
+    uint pad;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = p.hd * p.nHead * p.T;
+    if (gid >= total) {
+        return;
+    }
+    uint row = p.nHead * p.hd;
+    uint t = gid / row;
+    uint rem = gid % row;
+    uint hh = rem / p.hd;
+    uint d = rem % p.hd;
+    uint dst = t * (2u * row) + hh * 2u * p.hd + d;
+    dqg[dst] = dq[gid];
+    dqg[dst + p.hd] = dgate[gid];
+}

@@ -1,0 +1,16 @@
+#version 450
+// Build the causal-conv input for a full (training) sequence: DConv-1 zero
+// history rows followed by the qkv projection. qkv is [convDim,T]; convIn is
+// [DConv-1+T, convDim, 1] (element (j,ch) at j + ch*ncs). The history rows are
+// zeroed by the caller.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer QKV    { float qkv[];    };
+layout(binding = 1) writeonly buffer ConvIn { float conin[];  };
+layout(push_constant) uniform P { uint dConv; uint convDim; uint T; uint ncs; } p;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.convDim * p.T) { return; }
+    uint ch = gid % p.convDim;
+    uint t = gid / p.convDim;
+    conin[(p.dConv - 1u + t) + ch * p.ncs] = qkv[gid];
+}

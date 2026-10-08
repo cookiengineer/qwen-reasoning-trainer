@@ -759,6 +759,7 @@ func cmdGPUInfo(cfg *Config, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "backend:        %s\n", caps.Name)
 	fmt.Fprintf(stdout, "fp16:           %v\n", caps.FP16)
 	fmt.Fprintf(stdout, "bf16:           %v\n", caps.BF16)
+	fmt.Fprintf(stdout, "fp32 atomics:   %v\n", caps.Float32Atomics)
 	fmt.Fprintf(stdout, "host fallback:  %v\n", caps.HostFallback)
 	fmt.Fprintf(stdout, "max buffer:     %d\n", caps.MaxBufferSize)
 	fmt.Fprintf(stdout, "memory:         %s (%d bytes)\n", humanBytes(int64(caps.MemoryBytes)), caps.MemoryBytes)

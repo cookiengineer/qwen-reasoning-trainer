@@ -28,8 +28,9 @@ import (
 var shaderFS embed.FS
 
 // maxBindings is the number of storage-buffer bindings in the shared
-// descriptor set layout. Shaders use a subset; GatedDeltaNet needs eight.
-const maxBindings = 8
+// descriptor set layout. Shaders use a subset; the atomic GatedDeltaNet
+// backward uses fifteen.
+const maxBindings = 16
 
 // Available reports whether a Vulkan loader can be opened.
 func Available() bool {
@@ -69,6 +70,10 @@ const (
 	vkStructureCommandBufferBeginInfo = 42
 	vkStructureMemoryBarrier          = 46
 
+	// Vulkan 1.1 / extension struct type tags.
+	vkStructurePhysicalDeviceFeatures2                    = 1000059000
+	vkStructurePhysicalDeviceShaderAtomicFloatFeaturesEXT = 1000260000
+
 	vkBufferUsageTransferSrc     = 0x00000001
 	vkBufferUsageTransferDst     = 0x00000002
 	vkBufferUsageStorage         = 0x00000020
@@ -85,8 +90,12 @@ const (
 	vkAccessShaderRead           = 0x00000020
 	vkAccessShaderWrite          = 0x00000040
 	vkPipelineStageCompute       = 0x00000800
+	vkPipelineStageTransfer      = 0x00001000
+	vkAccessTransferRead         = 0x00000200
+	vkAccessTransferWrite        = 0x00000800
 	vkDescriptorPoolFreeSet      = 0x00000001
 	vkApiVersion10               = 0x00400000
+	vkApiVersion11               = 0x00401000
 )
 
 // ---- Vulkan structs ----
@@ -139,6 +148,46 @@ type memoryAllocateInfo struct {
 	pNext           uintptr
 	allocationSize  uint64
 	memoryTypeIndex uint32
+}
+
+// extensionProperties mirrors VkExtensionProperties; extensionName is
+// VK_MAX_EXTENSION_NAME_SIZE (256) bytes.
+type extensionProperties struct {
+	extensionName [256]byte
+	specVersion   uint32
+}
+
+// physicalDeviceFeatures2 mirrors VkPhysicalDeviceFeatures2 with enough room for
+// the core VkPhysicalDeviceFeatures (55 bools).
+type physicalDeviceFeatures2 struct {
+	sType    uint32
+	_        uint32
+	pNext    uintptr
+	features [64]uint32
+}
+
+// physicalDeviceShaderAtomicFloatFeatures mirrors
+// VkPhysicalDeviceShaderAtomicFloatFeaturesEXT.
+type physicalDeviceShaderAtomicFloatFeatures struct {
+	sType                           uint32
+	_                               uint32
+	pNext                           uintptr
+	shaderBufferFloat32Atomics      uint32
+	shaderBufferFloat32AtomicAdd    uint32
+	shaderSharedFloat32Atomics      uint32
+	shaderSharedFloat32AtomicAdd    uint32
+	shaderBufferFloat16Atomics      uint32
+	shaderBufferFloat16AtomicAdd    uint32
+	shaderBufferFloat16AtomicMinMax uint32
+	shaderBufferFloat32AtomicMinMax uint32
+	shaderSharedFloat16Atomics      uint32
+	shaderSharedFloat16AtomicAdd    uint32
+	shaderSharedFloat16AtomicMinMax uint32
+	shaderSharedFloat32AtomicMinMax uint32
+	shaderImageFloat32Atomics       uint32
+	shaderImageFloat32AtomicAdd     uint32
+	sparseImageFloat32Atomics       uint32
+	sparseImageFloat32AtomicAdd     uint32
 }
 
 type bufferCreateInfo struct {
@@ -351,48 +400,50 @@ type fenceCreateInfo struct {
 type vk struct {
 	getInstanceProcAddr uintptr
 
-	CreateInstance                    uintptr
-	EnumeratePhysicalDevices          uintptr
-	GetPhysicalDeviceQueueFamilyProps uintptr
-	GetPhysicalDeviceMemoryProps      uintptr
-	GetPhysicalDeviceProperties       uintptr
-	CreateDevice                      uintptr
-	GetDeviceQueue                    uintptr
-	CreateBuffer                      uintptr
-	GetBufferMemoryRequirements       uintptr
-	AllocateMemory                    uintptr
-	BindBufferMemory                  uintptr
-	MapMemory                         uintptr
-	UnmapMemory                       uintptr
-	DestroyBuffer                     uintptr
-	FreeMemory                        uintptr
-	CreateShaderModule                uintptr
-	CreateDescriptorSetLayout         uintptr
-	CreatePipelineLayout              uintptr
-	CreateComputePipelines            uintptr
-	CreateDescriptorPool              uintptr
-	AllocateDescriptorSets            uintptr
-	ResetDescriptorPool               uintptr
-	UpdateDescriptorSets              uintptr
-	CreateCommandPool                 uintptr
-	AllocateCommandBuffers            uintptr
-	ResetCommandBuffer                uintptr
-	BeginCommandBuffer                uintptr
-	CmdBindPipeline                   uintptr
-	CmdBindDescriptorSets             uintptr
-	CmdPushConstants                  uintptr
-	CmdDispatch                       uintptr
-	CmdPipelineBarrier                uintptr
-	CmdCopyBuffer                     uintptr
-	EndCommandBuffer                  uintptr
-	QueueSubmit                       uintptr
-	QueueWaitIdle                     uintptr
-	CreateFence                       uintptr
-	WaitForFences                     uintptr
-	ResetFences                       uintptr
-	DeviceWaitIdle                    uintptr
-	DestroyDevice                     uintptr
-	DestroyInstance                   uintptr
+	CreateInstance                     uintptr
+	EnumeratePhysicalDevices           uintptr
+	GetPhysicalDeviceQueueFamilyProps  uintptr
+	GetPhysicalDeviceMemoryProps       uintptr
+	GetPhysicalDeviceProperties        uintptr
+	CreateDevice                       uintptr
+	GetDeviceQueue                     uintptr
+	EnumerateDeviceExtensionProperties uintptr
+	GetPhysicalDeviceFeatures2         uintptr
+	CreateBuffer                       uintptr
+	GetBufferMemoryRequirements        uintptr
+	AllocateMemory                     uintptr
+	BindBufferMemory                   uintptr
+	MapMemory                          uintptr
+	UnmapMemory                        uintptr
+	DestroyBuffer                      uintptr
+	FreeMemory                         uintptr
+	CreateShaderModule                 uintptr
+	CreateDescriptorSetLayout          uintptr
+	CreatePipelineLayout               uintptr
+	CreateComputePipelines             uintptr
+	CreateDescriptorPool               uintptr
+	AllocateDescriptorSets             uintptr
+	ResetDescriptorPool                uintptr
+	UpdateDescriptorSets               uintptr
+	CreateCommandPool                  uintptr
+	AllocateCommandBuffers             uintptr
+	ResetCommandBuffer                 uintptr
+	BeginCommandBuffer                 uintptr
+	CmdBindPipeline                    uintptr
+	CmdBindDescriptorSets              uintptr
+	CmdPushConstants                   uintptr
+	CmdDispatch                        uintptr
+	CmdPipelineBarrier                 uintptr
+	CmdCopyBuffer                      uintptr
+	EndCommandBuffer                   uintptr
+	QueueSubmit                        uintptr
+	QueueWaitIdle                      uintptr
+	CreateFence                        uintptr
+	WaitForFences                      uintptr
+	ResetFences                        uintptr
+	DeviceWaitIdle                     uintptr
+	DestroyDevice                      uintptr
+	DestroyInstance                    uintptr
 }
 
 func cstr(s string) (uintptr, []byte) {
@@ -409,52 +460,86 @@ func (v *vk) load(instance uintptr, name string) uintptr {
 
 func (v *vk) loadAll(instance uintptr) {
 	names := map[*uintptr]string{
-		&v.CreateInstance:                    "vkCreateInstance",
-		&v.EnumeratePhysicalDevices:          "vkEnumeratePhysicalDevices",
-		&v.GetPhysicalDeviceQueueFamilyProps: "vkGetPhysicalDeviceQueueFamilyProperties",
-		&v.GetPhysicalDeviceMemoryProps:      "vkGetPhysicalDeviceMemoryProperties",
-		&v.GetPhysicalDeviceProperties:       "vkGetPhysicalDeviceProperties",
-		&v.CreateDevice:                      "vkCreateDevice",
-		&v.GetDeviceQueue:                    "vkGetDeviceQueue",
-		&v.CreateBuffer:                      "vkCreateBuffer",
-		&v.GetBufferMemoryRequirements:       "vkGetBufferMemoryRequirements",
-		&v.AllocateMemory:                    "vkAllocateMemory",
-		&v.BindBufferMemory:                  "vkBindBufferMemory",
-		&v.MapMemory:                         "vkMapMemory",
-		&v.UnmapMemory:                       "vkUnmapMemory",
-		&v.DestroyBuffer:                     "vkDestroyBuffer",
-		&v.FreeMemory:                        "vkFreeMemory",
-		&v.CreateShaderModule:                "vkCreateShaderModule",
-		&v.CreateDescriptorSetLayout:         "vkCreateDescriptorSetLayout",
-		&v.CreatePipelineLayout:              "vkCreatePipelineLayout",
-		&v.CreateComputePipelines:            "vkCreateComputePipelines",
-		&v.CreateDescriptorPool:              "vkCreateDescriptorPool",
-		&v.AllocateDescriptorSets:            "vkAllocateDescriptorSets",
-		&v.ResetDescriptorPool:               "vkResetDescriptorPool",
-		&v.UpdateDescriptorSets:              "vkUpdateDescriptorSets",
-		&v.CreateCommandPool:                 "vkCreateCommandPool",
-		&v.AllocateCommandBuffers:            "vkAllocateCommandBuffers",
-		&v.ResetCommandBuffer:                "vkResetCommandBuffer",
-		&v.BeginCommandBuffer:                "vkBeginCommandBuffer",
-		&v.CmdBindPipeline:                   "vkCmdBindPipeline",
-		&v.CmdBindDescriptorSets:             "vkCmdBindDescriptorSets",
-		&v.CmdPushConstants:                  "vkCmdPushConstants",
-		&v.CmdDispatch:                       "vkCmdDispatch",
-		&v.CmdPipelineBarrier:                "vkCmdPipelineBarrier",
-		&v.CmdCopyBuffer:                     "vkCmdCopyBuffer",
-		&v.EndCommandBuffer:                  "vkEndCommandBuffer",
-		&v.QueueSubmit:                       "vkQueueSubmit",
-		&v.QueueWaitIdle:                     "vkQueueWaitIdle",
-		&v.CreateFence:                       "vkCreateFence",
-		&v.WaitForFences:                     "vkWaitForFences",
-		&v.ResetFences:                       "vkResetFences",
-		&v.DeviceWaitIdle:                    "vkDeviceWaitIdle",
-		&v.DestroyDevice:                     "vkDestroyDevice",
-		&v.DestroyInstance:                   "vkDestroyInstance",
+		&v.CreateInstance:                     "vkCreateInstance",
+		&v.EnumeratePhysicalDevices:           "vkEnumeratePhysicalDevices",
+		&v.GetPhysicalDeviceQueueFamilyProps:  "vkGetPhysicalDeviceQueueFamilyProperties",
+		&v.GetPhysicalDeviceMemoryProps:       "vkGetPhysicalDeviceMemoryProperties",
+		&v.GetPhysicalDeviceProperties:        "vkGetPhysicalDeviceProperties",
+		&v.CreateDevice:                       "vkCreateDevice",
+		&v.GetDeviceQueue:                     "vkGetDeviceQueue",
+		&v.EnumerateDeviceExtensionProperties: "vkEnumerateDeviceExtensionProperties",
+		&v.GetPhysicalDeviceFeatures2:         "vkGetPhysicalDeviceFeatures2",
+		&v.CreateBuffer:                       "vkCreateBuffer",
+		&v.GetBufferMemoryRequirements:        "vkGetBufferMemoryRequirements",
+		&v.AllocateMemory:                     "vkAllocateMemory",
+		&v.BindBufferMemory:                   "vkBindBufferMemory",
+		&v.MapMemory:                          "vkMapMemory",
+		&v.UnmapMemory:                        "vkUnmapMemory",
+		&v.DestroyBuffer:                      "vkDestroyBuffer",
+		&v.FreeMemory:                         "vkFreeMemory",
+		&v.CreateShaderModule:                 "vkCreateShaderModule",
+		&v.CreateDescriptorSetLayout:          "vkCreateDescriptorSetLayout",
+		&v.CreatePipelineLayout:               "vkCreatePipelineLayout",
+		&v.CreateComputePipelines:             "vkCreateComputePipelines",
+		&v.CreateDescriptorPool:               "vkCreateDescriptorPool",
+		&v.AllocateDescriptorSets:             "vkAllocateDescriptorSets",
+		&v.ResetDescriptorPool:                "vkResetDescriptorPool",
+		&v.UpdateDescriptorSets:               "vkUpdateDescriptorSets",
+		&v.CreateCommandPool:                  "vkCreateCommandPool",
+		&v.AllocateCommandBuffers:             "vkAllocateCommandBuffers",
+		&v.ResetCommandBuffer:                 "vkResetCommandBuffer",
+		&v.BeginCommandBuffer:                 "vkBeginCommandBuffer",
+		&v.CmdBindPipeline:                    "vkCmdBindPipeline",
+		&v.CmdBindDescriptorSets:              "vkCmdBindDescriptorSets",
+		&v.CmdPushConstants:                   "vkCmdPushConstants",
+		&v.CmdDispatch:                        "vkCmdDispatch",
+		&v.CmdPipelineBarrier:                 "vkCmdPipelineBarrier",
+		&v.CmdCopyBuffer:                      "vkCmdCopyBuffer",
+		&v.EndCommandBuffer:                   "vkEndCommandBuffer",
+		&v.QueueSubmit:                        "vkQueueSubmit",
+		&v.QueueWaitIdle:                      "vkQueueWaitIdle",
+		&v.CreateFence:                        "vkCreateFence",
+		&v.WaitForFences:                      "vkWaitForFences",
+		&v.ResetFences:                        "vkResetFences",
+		&v.DeviceWaitIdle:                     "vkDeviceWaitIdle",
+		&v.DestroyDevice:                      "vkDestroyDevice",
+		&v.DestroyInstance:                    "vkDestroyInstance",
 	}
 	for ptr, n := range names {
 		*ptr = v.load(instance, n)
 	}
+	// GetPhysicalDeviceFeatures2 is core in Vulkan 1.1; fall back to the KHR
+	// alias for 1.0 instances.
+	if v.GetPhysicalDeviceFeatures2 == 0 {
+		v.GetPhysicalDeviceFeatures2 = v.load(instance, "vkGetPhysicalDeviceFeatures2KHR")
+	}
+}
+
+// hasDeviceExtension reports whether the physical device exposes a named
+// extension.
+func hasDeviceExtension(v *vk, pd uintptr, name string) bool {
+	if v.EnumerateDeviceExtensionProperties == 0 {
+		return false
+	}
+	var count uint32
+	if vkCall(v.EnumerateDeviceExtensionProperties, pd, 0, uintptr(unsafe.Pointer(&count)), 0) != vkSuccess || count == 0 {
+		return false
+	}
+	props := make([]extensionProperties, count)
+	if vkCall(v.EnumerateDeviceExtensionProperties, pd, 0, uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&props[0]))) != vkSuccess {
+		return false
+	}
+	for i := range props {
+		n := props[i].extensionName[:]
+		end := 0
+		for end < len(n) && n[end] != 0 {
+			end++
+		}
+		if string(n[:end]) == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Backend is a Vulkan compute backend.
@@ -497,8 +582,9 @@ type Backend struct {
 	// pool recycles device buffers by (size, usage, hostOnly) so a resident
 	// graph does not pay vkCreateBuffer/vkAllocateMemory per op. poolBytes is
 	// bounded by poolCap.
-	pool      map[poolKey][]*buffer
-	poolBytes uint64
+	pool        map[poolKey][]*buffer
+	poolBytes   uint64
+	deviceBytes uint64
 
 	stats Stats
 }
@@ -513,6 +599,7 @@ type Stats struct {
 	BytesUploaded   uint64
 	BytesDownloaded uint64
 	PooledBytes     uint64
+	DeviceBytes     uint64
 }
 
 type poolKey struct {
@@ -535,9 +622,12 @@ type buffer struct {
 	hostVisible bool
 	usage       uint32
 	staging     bool
-	size        uint64
-	dims        []int
-	typ         quant.Type
+	// shared marks a non-owning view produced by Reshape; Free is a no-op and
+	// the underlying buffer is owned by the original allocation.
+	shared bool
+	size   uint64
+	dims   []int
+	typ    quant.Type
 }
 
 func (x *buffer) Dims() []int { return x.dims }
@@ -577,7 +667,7 @@ func New() (*Backend, error) {
 		sType:              vkStructureApplicationInfo,
 		pApplicationName:   uintptr(unsafe.Pointer(&appNameBuf[0])),
 		applicationVersion: 1,
-		apiVersion:         vkApiVersion10,
+		apiVersion:         vkApiVersion11,
 	}
 	ici := instanceCreateInfo{
 		sType:            vkStructureInstanceCreateInfo,
@@ -634,6 +724,20 @@ func New() (*Backend, error) {
 
 	vkCall(v.GetPhysicalDeviceMemoryProps, b.physicalDevice, uintptr(unsafe.Pointer(&b.memProps)))
 
+	// Optional: VK_EXT_shader_atomic_float, used by the atomic GatedDeltaNet
+	// backward. Query the feature and enable it at device creation when present.
+	atomicFeatures := new(physicalDeviceShaderAtomicFloatFeatures)
+	atomicFeatures.sType = vkStructurePhysicalDeviceShaderAtomicFloatFeaturesEXT
+	enableAtomics := false
+	if v.GetPhysicalDeviceFeatures2 != 0 && hasDeviceExtension(v, b.physicalDevice, "VK_EXT_shader_atomic_float") {
+		f2 := new(physicalDeviceFeatures2)
+		f2.sType = vkStructurePhysicalDeviceFeatures2
+		f2.pNext = uintptr(unsafe.Pointer(atomicFeatures))
+		vkCall(v.GetPhysicalDeviceFeatures2, b.physicalDevice, uintptr(unsafe.Pointer(f2)))
+		enableAtomics = atomicFeatures.shaderBufferFloat32AtomicAdd != 0
+		runtime.KeepAlive(f2)
+	}
+
 	prio := float32(1.0)
 	qci := deviceQueueCreateInfo{
 		sType:            vkStructureDeviceQueueCreateInfo,
@@ -646,11 +750,22 @@ func New() (*Backend, error) {
 		queueCreateInfoCount: 1,
 		pQueueCreateInfos:    uintptr(unsafe.Pointer(&qci)),
 	}
+	extNameBytes := append([]byte("VK_EXT_shader_atomic_float"), 0)
+	var extNames [1]uintptr
+	if enableAtomics {
+		atomicFeatures.shaderBufferFloat32AtomicAdd = 1
+		dci.pNext = uintptr(unsafe.Pointer(atomicFeatures))
+		extNames[0] = uintptr(unsafe.Pointer(&extNameBytes[0]))
+		dci.enabledExtensionCount = 1
+		dci.ppEnabledExtensionNames = uintptr(unsafe.Pointer(&extNames[0]))
+	}
 	var device uintptr
 	if res := vkCall(v.CreateDevice, b.physicalDevice, uintptr(unsafe.Pointer(&dci)), 0, uintptr(unsafe.Pointer(&device))); res != vkSuccess {
 		b.Close()
 		return nil, fmt.Errorf("vulkan: vkCreateDevice failed (%d)", int32(res))
 	}
+	runtime.KeepAlive(extNameBytes)
+	runtime.KeepAlive(atomicFeatures)
 	b.device = device
 	vkCall(v.GetDeviceQueue, device, uintptr(b.queueFamily), 0, uintptr(unsafe.Pointer(&b.queue)))
 
@@ -681,9 +796,10 @@ func New() (*Backend, error) {
 	}
 
 	b.caps = compute.Capabilities{
-		Name:          "vulkan(" + name + ")",
-		MaxBufferSize: math.MaxUint32,
-		MemoryBytes:   b.deviceMemorySize(),
+		Name:           "vulkan(" + name + ")",
+		Float32Atomics: enableAtomics,
+		MaxBufferSize:  math.MaxUint32,
+		MemoryBytes:    b.deviceMemorySize(),
 	}
 
 	d, err := b.allocBuffer(16, vkBufferUsageStorage|vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
@@ -742,11 +858,11 @@ func (b *Backend) setupDescriptors() error {
 		return fmt.Errorf("vulkan: create pipeline layout failed")
 	}
 
-	poolSize := descriptorPoolSize{typ: vkDescriptorTypeStorage, descriptorCount: maxBindings * 8192}
+	poolSize := descriptorPoolSize{typ: vkDescriptorTypeStorage, descriptorCount: maxBindings * 65536}
 	dpci := descriptorPoolCreateInfo{
 		sType:         vkStructureDescriptorPoolCi,
 		flags:         vkDescriptorPoolFreeSet,
-		maxSets:       8192,
+		maxSets:       65536,
 		poolSizeCount: 1,
 		pPoolSizes:    uintptr(unsafe.Pointer(&poolSize)),
 	}
@@ -839,6 +955,7 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 			return nil, fmt.Errorf("vulkan: map memory failed")
 		}
 	}
+	b.deviceBytes += req.size
 	return &buffer{b: b, buf: buf, mem: mem, mapped: mapped, hostVisible: hostVisible, usage: usage, staging: hostOnly, size: size, typ: quant.TypeF32}, nil
 }
 
@@ -875,6 +992,7 @@ func (b *Backend) Stats() Stats {
 	defer b.mu.Unlock()
 	s := b.stats
 	s.PooledBytes = b.poolBytes
+	s.DeviceBytes = b.deviceBytes
 	return s
 }
 
@@ -1175,6 +1293,14 @@ func (b *Backend) writeBytes(x *buffer, src []byte) error {
 	}
 	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: uint64(len(src))}
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, staging.buf, x.buf, 1, uintptr(unsafe.Pointer(&region)))
+	// Make the transfer visible to the compute stage before any dispatch reads
+	// the buffer.
+	barrier := memoryBarrier{
+		sType:         vkStructureMemoryBarrier,
+		srcAccessMask: vkAccessTransferWrite,
+		dstAccessMask: vkAccessShaderRead | vkAccessShaderWrite,
+	}
+	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageTransfer, vkPipelineStageCompute, 0, 1, uintptr(unsafe.Pointer(&barrier)), 0, 0, 0, 0)
 	b.Free(staging) // deferred until the flush submits the copy
 	return nil
 }
@@ -1196,6 +1322,13 @@ func (b *Backend) readBytes(x *buffer, n int) ([]byte, error) {
 		return nil, err
 	}
 	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: uint64(n)}
+	// Make prior compute writes visible to the transfer stage.
+	barrier := memoryBarrier{
+		sType:         vkStructureMemoryBarrier,
+		srcAccessMask: vkAccessShaderWrite,
+		dstAccessMask: vkAccessTransferRead,
+	}
+	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageCompute, vkPipelineStageTransfer, 0, 1, uintptr(unsafe.Pointer(&barrier)), 0, 0, 0, 0)
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, x.buf, staging.buf, 1, uintptr(unsafe.Pointer(&region)))
 	if err := b.flush(); err != nil {
 		b.destroyBuffer(staging)

@@ -80,7 +80,7 @@ func (b *Backend) Download(buf compute.Buffer) (*compute.Tensor, error) {
 // recorded are destroyed after the next flush.
 func (b *Backend) Free(buf compute.Buffer) {
 	x, ok := buf.(*buffer)
-	if !ok || x == nil {
+	if !ok || x == nil || x.shared {
 		return
 	}
 	if b.recording {
@@ -91,8 +91,11 @@ func (b *Backend) Free(buf compute.Buffer) {
 }
 
 // destroyBuffer releases a buffer back to the pool, or frees it when the pool
-// is disabled or full.
+// is disabled or full. Non-owning views are ignored.
 func (b *Backend) destroyBuffer(x *buffer) {
+	if x.shared {
+		return
+	}
 	if !b.closed && b.poolPut(x) {
 		return
 	}
@@ -107,6 +110,9 @@ func (b *Backend) freeBuffer(x *buffer) {
 	}
 	vkCall(b.vk.DestroyBuffer, b.device, x.buf, 0)
 	vkCall(b.vk.FreeMemory, b.device, x.mem, 0)
+	if b.deviceBytes >= x.size {
+		b.deviceBytes -= x.size
+	}
 }
 
 // drainPool frees every pooled buffer.
@@ -430,6 +436,237 @@ func (b *Backend) SoftmaxBack(out, dOut compute.Buffer) (compute.Buffer, error) 
 	return dx, nil
 }
 
+// CrossEntropy implements compute.Backend.
+func (b *Backend) CrossEntropy(logits compute.Buffer, targets []int32, ignoreIndex int) (compute.Buffer, compute.Buffer, error) {
+	t, err := asBuffer(logits)
+	if err != nil {
+		return nil, nil, err
+	}
+	V := t.Ne0()
+	T := dimOr1(t.dims, 1)
+	if len(targets) != T {
+		return nil, nil, compute.ErrShape
+	}
+	lb, err := b.newZeroF32Buffer(1)
+	if err != nil {
+		return nil, nil, err
+	}
+	dl, err := b.newZeroF32Buffer(V, T)
+	if err != nil {
+		b.Free(lb)
+		return nil, nil, err
+	}
+	count := 0
+	for _, tg := range targets {
+		if int(tg) != ignoreIndex {
+			count++
+		}
+	}
+	inv := float32(0)
+	if count > 0 {
+		inv = 1 / float32(count)
+	}
+	idx, err := b.uploadInt32(targets)
+	if err != nil {
+		b.Free(lb)
+		b.Free(dl)
+		return nil, nil, err
+	}
+	defer b.Free(idx)
+	pc := push(uint32(V), uint32(T), inv, ignoreIndex)
+	if err := b.dispatch("cross_entropy", []*buffer{t, idx, lb, dl}, pc, [3]uint32{uint32(T), 1, 1}); err != nil {
+		b.Free(lb)
+		b.Free(dl)
+		return nil, nil, err
+	}
+	return lb, dl, nil
+}
+
+// SplitQG implements compute.Backend.
+func (b *Backend) SplitQG(qg compute.Buffer, hd, nHead, T int) (compute.Buffer, compute.Buffer, error) {
+	x, err := asBuffer(qg)
+	if err != nil {
+		return nil, nil, err
+	}
+	q, err := b.newF32Buffer(hd, nHead, T)
+	if err != nil {
+		return nil, nil, err
+	}
+	gate, err := b.newF32Buffer(nHead*hd, T)
+	if err != nil {
+		b.Free(q)
+		return nil, nil, err
+	}
+	total := uint32(hd * nHead * T)
+	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
+	if err := b.dispatch("qg_split", []*buffer{x, q, gate}, push(uint32(hd), uint32(nHead), uint32(T), uint32(0)), groups); err != nil {
+		b.Free(q)
+		b.Free(gate)
+		return nil, nil, err
+	}
+	return q, gate, nil
+}
+
+// SplitQGBack implements compute.Backend.
+func (b *Backend) SplitQGBack(dq, dgate compute.Buffer) (compute.Buffer, error) {
+	a, err := asBuffer(dq)
+	if err != nil {
+		return nil, err
+	}
+	g, err := asBuffer(dgate)
+	if err != nil {
+		return nil, err
+	}
+	hd := a.Ne0()
+	nHead := dimOr1(a.dims, 1)
+	T := dimOr1(a.dims, 2)
+	dqg, err := b.newF32Buffer(2*hd*nHead, T)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(hd * nHead * T)
+	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
+	if err := b.dispatch("qg_merge", []*buffer{a, g, dqg}, push(uint32(hd), uint32(nHead), uint32(T), uint32(0)), groups); err != nil {
+		b.Free(dqg)
+		return nil, err
+	}
+	return dqg, nil
+}
+
+// Reshape implements compute.Backend. It returns a non-owning view with new
+// dims; the caller must not free it (Free is a no-op anyway).
+func (b *Backend) Reshape(buf compute.Buffer, dims []int) (compute.Buffer, error) {
+	x, err := asBuffer(buf)
+	if err != nil {
+		return nil, err
+	}
+	n := 1
+	for _, d := range dims {
+		n *= d
+	}
+	if n != x.NumElements() {
+		return nil, compute.ErrShape
+	}
+	v := *x
+	v.dims = append([]int(nil), dims...)
+	v.shared = true
+	return &v, nil
+}
+
+// ConvInput implements compute.Backend. The history rows are zeroed.
+func (b *Backend) ConvInput(qkv compute.Buffer, dConv, convDim, T int) (compute.Buffer, error) {
+	t, err := asBuffer(qkv)
+	if err != nil {
+		return nil, err
+	}
+	ncs := dConv - 1 + T
+	out, err := b.newZeroF32Buffer(ncs, convDim, 1)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(convDim * T)
+	if err := b.dispatch("conv_input", []*buffer{t, out}, push(uint32(dConv), uint32(convDim), uint32(T), uint32(ncs)), [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// ConvInputBack implements compute.Backend.
+func (b *Backend) ConvInputBack(dConvIn compute.Buffer, dConv, convDim, T int) (compute.Buffer, error) {
+	t, err := asBuffer(dConvIn)
+	if err != nil {
+		return nil, err
+	}
+	ncs := dConv - 1 + T
+	out, err := b.newF32Buffer(convDim, T)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(convDim * T)
+	if err := b.dispatch("conv_input_back", []*buffer{t, out}, push(uint32(dConv), uint32(convDim), uint32(T), uint32(ncs)), [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// GatherHeads implements compute.Backend.
+func (b *Backend) GatherHeads(convOut compute.Buffer, offset, headDim, nHead, T, convDim int) (compute.Buffer, error) {
+	t, err := asBuffer(convOut)
+	if err != nil {
+		return nil, err
+	}
+	out, err := b.newF32Buffer(headDim, nHead, T)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(headDim * nHead * T)
+	pc := push(uint32(offset), uint32(headDim), uint32(nHead), uint32(T), uint32(convDim), uint32(0))
+	if err := b.dispatch("gather_heads", []*buffer{t, out}, pc, [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// GatherHeadsBack implements compute.Backend.
+func (b *Backend) GatherHeadsBack(dOut compute.Buffer, offset, headDim, nHead, T, convDim int) (compute.Buffer, error) {
+	t, err := asBuffer(dOut)
+	if err != nil {
+		return nil, err
+	}
+	out, err := b.newZeroF32Buffer(convDim, T)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(headDim * nHead * T)
+	pc := push(uint32(offset), uint32(headDim), uint32(nHead), uint32(T), uint32(convDim), uint32(0))
+	if err := b.dispatch("gather_heads_back", []*buffer{t, out}, pc, [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// RepeatHeads implements compute.Backend.
+func (b *Backend) RepeatHeads(x compute.Buffer, headDim, nIn, nOut, T int) (compute.Buffer, error) {
+	t, err := asBuffer(x)
+	if err != nil {
+		return nil, err
+	}
+	out, err := b.newF32Buffer(headDim, nOut, T)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(headDim * nOut * T)
+	pc := push(uint32(headDim), uint32(nIn), uint32(nOut), uint32(T))
+	if err := b.dispatch("repeat_heads", []*buffer{t, out}, pc, [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// RepeatHeadsBack implements compute.Backend.
+func (b *Backend) RepeatHeadsBack(dOut compute.Buffer, headDim, nIn, nOut, T int) (compute.Buffer, error) {
+	t, err := asBuffer(dOut)
+	if err != nil {
+		return nil, err
+	}
+	out, err := b.newF32Buffer(headDim, nIn, T)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(headDim * nIn * T)
+	pc := push(uint32(headDim), uint32(nIn), uint32(nOut), uint32(T))
+	if err := b.dispatch("repeat_heads_back", []*buffer{t, out}, pc, [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
 // GetRows implements compute.Backend.
 func (b *Backend) GetRows(table compute.Buffer, indices []int32) (compute.Buffer, error) {
 	tt, err := asBuffer(table)
@@ -451,6 +688,50 @@ func (b *Backend) GetRows(table compute.Buffer, indices []int32) (compute.Buffer
 	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
 	if err := b.dispatch("get_rows", []*buffer{tt, idxBuf, out}, push(uint32(rowLen), uint32(nRows), uint32(len(indices))), groups); err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+// GetRowsWeight implements compute.Backend. Quantized tables are gathered one
+// row at a time by running the type's dequant shader on that row's blocks,
+// writing the dequantized row into the output. This avoids materializing the
+// huge embedding table as float32.
+func (b *Backend) GetRowsWeight(w compute.Buffer, indices []int32) (compute.Buffer, error) {
+	wb, err := asBuffer(w)
+	if err != nil {
+		return nil, err
+	}
+	if wb.typ == quant.TypeF32 {
+		return b.GetRows(w, indices)
+	}
+	in := wb.Ne0()
+	nRows := dimOr1(wb.dims, 1)
+	sh, ok := dequantShaders[wb.typ]
+	if !ok {
+		return nil, fmt.Errorf("vulkan: no dequant shader for %s", wb.typ)
+	}
+	blocksPerRow := in
+	if sh.blockElems > 1 {
+		if in%sh.blockElems != 0 {
+			return nil, fmt.Errorf("vulkan: row length %d not a multiple of block %d", in, sh.blockElems)
+		}
+		blocksPerRow = in / sh.blockElems
+	}
+	out, err := b.newF32Buffer(in, len(indices))
+	if err != nil {
+		return nil, err
+	}
+	groups := [3]uint32{ceilDiv(uint32(blocksPerRow), 64), 1, 1}
+	for t, idx := range indices {
+		if idx < 0 || int(idx) >= nRows {
+			b.Free(out)
+			return nil, compute.ErrShape
+		}
+		pc := push(uint32(blocksPerRow), uint32(int(idx)*blocksPerRow), uint32(t*blocksPerRow), uint32(0))
+		if err := b.dispatch(sh.name, []*buffer{wb, out}, pc, groups); err != nil {
+			b.Free(out)
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -752,6 +1033,137 @@ func (b *Backend) GatedDeltaNet(q, k, v, g, beta, state compute.Buffer) (compute
 	return out, ns, nil
 }
 
+// newZeroF32Buffer allocates a float32 buffer and zeroes it (for atomic
+// accumulation targets).
+func (b *Backend) newZeroF32Buffer(dims ...int) (*buffer, error) {
+	buf, err := b.newF32Buffer(dims...)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.writeBytes(buf, make([]byte, buf.size)); err != nil {
+		b.Free(buf)
+		return nil, err
+	}
+	return buf, nil
+}
+
+// GatedDeltaNetBackward implements compute.Backend with the atomic kernel
+// (VK_EXT_shader_atomic_float). It requires Float32Atomics support.
+func (b *Backend) GatedDeltaNetBackward(q, k, v, g, beta, state, dOut, dNewState compute.Buffer) (compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, error) {
+	tq, err := asBuffer(q)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	tk, err := asBuffer(k)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	tv, err := asBuffer(v)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	tg, err := asBuffer(g)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	tb, err := asBuffer(beta)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	ts, err := asBuffer(state)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	td, err := asBuffer(dOut)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	tn, err := asBuffer(dNewState)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	if !b.caps.Float32Atomics {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("vulkan: GatedDeltaNetBackward needs VK_EXT_shader_atomic_float")
+	}
+	sv := tq.Ne0()
+	h := dimOr1(tq.dims, 1)
+	nTok := dimOr1(tq.dims, 2)
+	gstride := tg.Ne0()
+	if sv > 256 || tv.Ne0() != sv || ts.Ne0() != sv {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("vulkan: GatedDeltaNetBackward unsupported shape (sv=%d)", sv)
+	}
+	kda := uint32(0)
+	if gstride == sv {
+		kda = 1
+	} else if gstride != 1 {
+		return nil, nil, nil, nil, nil, nil, compute.ErrShape
+	}
+	// The atomic kernel recomputes per-row states into a global scratch buffer
+	// (O(h*S_v^2*nTok)). Bound it so very long sequences fall back to the host
+	// rather than overrunning device memory or stalling the driver.
+	if uint64(h)*uint64(sv)*uint64(nTok+1)*uint64(sv) > 128*1024*1024 {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("vulkan: GatedDeltaNetBackward scratch too large; use the host path")
+	}
+	scale := float32(1 / math.Sqrt(float64(sv)))
+
+	scratch, err := b.newF32Buffer(h * sv * (nTok + 1) * sv)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	defer b.Free(scratch)
+	dQ, err := b.newZeroF32Buffer(tq.dims...)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dK, err := b.newZeroF32Buffer(tk.dims...)
+	if err != nil {
+		b.Free(dQ)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dV, err := b.newF32Buffer(tv.dims...)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dG, err := b.newZeroF32Buffer(tg.dims...)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dBeta, err := b.newZeroF32Buffer(tb.dims...)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		b.Free(dG)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dState, err := b.newF32Buffer(ts.dims...)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		b.Free(dG)
+		b.Free(dBeta)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	pc := push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda)
+	bindings := []*buffer{tq, tk, tv, tg, tb, ts, td, tn, scratch, dQ, dK, dV, dG, dBeta, dState}
+	if err := b.dispatch("gdn_back", bindings, pc, [3]uint32{uint32(h * sv), 1, 1}); err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		b.Free(dG)
+		b.Free(dBeta)
+		b.Free(dState)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	return dQ, dK, dV, dG, dBeta, dState, nil
+}
+
 // gatedDeltaNetHost is the fallback used when the dimensions exceed the shader.
 func (b *Backend) gatedDeltaNetHost(q, k, v, g, beta, state compute.Buffer) (compute.Buffer, compute.Buffer, error) {
 	dq, err := b.Download(q)
@@ -810,7 +1222,13 @@ func (b *Backend) Copy(dst, src compute.Buffer) error {
 		return err
 	}
 	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: s.size}
+	// Prior compute writes to src must be visible to the transfer stage, and
+	// the result visible to later compute.
+	pre := memoryBarrier{sType: vkStructureMemoryBarrier, srcAccessMask: vkAccessShaderWrite, dstAccessMask: vkAccessTransferRead}
+	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageCompute, vkPipelineStageTransfer, 0, 1, uintptr(unsafe.Pointer(&pre)), 0, 0, 0, 0)
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, s.buf, d.buf, 1, uintptr(unsafe.Pointer(&region)))
+	post := memoryBarrier{sType: vkStructureMemoryBarrier, srcAccessMask: vkAccessTransferWrite, dstAccessMask: vkAccessShaderRead | vkAccessShaderWrite}
+	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageTransfer, vkPipelineStageCompute, 0, 1, uintptr(unsafe.Pointer(&post)), 0, 0, 0, 0)
 	return nil
 }
 

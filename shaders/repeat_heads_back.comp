@@ -1,0 +1,20 @@
+#version 450
+// Gradient of repeat_heads.comp. Atomic-free: one invocation per input element
+// sums the output heads that map to it.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer DOut { float do_[]; };
+layout(binding = 1) writeonly buffer DX   { float dx[];  };
+layout(push_constant) uniform P { uint headDim; uint nIn; uint nOut; uint T; } p;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.headDim * p.nIn * p.T) { return; }
+    uint d = gid % p.headDim;
+    uint rem = gid / p.headDim;
+    uint hh = rem % p.nIn;
+    uint t = rem / p.nIn;
+    float s = 0.0;
+    for (uint o = hh; o < p.nOut; o += p.nIn) {
+        s += do_[d + o * p.headDim + t * p.nOut * p.headDim];
+    }
+    dx[gid] = s;
+}

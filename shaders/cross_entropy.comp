@@ -1,0 +1,70 @@
+#version 450
+
+// Fused softmax cross-entropy. One workgroup per token; 256 lanes reduce over
+// the vocabulary. Produces the per-token dLogits = (softmax - onehot) * invCount
+// and accumulates loss += -log p_target * invCount (atomicAdd). Rows whose
+// target equals ignore contribute nothing (the caller zeroes dLogits).
+
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Logits  { float logits[];  };
+layout(binding = 1) readonly buffer Targets { int   targets[]; };
+layout(binding = 2)          buffer DLoss   { float dloss[];   };
+layout(binding = 3)          buffer DLogits { float dlogits[]; };
+
+layout(push_constant) uniform P {
+    uint  V;
+    uint  T;
+    float invCount;
+    int   ignore;
+} p;
+
+shared float red[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    int  target = targets[t];
+
+    // Row max.
+    float m = -1e30;
+    for (uint v = lane; v < p.V; v += 256u) {
+        m = max(m, logits[v + t * p.V]);
+    }
+    red[lane] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) { red[lane] = max(red[lane], red[lane + s]); }
+        barrier();
+    }
+    float mx = red[0];
+
+    if (target == p.ignore) {
+        return;
+    }
+
+    // Sum of exp.
+    float sum = 0.0;
+    for (uint v = lane; v < p.V; v += 256u) {
+        sum += exp(logits[v + t * p.V] - mx);
+    }
+    red[lane] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) { red[lane] += red[lane + s]; }
+        barrier();
+    }
+    float sm = red[0];
+
+    for (uint v = lane; v < p.V; v += 256u) {
+        float e = exp(logits[v + t * p.V] - mx) / sm;
+        float oh = (v == uint(target)) ? 1.0 : 0.0;
+        dlogits[v + t * p.V] = (e - oh) * p.invCount;
+    }
+    if (lane == 0u) {
+        float pt = exp(logits[uint(target) + t * p.V] - mx) / sm;
+        atomicAdd(dloss[0], -log(pt) * p.invCount);
+    }
+}

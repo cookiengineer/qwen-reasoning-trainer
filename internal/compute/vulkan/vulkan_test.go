@@ -965,3 +965,169 @@ func maxAbsDiffLocal(a, b []float32) float64 {
 	}
 	return m
 }
+
+func TestVulkanGatedDeltaNetBackward(t *testing.T) {
+	c, v := newBackends(t)
+	if !v.Capabilities().Float32Atomics {
+		t.Skip("vulkan device lacks float32 atomics")
+	}
+	const sv, h, nTok = 3, 2, 5
+	q := autograd.Random(80, 1.0, sv, h, nTok)
+	k := autograd.Random(81, 1.0, sv, h, nTok)
+	vv := autograd.Random(82, 1.0, sv, h, nTok)
+	beta := autograd.Random(84, 0.5, 1, h, nTok)
+	state := autograd.Random(85, 0.5, sv, sv, h)
+	dOut := autograd.Random(86, 1.0, sv, h, nTok)
+	dNew := autograd.Random(87, 1.0, sv, sv, h)
+
+	for _, kda := range []bool{false, true} {
+		var g *compute.Tensor
+		if kda {
+			g = autograd.Random(83, 0.3, sv, h, nTok)
+		} else {
+			g = autograd.Random(83, 0.3, 1, h, nTok)
+		}
+		name := "scalar"
+		if kda {
+			name = "kda"
+		}
+		cq, ck, cvv, cg, cb, cs, err := c.GatedDeltaNetBackward(
+			up(t, c, q.Dims, q.F32), up(t, c, k.Dims, k.F32), up(t, c, vv.Dims, vv.F32),
+			up(t, c, g.Dims, g.F32), up(t, c, beta.Dims, beta.F32), up(t, c, state.Dims, state.F32),
+			up(t, c, dOut.Dims, dOut.F32), up(t, c, dNew.Dims, dNew.F32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		vq, vk, vvv, vg, vb, vs, err := v.GatedDeltaNetBackward(
+			up(t, v, q.Dims, q.F32), up(t, v, k.Dims, k.F32), up(t, v, vv.Dims, vv.F32),
+			up(t, v, g.Dims, g.F32), up(t, v, beta.Dims, beta.F32), up(t, v, state.Dims, state.F32),
+			up(t, v, dOut.Dims, dOut.F32), up(t, v, dNew.Dims, dNew.F32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		compare(t, name+" dQ", down(t, v, vq), down(t, c, cq))
+		compare(t, name+" dK", down(t, v, vk), down(t, c, ck))
+		compare(t, name+" dV", down(t, v, vvv), down(t, c, cvv))
+		compare(t, name+" dG", down(t, v, vg), down(t, c, cg))
+		compare(t, name+" dBeta", down(t, v, vb), down(t, c, cb))
+		compare(t, name+" dState", down(t, v, vs), down(t, c, cs))
+
+		// Independent oracle.
+		hq, hk, hvv, hg, hb, hs, err := autograd.GatedDeltaNetBackward(q, k, vv, g, beta, state, dOut, dNew)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			n    string
+			got  []float32
+			want *compute.Tensor
+		}{
+			{name + " dQ", down(t, v, vq), hq}, {name + " dK", down(t, v, vk), hk},
+			{name + " dV", down(t, v, vvv), hvv}, {name + " dG", down(t, v, vg), hg},
+			{name + " dBeta", down(t, v, vb), hb}, {name + " dState", down(t, v, vs), hs},
+		} {
+			if d := maxAbsDiffLocal(tc.got, tc.want.F32); d > 1e-3 {
+				t.Fatalf("%s: device vs autograd max diff %g", tc.n, d)
+			}
+		}
+	}
+}
+
+func TestVulkanHeadViewOps(t *testing.T) {
+	c, v := newBackends(t)
+	const dConv, convDim, T = 3, 8, 4
+	ncs := dConv - 1 + T
+	qkv := autograd.Random(90, 1.0, convDim, T)
+	cv := autograd.Random(91, 1.0, convDim, T)
+
+	// ConvInput / back.
+	ciC, _ := c.ConvInput(up(t, c, []int{convDim, T}, qkv.F32), dConv, convDim, T)
+	ciV, _ := v.ConvInput(up(t, v, []int{convDim, T}, qkv.F32), dConv, convDim, T)
+	compare(t, "conv_input", down(t, v, ciV), down(t, c, ciC))
+	cbC, _ := c.ConvInputBack(up(t, c, []int{ncs, convDim, 1}, autograd.Random(95, 1.0, ncs, convDim, 1).F32), dConv, convDim, T)
+	cbV, _ := v.ConvInputBack(up(t, v, []int{ncs, convDim, 1}, autograd.Random(95, 1.0, ncs, convDim, 1).F32), dConv, convDim, T)
+	compare(t, "conv_input_back", down(t, v, cbV), down(t, c, cbC))
+
+	// GatherHeads / back.
+	const offset, headDim, nHead = 2, 2, 3
+	gC, _ := c.GatherHeads(up(t, c, []int{convDim, T}, cv.F32), offset, headDim, nHead, T, convDim)
+	gV, _ := v.GatherHeads(up(t, v, []int{convDim, T}, cv.F32), offset, headDim, nHead, T, convDim)
+	compare(t, "gather_heads", down(t, v, gV), down(t, c, gC))
+	dg := autograd.Random(92, 1.0, headDim, nHead, T)
+	gbC, _ := c.GatherHeadsBack(up(t, c, []int{headDim, nHead, T}, dg.F32), offset, headDim, nHead, T, convDim)
+	gbV, _ := v.GatherHeadsBack(up(t, v, []int{headDim, nHead, T}, dg.F32), offset, headDim, nHead, T, convDim)
+	compare(t, "gather_heads_back", down(t, v, gbV), down(t, c, gbC))
+
+	// RepeatHeads / back.
+	const hd, nIn, nOut = 2, 2, 4
+	rx := autograd.Random(93, 1.0, hd, nIn, T)
+	rC, _ := c.RepeatHeads(up(t, c, []int{hd, nIn, T}, rx.F32), hd, nIn, nOut, T)
+	rV, _ := v.RepeatHeads(up(t, v, []int{hd, nIn, T}, rx.F32), hd, nIn, nOut, T)
+	compare(t, "repeat_heads", down(t, v, rV), down(t, c, rC))
+	drx := autograd.Random(94, 1.0, hd, nOut, T)
+	rbC, _ := c.RepeatHeadsBack(up(t, c, []int{hd, nOut, T}, drx.F32), hd, nIn, nOut, T)
+	rbV, _ := v.RepeatHeadsBack(up(t, v, []int{hd, nOut, T}, drx.F32), hd, nIn, nOut, T)
+	compare(t, "repeat_heads_back", down(t, v, rbV), down(t, c, rbC))
+}
+
+func TestVulkanGetRowsWeight(t *testing.T) {
+	c, v := newBackends(t)
+	const in, nRows = 256, 5
+	wf := make([]float32, in*nRows)
+	for i := range wf {
+		wf[i] = float32((i%19)-9) * 0.2
+	}
+	indices := []int32{3, 0, 4, 3}
+	for _, typ := range []quant.Type{quant.TypeQ4_K, quant.TypeQ5_K, quant.TypeQ6_K, quant.TypeIQ4_XS} {
+		raw, err := quant.Quantize(typ, wf)
+		if err != nil {
+			t.Fatalf("%s: %v", typ, err)
+		}
+		cw, _ := c.UploadWeight(typ, raw, []int{in, nRows})
+		vw, _ := v.UploadWeight(typ, raw, []int{in, nRows})
+		co, err := c.GetRowsWeight(cw, indices)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vo, err := v.GetRowsWeight(vw, indices)
+		if err != nil {
+			t.Fatal(err)
+		}
+		compare(t, "get_rows_weight "+typ.String(), down(t, v, vo), down(t, c, co))
+	}
+}
+
+func TestVulkanCrossEntropy(t *testing.T) {
+	c, v := newBackends(t)
+	const V, T = 37, 4
+	logits := autograd.Random(700, 2.0, V, T)
+	targets := []int32{3, -100, 10, 36}
+
+	cl, cd, err := c.CrossEntropy(up(t, c, []int{V, T}, logits.F32), targets, -100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vl, vd, err := v.CrossEntropy(up(t, v, []int{V, T}, logits.F32), targets, -100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotL := down(t, v, vl)
+	wantL := down(t, c, cl)
+	if d := math.Abs(float64(gotL[0] - wantL[0])); d > 1e-5 {
+		t.Fatalf("loss %g vs %g", gotL[0], wantL[0])
+	}
+	compare(t, "cross_entropy dLogits", down(t, v, vd), down(t, c, cd))
+
+	// Independent oracle: compute.CrossEntropy + autograd.CrossEntropyBackward.
+	refLoss, err := compute.CrossEntropy(logits, []int{3, -100, 10, 36}, -100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := math.Abs(float64(gotL[0] - refLoss)); d > 1e-5 {
+		t.Fatalf("loss vs oracle: %g vs %g", gotL[0], refLoss)
+	}
+	refD := autograd.CrossEntropyBackward(logits, []int{3, -100, 10, 36}, -100)
+	if d := maxAbsDiffLocal(down(t, v, vd), refD.F32); d > 1e-5 {
+		t.Fatalf("dLogits vs oracle: max diff %g", d)
+	}
+}

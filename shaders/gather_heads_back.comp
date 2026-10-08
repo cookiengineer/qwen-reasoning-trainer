@@ -1,0 +1,16 @@
+#version 450
+// Gradient of gather_heads.comp: scatter into the conv-output region. The
+// caller zeroes dConvOut first (q, k and v scatter into disjoint regions).
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer DOut     { float do_[]; };
+layout(binding = 1) writeonly buffer DConvOut { float dc[];  };
+layout(push_constant) uniform P { uint offset; uint headDim; uint nHead; uint T; uint convDim; uint pad; } p;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.headDim * p.nHead * p.T) { return; }
+    uint d = gid % p.headDim;
+    uint rem = gid / p.headDim;
+    uint hh = rem % p.nHead;
+    uint t = rem / p.nHead;
+    dc[(p.offset + hh * p.headDim + d) + t * p.convDim] = do_[gid];
+}

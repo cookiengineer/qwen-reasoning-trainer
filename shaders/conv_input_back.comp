@@ -1,0 +1,13 @@
+#version 450
+// Gradient of conv_input.comp: gather the qkv rows back out of the conv input.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer DConvIn { float dconin[]; };
+layout(binding = 1) writeonly buffer DQKV    { float dqkv[];   };
+layout(push_constant) uniform P { uint dConv; uint convDim; uint T; uint ncs; } p;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= p.convDim * p.T) { return; }
+    uint ch = gid % p.convDim;
+    uint t = gid / p.convDim;
+    dqkv[gid] = dconin[(p.dConv - 1u + t) + ch * p.ncs];
+}
