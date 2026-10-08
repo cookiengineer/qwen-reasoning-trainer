@@ -1,0 +1,61 @@
+#version 450
+
+// Fused Q4_K dequantize + GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
+// One invocation per output row, so the weight is read once and never
+// materialized as float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint K; uint N; } p;
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+
+void getScaleMin(uint j, uint s, out uint d, out uint m) {
+    if (j < 4u) {
+        d = getb(s + j) & 63u;
+        m = getb(s + j + 4u) & 63u;
+    } else {
+        d = (getb(s + j + 4u) & 0xFu) | ((getb(s + j - 4u) >> 6) << 4);
+        m = (getb(s + j + 4u) >> 4) | ((getb(s + j) >> 6) << 4);
+    }
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint base = (n * bpr + blk) * 144u;
+        uint sbase = base + 4u;
+        uint qbase = base + 16u;
+        uint xb = blk * 256u;
+        float d = f16(base);
+        float mn = f16(base + 2u);
+        uint is = 0u;
+        for (uint j = 0u; j < 256u; j += 64u) {
+            uint sc1, m1, sc2, m2;
+            getScaleMin(is, sbase, sc1, m1);
+            getScaleMin(is + 1u, sbase, sc2, m2);
+            float d1 = d * float(sc1), mn1 = mn * float(m1);
+            float d2 = d * float(sc2), mn2 = mn * float(m2);
+            for (uint l = 0u; l < 32u; l++) {
+                uint q = getb(qbase + (j >> 1u) + l);
+                acc += (d1 * float(q & 0xFu) - mn1) * x[xb + j + l];
+            }
+            for (uint l = 0u; l < 32u; l++) {
+                uint q = getb(qbase + (j >> 1u) + l);
+                acc += (d2 * float(q >> 4u) - mn2) * x[xb + j + 32u + l];
+            }
+            is += 2u;
+        }
+    }
+    y[n] = acc;
+}

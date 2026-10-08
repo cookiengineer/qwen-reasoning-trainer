@@ -1,0 +1,46 @@
+#version 450
+
+// Fused IQ4_XS dequantize + GEMV.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint K; uint N; } p;
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+
+const float KV[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint base = (n * bpr + blk) * 136u;
+        uint xb = blk * 256u;
+        float d = f16(base);
+        uint sh = getb(base + 2u) | (getb(base + 3u) << 8u);
+        uint o = 0u;
+        for (uint ib = 0u; ib < 8u; ib++) {
+            uint sl = getb(base + 4u + (ib >> 1u));
+            int ls = int((sl >> (4u * (ib & 1u))) & 0xFu) | int(((sh >> (2u * ib)) & 3u) << 4u);
+            float dl = d * float(ls - 32);
+            for (uint j = 0u; j < 16u; j++) {
+                uint qb = getb(base + 8u + ib * 16u + j);
+                acc += dl * KV[qb & 0xFu] * x[xb + o + j];
+                acc += dl * KV[qb >> 4u] * x[xb + o + j + 16u];
+            }
+            o += 32u;
+        }
+    }
+    y[n] = acc;
+}

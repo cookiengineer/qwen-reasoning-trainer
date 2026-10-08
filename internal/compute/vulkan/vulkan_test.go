@@ -336,3 +336,45 @@ func TestVulkanMatMulWeightBlocked(t *testing.T) {
 	}
 	compare(t, "matmulweight-blocked", down(t, v, got), wantT.F32)
 }
+
+func TestVulkanGemvFused(t *testing.T) {
+	_, v := newBackends(t)
+	types := []quant.Type{quant.TypeQ4_K, quant.TypeQ5_K, quant.TypeQ6_K, quant.TypeIQ4_XS}
+	for _, typ := range types {
+		offs, _ := dequantShaderCase(typ)
+		k, n := 256, 8
+		raw := buildRaw(typ, n, uint32(typ)+17, offs)
+		x := make([]float32, k)
+		for i := range x {
+			x[i] = float32(math.Sin(float64(i)*0.11)) * 0.5
+		}
+		// Expected: dequantize the weight then matmul with x.
+		dq, err := quant.Dequant(typ, raw, int64(k*n))
+		if err != nil {
+			t.Fatalf("%s: %v", typ, err)
+		}
+		wantT, err := compute.MatMul(&compute.Tensor{Dims: []int{k, n}, F32: dq}, &compute.Tensor{Dims: []int{k, 1}, F32: x})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb, err := v.UploadWeight(typ, raw, []int{k, n})
+		if err != nil {
+			t.Fatal(err)
+		}
+		xb := up(t, v, []int{k, 1}, x)
+		got, err := v.MatMulWeight(wb, xb)
+		if err != nil {
+			t.Fatalf("%s: %v", typ, err)
+		}
+		vgot := down(t, v, got)
+		if len(vgot) != n {
+			t.Fatalf("%s: len %d", typ, len(vgot))
+		}
+		for i := 0; i < n; i++ {
+			tol := 1e-3 + 1e-3*float32(math.Abs(float64(wantT.F32[i])))
+			if float32(math.Abs(float64(vgot[i]-wantT.F32[i]))) > tol {
+				t.Fatalf("%s[%d]: got %v want %v", typ, i, vgot[i], wantT.F32[i])
+			}
+		}
+	}
+}

@@ -1,12 +1,24 @@
 package vulkan
 
 import (
+	"errors"
 	"fmt"
 	"unsafe"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
+
+// errNoGemv reports that no fused dequant+GEMV shader exists for a type.
+var errNoGemv = errors.New("vulkan: no fused gemv shader")
+
+// gemvShaders maps a quantized type to its fused dequantize+GEMV shader.
+var gemvShaders = map[quant.Type]string{
+	quant.TypeQ4_K:   "gemv_q4_k",
+	quant.TypeQ5_K:   "gemv_q5_k",
+	quant.TypeQ6_K:   "gemv_q6_k",
+	quant.TypeIQ4_XS: "gemv_iq4_xs",
+}
 
 // Capabilities implements compute.Backend.
 func (b *Backend) Capabilities() compute.Capabilities { return b.caps }
@@ -544,6 +556,30 @@ func (b *Backend) DequantWeight(w compute.Buffer) (compute.Buffer, error) {
 	return b.dequantRange(x, 0, 0, count, x.dims)
 }
 
+// gemv computes y = W * x for a single activation column using a fused
+// dequantize+GEMV shader. It returns errNoGemv when the type has no shader.
+func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
+	name, ok := gemvShaders[w.typ]
+	if !ok {
+		return nil, errNoGemv
+	}
+	k := w.Ne0()
+	n := dimOr1(w.dims, 1)
+	if x.NumElements() < k {
+		return nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(n, 1)
+	if err != nil {
+		return nil, err
+	}
+	groups := [3]uint32{ceilDiv(uint32(n), 64), 1, 1}
+	if err := b.dispatch(name, []*buffer{w, x, out}, push(uint32(k), uint32(n)), groups); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
 // MatMulWeight implements compute.Backend. Quantized weights are processed in
 // row blocks: each block is dequantized on the device into a bounded float32
 // scratch buffer and multiplied, then the results are assembled on the host.
@@ -572,6 +608,16 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	}
 	if sh.blockElems > 1 && k%sh.blockElems != 0 {
 		return nil, fmt.Errorf("vulkan: row length %d not a multiple of block %d", k, sh.blockElems)
+	}
+
+	// Single-token decode: use a fused dequantize+GEMV shader when available,
+	// which avoids materializing the weight as float32.
+	if m == 1 {
+		if out, gerr := b.gemv(wb, xb); gerr == nil {
+			return out, nil
+		} else if !errors.Is(gerr, errNoGemv) {
+			return nil, gerr
+		}
 	}
 
 	// Bound the float32 scratch to ~256 MiB and the block count per dequant
