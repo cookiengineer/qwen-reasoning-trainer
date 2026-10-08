@@ -90,13 +90,34 @@ func (b *Backend) Free(buf compute.Buffer) {
 	b.destroyBuffer(x)
 }
 
+// destroyBuffer releases a buffer back to the pool, or frees it when the pool
+// is disabled or full.
 func (b *Backend) destroyBuffer(x *buffer) {
+	if !b.closed && b.poolPut(x) {
+		return
+	}
+	b.freeBuffer(x)
+}
+
+// freeBuffer unmaps and destroys a buffer's Vulkan resources.
+func (b *Backend) freeBuffer(x *buffer) {
 	if x.mapped != nil {
 		vkCall(b.vk.UnmapMemory, b.device, x.mem)
 		x.mapped = nil
 	}
 	vkCall(b.vk.DestroyBuffer, b.device, x.buf, 0)
 	vkCall(b.vk.FreeMemory, b.device, x.mem, 0)
+}
+
+// drainPool frees every pooled buffer.
+func (b *Backend) drainPool() {
+	for key, list := range b.pool {
+		for _, buf := range list {
+			b.freeBuffer(buf)
+		}
+		delete(b.pool, key)
+	}
+	b.poolBytes = 0
 }
 
 // Sync implements compute.Backend.
@@ -112,11 +133,12 @@ func (b *Backend) Close() error {
 	if b.recording {
 		b.flush()
 	}
+	b.closed = true
+	b.drainPool()
 	if b.dummy != nil {
-		b.destroyBuffer(b.dummy)
+		b.freeBuffer(b.dummy)
 		b.dummy = nil
 	}
-	b.closed = true
 	if b.device != 0 {
 		vkCall(b.vk.DeviceWaitIdle, b.device)
 		vkCall(b.vk.DestroyDevice, b.device, 0)

@@ -493,7 +493,36 @@ type Backend struct {
 	// recording; they are destroyed after the next flush.
 	recording bool
 	pending   []*buffer
+
+	// pool recycles device buffers by (size, usage, hostOnly) so a resident
+	// graph does not pay vkCreateBuffer/vkAllocateMemory per op. poolBytes is
+	// bounded by poolCap.
+	pool      map[poolKey][]*buffer
+	poolBytes uint64
+
+	stats Stats
 }
+
+// Stats counts device activity for profiling the host-mediated vs resident
+// execution paths.
+type Stats struct {
+	Dispatches      uint64
+	Submits         uint64
+	Allocs          uint64
+	PoolHits        uint64
+	BytesUploaded   uint64
+	BytesDownloaded uint64
+	PooledBytes     uint64
+}
+
+type poolKey struct {
+	size    uint64
+	usage   uint32
+	staging bool
+}
+
+// poolCap bounds the bytes retained by the buffer pool.
+const poolCap = 1 << 30
 
 type buffer struct {
 	b      *Backend
@@ -504,6 +533,8 @@ type buffer struct {
 	// directly from the host. Device-local buffers on discrete GPUs are not,
 	// and require staging copies.
 	hostVisible bool
+	usage       uint32
+	staging     bool
 	size        uint64
 	dims        []int
 	typ         quant.Type
@@ -745,6 +776,12 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	if size == 0 {
 		size = 4
 	}
+	if buf, ok := b.poolGet(poolKey{size: size, usage: usage, staging: hostOnly}); ok {
+		buf.dims = nil
+		buf.typ = quant.TypeF32
+		return buf, nil
+	}
+	b.stats.Allocs++
 	bci := bufferCreateInfo{
 		sType:       vkStructureBufferCreateInfo,
 		size:        size,
@@ -802,7 +839,50 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 			return nil, fmt.Errorf("vulkan: map memory failed")
 		}
 	}
-	return &buffer{b: b, buf: buf, mem: mem, mapped: mapped, hostVisible: hostVisible, size: size, typ: quant.TypeF32}, nil
+	return &buffer{b: b, buf: buf, mem: mem, mapped: mapped, hostVisible: hostVisible, usage: usage, staging: hostOnly, size: size, typ: quant.TypeF32}, nil
+}
+
+// poolGet returns a recycled buffer of the given key, if any.
+func (b *Backend) poolGet(key poolKey) (*buffer, bool) {
+	list := b.pool[key]
+	if len(list) == 0 {
+		return nil, false
+	}
+	buf := list[len(list)-1]
+	b.pool[key] = list[:len(list)-1]
+	b.poolBytes -= buf.size
+	b.stats.PoolHits++
+	return buf, true
+}
+
+// poolPut offers a buffer to the pool, returning false if the pool is full.
+func (b *Backend) poolPut(buf *buffer) bool {
+	if b.poolBytes+buf.size > poolCap {
+		return false
+	}
+	if b.pool == nil {
+		b.pool = map[poolKey][]*buffer{}
+	}
+	key := poolKey{size: buf.size, usage: buf.usage, staging: buf.staging}
+	b.pool[key] = append(b.pool[key], buf)
+	b.poolBytes += buf.size
+	return true
+}
+
+// Stats returns a snapshot of device activity counters.
+func (b *Backend) Stats() Stats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.stats
+	s.PooledBytes = b.poolBytes
+	return s
+}
+
+// ResetStats clears the device activity counters.
+func (b *Backend) ResetStats() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stats = Stats{}
 }
 
 func (b *Backend) memoryType(bits, flags uint32) (uint32, bool) {
@@ -931,6 +1011,7 @@ func (b *Backend) flush() error {
 		if res := vkCall(b.vk.WaitForFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence)), 1, ^uintptr(0)); res != vkSuccess {
 			return fmt.Errorf("vulkan: wait for fence failed")
 		}
+		b.stats.Submits++
 		b.recording = false
 	}
 	for _, x := range b.pending {
@@ -942,6 +1023,7 @@ func (b *Backend) flush() error {
 
 // dispatch records a compute dispatch into the current batch.
 func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups [3]uint32) error {
+	b.stats.Dispatches++
 	pipe, err := b.pipeline(name)
 	if err != nil {
 		return err
@@ -1077,6 +1159,7 @@ func (b *Backend) writeBytes(x *buffer, src []byte) error {
 	if len(src) == 0 {
 		return nil
 	}
+	b.stats.BytesUploaded += uint64(len(src))
 	if x.mapped != nil {
 		copy(unsafe.Slice((*byte)(x.mapped), len(src)), src)
 		return nil
@@ -1099,6 +1182,7 @@ func (b *Backend) writeBytes(x *buffer, src []byte) error {
 // readBytes returns a host copy of the buffer's contents, through a staging
 // buffer when the source is not host-visible. It flushes pending commands.
 func (b *Backend) readBytes(x *buffer, n int) ([]byte, error) {
+	b.stats.BytesDownloaded += uint64(n)
 	if x.mapped != nil {
 		out := make([]byte, n)
 		copy(out, unsafe.Slice((*byte)(x.mapped), n))
