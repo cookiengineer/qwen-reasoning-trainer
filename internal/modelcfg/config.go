@@ -39,6 +39,7 @@ type Config struct {
 
 	RopeTheta             float64
 	RopeSections          []int
+	RopeDimCount          int
 	RMSNormEps            float64
 	FullAttentionInterval int
 	NextNPredictLayers    int
@@ -76,6 +77,7 @@ func FromGGUF(g *gguf.File) (*Config, error) {
 		c.KeyLength = c.EmbeddingLength / c.HeadCount
 	}
 	c.RopeTheta = floatMeta(g, key("rope.freq_base"))
+	c.RopeDimCount = int(intMeta(g, key("rope.dimension_count")))
 	c.RMSNormEps = floatMeta(g, key("attention.layer_norm_rms_epsilon"))
 	c.FullAttentionInterval = int(intMeta(g, key("full_attention_interval")))
 	if c.FullAttentionInterval == 0 {

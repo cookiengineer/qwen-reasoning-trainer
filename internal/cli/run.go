@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute/vulkan"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/gguf"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/hf"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
@@ -19,6 +20,7 @@ Usage:
 Commands:
   download   Download the model GGUF from Hugging Face
   inspect    Print model architecture, tensor types, and size
+  gpu-info   Print Vulkan device capabilities
   help       Show this help
 
 Global flags:
@@ -51,6 +53,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return cmdDownload(cfg, stdout, stderr)
 	case "inspect":
 		return cmdInspect(cfg, stdout, stderr)
+	case "gpu-info":
+		return cmdGPUInfo(cfg, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", cfg.Command)
 		fmt.Fprint(stderr, usage)
@@ -95,6 +99,22 @@ func cmdDownload(cfg *Config, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stderr, "\nDone: %s\n", cfg.Model)
 	fmt.Fprintln(stdout, cfg.Model)
+	return 0
+}
+
+func cmdGPUInfo(cfg *Config, stdout, stderr io.Writer) int {
+	b, err := vulkan.New()
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	defer b.Close()
+	caps := b.Capabilities()
+	fmt.Fprintf(stdout, "backend:        %s\n", caps.Name)
+	fmt.Fprintf(stdout, "fp16:           %v\n", caps.FP16)
+	fmt.Fprintf(stdout, "bf16:           %v\n", caps.BF16)
+	fmt.Fprintf(stdout, "host fallback:  %v\n", caps.HostFallback)
+	fmt.Fprintf(stdout, "max buffer:     %d\n", caps.MaxBufferSize)
 	return 0
 }
 
