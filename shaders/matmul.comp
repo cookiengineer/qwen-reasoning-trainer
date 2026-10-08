@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer A { float a[]; };
+layout(binding = 1) readonly  buffer B { float b[]; };
+layout(binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint M;
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = p.N * p.M;
+    if (idx >= total) {
+        return;
+    }
+    uint n = idx % p.N;
+    uint m = idx / p.N;
+    uint aBase = n * p.K;
+    uint bBase = m * p.K;
+    float acc = 0.0;
+    for (uint k = 0; k < p.K; k++) {
+        acc += a[aBase + k] * b[bBase + k];
+    }
+    c[m * p.N + n] = acc;
+}

@@ -1,0 +1,25 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer T { float t[]; };
+layout(binding = 1) readonly  buffer I { int   idx[]; };
+layout(binding = 2) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint rowLen;
+    uint nRows;
+    uint count;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = p.count * p.rowLen;
+    if (gid >= total) {
+        return;
+    }
+    uint i = gid / p.rowLen;
+    uint d = gid % p.rowLen;
+    int row = idx[i];
+    o[gid] = t[uint(row) * p.rowLen + d];
+}

@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer X   { float x[]; };
+layout(binding = 1) readonly  buffer POS { int   pos[]; };
+layout(binding = 2) writeonly buffer O   { float o[]; };
+
+layout(push_constant) uniform P {
+    uint  headDim;
+    uint  nHead;
+    uint  nTok;
+    uint  nDims;
+    float theta;
+    uint  pad;
+} p;
+
+void main() {
+    uint hd = p.nDims / 2u;
+    uint total = p.nTok * p.nHead * hd;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= total) {
+        return;
+    }
+    uint i = gid % hd;
+    uint t = (gid / hd) / p.nHead;
+    uint h = (gid / hd) % p.nHead;
+    uint base = (t * p.nHead + h) * p.headDim;
+    float freq = pow(p.theta, -2.0 * float(i) / float(p.nDims));
+    float ang = float(pos[t]) * freq;
+    float c = cos(ang);
+    float s = sin(ang);
+    float x0 = x[base + i];
+    float x1 = x[base + i + hd];
+    o[base + i] = x0 * c - x1 * s;
+    o[base + i + hd] = x0 * s + x1 * c;
+}

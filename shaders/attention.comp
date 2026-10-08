@@ -1,0 +1,65 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly  buffer Q { float q[]; };
+layout(binding = 1) readonly  buffer K { float k[]; };
+layout(binding = 2) readonly  buffer V { float v[]; };
+layout(binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint  headDim;
+    uint  nTok;
+    uint  nHead;
+    uint  nHeadKV;
+    float scale;
+    uint  causal;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = p.nHead * p.nTok;
+    if (gid >= total) {
+        return;
+    }
+    uint i = gid % p.nTok;
+    uint h = gid / p.nTok;
+    uint group = p.nHead / p.nHeadKV;
+    uint kv = h / group;
+    uint maxJ = (p.causal == 1u) ? (i + 1u) : p.nTok;
+
+    uint qOff = (i * p.nHead + h) * p.headDim;
+    float m = -1e30;
+    for (uint j = 0; j < maxJ; j++) {
+        uint kOff = (j * p.nHeadKV + kv) * p.headDim;
+        float dot = 0.0;
+        for (uint d = 0; d < p.headDim; d++) {
+            dot += q[qOff + d] * k[kOff + d];
+        }
+        dot *= p.scale;
+        m = max(m, dot);
+    }
+    float sum = 0.0;
+    for (uint j = 0; j < maxJ; j++) {
+        uint kOff = (j * p.nHeadKV + kv) * p.headDim;
+        float dot = 0.0;
+        for (uint d = 0; d < p.headDim; d++) {
+            dot += q[qOff + d] * k[kOff + d];
+        }
+        sum += exp(dot * p.scale - m);
+    }
+    uint oOff = qOff;
+    for (uint d = 0; d < p.headDim; d++) {
+        float acc = 0.0;
+        for (uint j = 0; j < maxJ; j++) {
+            uint kOff = (j * p.nHeadKV + kv) * p.headDim;
+            float dot = 0.0;
+            for (uint dd = 0; dd < p.headDim; dd++) {
+                dot += q[qOff + dd] * k[kOff + dd];
+            }
+            uint vOff = (j * p.nHeadKV + kv) * p.headDim;
+            acc += exp(dot * p.scale - m) * v[vOff + d];
+        }
+        o[oOff + d] = acc / sum;
+    }
+}

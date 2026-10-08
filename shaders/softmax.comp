@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly  buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint rowLen;
+    uint rows;
+} p;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) {
+        return;
+    }
+    uint base = r * p.rowLen;
+    float m = x[base];
+    for (uint i = 1; i < p.rowLen; i++) {
+        m = max(m, x[base + i]);
+    }
+    float sum = 0.0;
+    for (uint i = 0; i < p.rowLen; i++) {
+        sum += exp(x[base + i] - m);
+    }
+    float inv = 1.0 / sum;
+    for (uint i = 0; i < p.rowLen; i++) {
+        y[base + i] = exp(x[base + i] - m) * inv;
+    }
+}

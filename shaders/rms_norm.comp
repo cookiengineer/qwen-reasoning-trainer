@@ -1,0 +1,35 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly  buffer X { float x[]; };
+layout(binding = 1) readonly  buffer W { float w[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint  rowLen;
+    uint  rows;
+    float eps;
+    uint  hasW;
+} p;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) {
+        return;
+    }
+    uint base = r * p.rowLen;
+    float ss = 0.0;
+    for (uint i = 0; i < p.rowLen; i++) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    float inv = 1.0 / sqrt(ss / float(p.rowLen) + p.eps);
+    for (uint i = 0; i < p.rowLen; i++) {
+        float v = x[base + i] * inv;
+        if (p.hasW == 1u) {
+            v *= w[i];
+        }
+        y[base + i] = v;
+    }
+}
