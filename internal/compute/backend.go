@@ -8,6 +8,9 @@ type Capabilities struct {
 	FP16          bool
 	BF16          bool
 	MaxBufferSize uint64
+	// MemoryBytes is the size of the memory the backend allocates from (the
+	// host-visible coherent heap for the Vulkan backend). Zero means unknown.
+	MemoryBytes uint64
 	// HostFallback reports whether unsupported ops are executed on the CPU.
 	HostFallback bool
 }

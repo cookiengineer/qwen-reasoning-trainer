@@ -1,4 +1,4 @@
-package qwen38
+package e2e
 
 import (
 	"encoding/json"
@@ -6,9 +6,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
 )
 
 type dumpTensor struct {
@@ -24,18 +27,32 @@ type dumpDoc struct {
 	GoHidden [][]float32           `json:"go_hidden"`
 }
 
+func tinyConfig() *qwen38.Config {
+	return &qwen38.Config{
+		NEmbd: 16, NHead: 4, NHeadKV: 2, HeadDim: 4, NRot: 4, NFf: 24, NLayer: 4, NVocab: 20,
+		RopeTheta: 10000, RmsEps: 1e-6,
+		DConv: 4, DState: 4, DInner: 16, DtRank: 4, GroupCount: 2,
+		FullAttnInterval: 4, NextNPredict: 0,
+		LayerTypes: []modelcfg.LayerType{
+			modelcfg.LayerLinearAttention,
+			modelcfg.LayerLinearAttention,
+			modelcfg.LayerLinearAttention,
+			modelcfg.LayerFullAttention,
+		},
+	}
+}
+
 // TestReferenceNumpy cross-checks the Go forward pass against an independent
-// NumPy implementation. It only runs when QWEN38_VERIFY_REF=1 so the default
-// test suite stays pure Go.
+// NumPy implementation. Only runs when QWEN38_VERIFY_REF=1.
 func TestReferenceNumpy(t *testing.T) {
 	if os.Getenv("QWEN38_VERIFY_REF") == "" {
 		t.Skip("set QWEN38_VERIFY_REF=1 to run the NumPy reference check")
 	}
 	cfg := tinyConfig()
-	w := NewRandom(cfg, 1234)
-	m := NewModel(w)
+	w := qwen38.NewRandom(cfg, 1234)
+	m := qwen38.NewModel(w)
 	tokens := []int32{1, 5, 2, 7, 3, 9}
-	res, err := m.Forward(tokens, ForwardOptions{RecordHidden: true})
+	res, err := m.Forward(tokens, qwen38.ForwardOptions{RecordHidden: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +78,7 @@ func TestReferenceNumpy(t *testing.T) {
 	doc.Config["IsRecurrent"] = rec
 
 	dumpT := func(name string, t *compute.Tensor) { doc.Tensors[name] = dumpTensor{Dims: t.Dims, Data: t.F32} }
-	dumpW := func(name string, w *Weight) { dumpT(name, w.Tensor()) }
+	dumpW := func(name string, w *qwen38.Weight) { dumpT(name, w.Tensor()) }
 	dumpVec := func(name string, v []float32) {
 		doc.Tensors[name] = dumpTensor{Dims: []int{len(v)}, Data: v}
 	}
@@ -69,7 +86,7 @@ func TestReferenceNumpy(t *testing.T) {
 	dumpVec("output_norm", w.OutputNorm)
 	dumpW("output", w.Output)
 	for il, lw := range w.Layers {
-		p := "l" + itoa(il) + "."
+		p := "l" + strconv.Itoa(il) + "."
 		dumpVec(p+"attn_norm", lw.AttnNorm)
 		dumpVec(p+"post_attn_norm", lw.PostAttnNorm)
 		if cfg.IsRecurrent(il) {
@@ -107,9 +124,7 @@ func TestReferenceNumpy(t *testing.T) {
 	}
 	f.Close()
 
-	_, thisFile, _, _ := runtime.Caller(0)
-	script := filepath.Join(filepath.Dir(thisFile), "ref_numpy.py")
-	cmd := exec.Command("python3", script, modelPath)
+	cmd := exec.Command(refPython(), scriptPath(t, "ref_numpy.py"), modelPath)
 	out, err := cmd.CombinedOutput()
 	t.Logf("python: %s", out)
 	if err != nil {
@@ -117,16 +132,17 @@ func TestReferenceNumpy(t *testing.T) {
 	}
 }
 
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
+// refPython returns the interpreter to use for the reference scripts.
+func refPython() string {
+	if p := os.Getenv("QWEN38_REF_PYTHON"); p != "" {
+		return p
 	}
-	var b [8]byte
-	p := len(b)
-	for i > 0 {
-		p--
-		b[p] = byte('0' + i%10)
-		i /= 10
-	}
-	return string(b[p:])
+	return "python3"
+}
+
+// scriptPath resolves a reference script next to this test file.
+func scriptPath(t *testing.T, name string) string {
+	t.Helper()
+	_, thisFile, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(thisFile), name)
 }

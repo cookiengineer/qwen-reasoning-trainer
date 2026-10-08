@@ -6,11 +6,15 @@
 #   make test       run the full test suite
 #   make check      fmt-check + vet + test
 #   make verify-ref run the NumPy forward-pass reference check
+#   make verify-data run the template + pre-tokenizer reference checks
+#   make e2e-venv   create e2e-tests/.venv with the reference dependencies
 #   make clean      remove build artifacts and compiled shaders
 
 GO        ?= go
 GLSLC     ?= glslc
 SPIRV_VAL ?= spirv-val
+# Interpreter used to create the e2e venv (override for a specific python3.x).
+SYSTEM_PYTHON ?= python3
 
 BIN_DIR := build
 BIN     := $(BIN_DIR)/qwen-trainer
@@ -24,8 +28,16 @@ SHADER_SPV := $(patsubst $(SHADER_DIR)/%.comp,$(SPIRV_DIR)/%.spv,$(SHADER_SRC))
 GLSL_FLAGS  := --target-env=vulkan1.1 -O
 SPIRV_FLAGS := --target-env vulkan1.1
 
+# Local Python environment for the opt-in external references.
+E2E_DIR    := e2e-tests
+E2E_REQS   := $(E2E_DIR)/requirements.txt
+E2E_VENV   := $(E2E_DIR)/.venv
+# Absolute so it works as an env var; `go test` runs with CWD set to the package.
+E2E_PYTHON ?= $(CURDIR)/$(E2E_VENV)/bin/python
+E2E_STAMP  := $(E2E_VENV)/.deps-ok
+
 .PHONY: all build shaders test vet fmt fmt-check tidy clean check \
-        verify-ref inspect gpu-info
+        verify-ref verify-data e2e-venv inspect gpu-info
 
 all: build
 
@@ -61,9 +73,24 @@ tidy:
 
 check: fmt-check vet test
 
-# Independent NumPy cross-check of the forward pass (requires python3 + numpy).
-verify-ref: shaders
-	QWEN38_VERIFY_REF=1 $(GO) test -run TestReferenceNumpy -v ./internal/model/qwen38/...
+# External cross-checks live in ./e2e-tests and are opt-in via env vars. They
+# run against a project-local venv (E2E_VENV) with pinned deps, created on
+# demand. Override the interpreter with `make verify-data E2E_PYTHON=...` (then
+# create it yourself: e.g. a venv with numpy+jinja2+regex).
+e2e-venv: $(E2E_STAMP)
+
+$(E2E_STAMP): $(E2E_REQS)
+	@echo "setting up $(E2E_VENV) ..."
+	@test -d $(E2E_VENV) || $(SYSTEM_PYTHON) -m venv $(E2E_VENV)
+	@$(E2E_VENV)/bin/python -m pip install --quiet --disable-pip-version-check --upgrade pip
+	@$(E2E_VENV)/bin/python -m pip install --quiet --disable-pip-version-check -r $(E2E_REQS)
+	@touch $(E2E_STAMP)
+
+verify-ref: $(E2E_STAMP)
+	QWEN38_VERIFY_REF=1 QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) test -run TestReferenceNumpy -v ./e2e-tests/...
+
+verify-data: $(E2E_STAMP)
+	QWEN38_VERIFY_DATA=1 QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) test -run TestReferenceData -v ./e2e-tests/...
 
 inspect: build
 	$(BIN) inspect

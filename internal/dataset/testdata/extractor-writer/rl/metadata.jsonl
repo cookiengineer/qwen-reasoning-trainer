@@ -1,0 +1,1 @@
+{"id":"ses_writer","topic":["general"],"agent":"build","subagent":false,"reward":{"tool_calls":1,"tool_errors":0,"tool_success_rate":1,"finish_reasons":null,"patches":0,"files_touched":0,"tokens":{"input":1,"output":2,"reasoning":3,"cache_read":0,"cache_write":0},"cost":0,"had_error":false,"quality_flags":["has_reasoning"],"redactions":0}}

@@ -640,6 +640,7 @@ func New() (*Backend, error) {
 	b.caps = compute.Capabilities{
 		Name:          "vulkan(" + name + ")",
 		MaxBufferSize: math.MaxUint32,
+		MemoryBytes:   b.deviceMemorySize(),
 	}
 
 	d, err := b.allocBuffer(16, vkBufferUsageStorage|vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
@@ -729,7 +730,12 @@ func (b *Backend) allocBuffer(size uint64, usage uint32) (*buffer, error) {
 	var req memoryRequirements
 	vkCall(b.vk.GetBufferMemoryRequirements, b.device, buf, uintptr(unsafe.Pointer(&req)))
 
-	idx, ok := b.memoryType(req.memoryTypeBits, vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
+	// Prefer device-local memory that is still mappable; fall back to any
+	// host-visible coherent type.
+	idx, ok := b.memoryType(req.memoryTypeBits, vkMemoryPropertyDevice|vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
+	if !ok {
+		idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
+	}
 	if !ok {
 		vkCall(b.vk.DestroyBuffer, b.device, buf, 0)
 		return nil, errors.New("vulkan: no host visible memory type")
@@ -764,6 +770,26 @@ func (b *Backend) memoryType(bits, flags uint32) (uint32, bool) {
 		}
 	}
 	return 0, false
+}
+
+// deviceMemorySize reports the total size of the device-local heaps, falling
+// back to the largest heap when none is marked device-local. Zero means the
+// size could not be determined.
+func (b *Backend) deviceMemorySize() uint64 {
+	var deviceLocal, max uint64
+	for i := uint32(0); i < b.memProps.memoryHeapCount && i < 16; i++ {
+		h := b.memProps.memoryHeaps[i]
+		if h.flags&vkMemoryPropertyDevice != 0 {
+			deviceLocal += h.size
+		}
+		if h.size > max {
+			max = h.size
+		}
+	}
+	if deviceLocal > 0 {
+		return deviceLocal
+	}
+	return max
 }
 
 // pipeline lazily creates a compute pipeline from an embedded shader.

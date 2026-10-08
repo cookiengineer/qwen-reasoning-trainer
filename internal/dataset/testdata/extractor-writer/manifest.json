@@ -1,0 +1,20 @@
+{
+  "version": "0.1.0",
+  "generated_at": "2026-10-08T00:00:00Z",
+  "input": "fixture",
+  "catalog_hash": "x",
+  "strict_openai": false,
+  "sessions_exported": 1,
+  "exported_session_ids": [
+    "ses_writer"
+  ],
+  "topics": {
+    "general": 1
+  },
+  "models": {
+    "deepseek-flash": 1
+  },
+  "agents": {
+    "build": 1
+  }
+}

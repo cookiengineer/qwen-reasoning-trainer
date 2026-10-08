@@ -15,6 +15,7 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/abliterate"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute/vulkan"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/dataset"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/evaluate"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/gguf"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/hf"
@@ -35,6 +36,7 @@ Commands:
   run        Load the model and greedily generate tokens
   abliterate Remove refusal directions and write an abliterated GGUF
   evaluate   Score a model's refusal rate and KL divergence from a base
+  dataset    Build tokenized, loss-masked examples from extractor JSONL
   help       Show this help
 
 Global flags:
@@ -75,6 +77,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return cmdAbliterate(cfg, stdout, stderr)
 	case "evaluate":
 		return cmdEvaluate(cfg, stdout, stderr)
+	case "dataset":
+		return cmdDataset(cfg, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", cfg.Command)
 		fmt.Fprint(stderr, usage)
@@ -128,7 +132,6 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	goodFile := fs.String("good", "", "file with one desirable prompt per line")
 	badFile := fs.String("bad", "", "file with one undesirable prompt per line")
 	out := fs.String("out", "", "output GGUF path")
-	useGPU := fs.Bool("gpu", false, "run matmuls on the Vulkan backend")
 	system := fs.String("system", "You are a helpful assistant.", "system prompt")
 	rowNorm := fs.String("row-norm", "full", "row normalization: none|pre|full")
 	orthogonalize := fs.Bool("orthogonalize", true, "orthogonalize against the good direction")
@@ -182,15 +185,9 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 		return 1
 	}
 	m := qwen38.NewModel(w)
-	if *useGPU {
-		be, err := vulkan.New()
-		if err != nil {
-			fmt.Fprintln(stderr, "error: vulkan backend:", err)
-			return 1
-		}
+	if be := resolveGPU(modelBytes(g)+gpuHeadroomBytes, cfg, stderr); be != nil {
 		defer func() { m.FreeDevice(); be.Close() }()
 		m.Backend = be
-		fmt.Fprintf(stderr, "using backend %s\n", be.Capabilities().Name)
 	}
 
 	good := encodePrompts(vocab, *system, goodLines)
@@ -275,7 +272,6 @@ func cmdRun(cfg *Config, stdout, stderr io.Writer) int {
 	prompt := fs.String("prompt", "", "text prompt (encoded with the model tokenizer)")
 	system := fs.String("system", "", "optional system message for --prompt")
 	gen := fs.Int("generate", 8, "number of tokens to generate")
-	useGPU := fs.Bool("gpu", false, "run matmuls on the Vulkan backend")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
@@ -325,15 +321,9 @@ func cmdRun(cfg *Config, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stderr, "weights loaded in %s\n", time.Since(t0).Round(time.Millisecond))
 
 	m := qwen38.NewModel(w)
-	if *useGPU {
-		be, err := vulkan.New()
-		if err != nil {
-			fmt.Fprintln(stderr, "error: vulkan backend:", err)
-			return 1
-		}
+	if be := resolveGPU(modelBytes(g)+gpuHeadroomBytes, cfg, stderr); be != nil {
 		defer func() { m.FreeDevice(); be.Close() }()
 		m.Backend = be
-		fmt.Fprintf(stderr, "using backend %s\n", be.Capabilities().Name)
 	}
 
 	st := qwen38.NewState(m.Cfg)
@@ -412,7 +402,6 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 	system := fs.String("system", "You are a helpful assistant.", "system prompt")
 	maxTokens := fs.Int("max-tokens", 32, "tokens to generate per prompt for refusal detection")
 	kw := fs.String("keywords", "", "comma-separated refusal keywords (default built-in)")
-	useGPU := fs.Bool("gpu", false, "run matmuls on the Vulkan backend")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
@@ -426,7 +415,7 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	newModel := func(path string) (*qwen38.Model, *tokenizer.Vocab, func(), error) {
+	newModel := func(path string, be compute.Backend) (*qwen38.Model, *tokenizer.Vocab, func(), error) {
 		g, err := gguf.Open(path)
 		if err != nil {
 			return nil, nil, nil, err
@@ -447,20 +436,9 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 			return nil, nil, nil, err
 		}
 		m := qwen38.NewModel(w)
-		var be *vulkan.Backend
-		if *useGPU {
-			be, err = vulkan.New()
-			if err != nil {
-				g.Close()
-				return nil, nil, nil, err
-			}
-			m.Backend = be
-		}
+		m.Backend = be
 		cleanup := func() {
-			if be != nil {
-				m.FreeDevice()
-				be.Close()
-			}
+			m.FreeDevice()
 			g.Close()
 		}
 		return m, vocab, cleanup, nil
@@ -471,7 +449,17 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	m, vocab, cleanup, err := newModel(path)
+	need := gpuHeadroomBytes + fileModelBytes(path)
+	if *baseFile != "" {
+		need += fileModelBytes(*baseFile)
+	}
+	be := resolveGPU(need, cfg, stderr)
+	defer func() {
+		if be != nil {
+			be.Close()
+		}
+	}()
+	m, vocab, cleanup, err := newModel(path, be)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
@@ -490,7 +478,7 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "refusal_rate: %.4f (%d prompts, up to %d tokens)\n", rate, len(prompts), *maxTokens)
 
 	if *baseFile != "" {
-		base, _, baseCleanup, err := newModel(*baseFile)
+		base, _, baseCleanup, err := newModel(*baseFile, be)
 		if err != nil {
 			fmt.Fprintln(stderr, "error:", err)
 			return 1
@@ -506,6 +494,96 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// cmdDataset tokenizes extractor JSONL with the model chat template and reports
+// assistant-only loss-mask statistics.
+func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("dataset", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	input := fs.String("input", "", "extractor output directory")
+	seqLen := fs.Int("seq-len", 0, "truncate sequences to N tokens (0 = no limit)")
+	minTarget := fs.Int("min-target", 1, "drop examples with fewer trainable tokens")
+	valRatio := fs.Float64("val-ratio", 0.02, "validation split ratio")
+	subagents := fs.Bool("include-subagents", false, "include the subagents/ tree")
+	effort := fs.String("reasoning-effort", "xhigh", "xhigh|medium|low")
+	noThink := fs.Bool("no-thinking", false, "render with enable_thinking=false")
+	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if *input == "" {
+		fmt.Fprintln(stderr, "error: --input is required")
+		return 2
+	}
+	if *valRatio < 0 || *valRatio >= 1 {
+		fmt.Fprintln(stderr, "error: --val-ratio must be in [0, 1)")
+		return 2
+	}
+
+	path, err := resolveModel(cfg, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	g, err := gguf.Open(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	defer g.Close()
+	vocab, err := tokenizer.FromGGUF(g)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+
+	d, err := dataset.Open(*input, dataset.WithSubagents(*subagents))
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	recs, err := d.Sessions()
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+
+	opt := dataset.DefaultBuildOptions()
+	opt.MaxSeqLen = *seqLen
+	opt.MinTargetTokens = *minTarget
+	opt.Render.ReasoningEffort = *effort
+	opt.Render.EnableThinking = !*noThink
+	exs, err := dataset.BuildExamples(vocab, recs, opt)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	train, val := dataset.Split(exs, *valRatio)
+
+	fmt.Fprintf(stdout, "input:          %s\n", d.Root())
+	fmt.Fprintf(stdout, "manifest:       version=%s strict=%v\n", d.Manifest.Version, d.Manifest.Strict)
+	fmt.Fprintf(stdout, "tokenizer:      pre=%s tools=%d\n", vocab.Pre, len(d.Manifest.Tools))
+	fmt.Fprintf(stdout, "sessions:       %d\n", len(recs))
+	fmt.Fprintf(stdout, "examples:       %d (dropped %d)\n", len(exs), len(recs)-len(exs))
+	fmt.Fprintf(stdout, "tokens:         %d total, avg %.1f\n", dataset.TotalTokens(exs), avg(dataset.TotalTokens(exs), len(exs)))
+	fmt.Fprintf(stdout, "target tokens:  %d total, avg %.1f\n", dataset.TotalLossTokens(exs), avg(dataset.TotalLossTokens(exs), len(exs)))
+	fmt.Fprintf(stdout, "mask ratio:     %.4f\n", ratio(dataset.TotalLossTokens(exs), dataset.TotalTokens(exs)))
+	fmt.Fprintf(stdout, "split:          train=%d val=%d\n", len(train), len(val))
+	return 0
+}
+
+func avg(n, d int) float64 {
+	if d == 0 {
+		return 0
+	}
+	return float64(n) / float64(d)
+}
+
+func ratio(n, d int) float64 {
+	if d == 0 {
+		return 0
+	}
+	return float64(n) / float64(d)
+}
+
 func cmdGPUInfo(cfg *Config, stdout, stderr io.Writer) int {
 	b, err := vulkan.New()
 	if err != nil {
@@ -519,6 +597,7 @@ func cmdGPUInfo(cfg *Config, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "bf16:           %v\n", caps.BF16)
 	fmt.Fprintf(stdout, "host fallback:  %v\n", caps.HostFallback)
 	fmt.Fprintf(stdout, "max buffer:     %d\n", caps.MaxBufferSize)
+	fmt.Fprintf(stdout, "memory:         %s (%d bytes)\n", humanBytes(int64(caps.MemoryBytes)), caps.MemoryBytes)
 	return 0
 }
 
@@ -591,4 +670,54 @@ func humanBytes(b int64) string {
 	default:
 		return fmt.Sprintf("%d B", b)
 	}
+}
+
+// gpuHeadroomBytes is reserved on top of the model size for activations, scratch
+// and the KV/recurrent state when deciding whether the GPU has enough memory.
+const gpuHeadroomBytes = 2 << 30
+
+// modelBytes returns the total on-disk size of a GGUF's tensor data.
+func modelBytes(g *gguf.File) uint64 {
+	var n uint64
+	for _, t := range g.Tensors {
+		if sz, err := t.ByteSize(); err == nil {
+			n += uint64(sz)
+		}
+	}
+	return n
+}
+
+func fileModelBytes(path string) uint64 {
+	g, err := gguf.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer g.Close()
+	return modelBytes(g)
+}
+
+// resolveGPU returns a Vulkan backend when a device is present and can hold at
+// least needBytes of weights, otherwise nil (CPU fallback). The caller owns a
+// non-nil backend and must Close it.
+func resolveGPU(needBytes uint64, cfg *Config, stderr io.Writer) compute.Backend {
+	be, err := vulkan.New()
+	if err != nil {
+		if cfg.LogLevel != "quiet" {
+			fmt.Fprintf(stderr, "gpu: unavailable (%v); using CPU\n", err)
+		}
+		return nil
+	}
+	caps := be.Capabilities()
+	if caps.MemoryBytes > 0 && caps.MemoryBytes < needBytes {
+		if cfg.LogLevel != "quiet" {
+			fmt.Fprintf(stderr, "gpu: %s has %s, need ~%s; using CPU\n",
+				caps.Name, humanBytes(int64(caps.MemoryBytes)), humanBytes(int64(needBytes)))
+		}
+		be.Close()
+		return nil
+	}
+	if cfg.LogLevel != "quiet" {
+		fmt.Fprintf(stderr, "gpu: using %s (%s)\n", caps.Name, humanBytes(int64(caps.MemoryBytes)))
+	}
+	return be
 }

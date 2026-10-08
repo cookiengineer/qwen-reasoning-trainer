@@ -6,6 +6,9 @@
 /models/
 /datasets/
 
+# Local Python venv for the e2e references
+/e2e-tests/.venv/
+
 # Local scratch
 *.part
 *.tmp

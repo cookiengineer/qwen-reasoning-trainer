@@ -1,0 +1,1 @@
+{"id":"ses_writer:m2","session":"ses_writer","topic":["general"],"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hello"}],"meta":{"agent":"build","model":"deepseek-flash","provider":"deepseek","subagent":false,"project":"hydraone","tokens":{"input":1,"output":2,"reasoning":3,"cache_read":0,"cache_write":0}}}

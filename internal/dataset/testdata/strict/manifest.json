@@ -1,0 +1,12 @@
+{
+  "version": "0.1.0",
+  "generated_at": "2026-10-08T09:00:00Z",
+  "input": "/tmp/opencode.db",
+  "catalog_hash": "deadbeef",
+  "strict_openai": true,
+  "sessions_exported": 1,
+  "exported_session_ids": [],
+  "topics": {"general": 1},
+  "models": {},
+  "agents": {}
+}

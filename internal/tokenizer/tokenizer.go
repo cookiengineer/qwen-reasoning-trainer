@@ -8,6 +8,7 @@ package tokenizer
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/gguf"
@@ -18,11 +19,23 @@ type Vocab struct {
 	Tokens []string
 	EOS    []int32
 	BOS    []int32
+	// Pre is the GGUF tokenizer.ggml.pre value (e.g. "qwen35").
+	Pre string
 
 	rev     map[rune]byte
 	enc     map[byte]rune
 	tokenID map[string]int32
 	merges  map[[2]string]int
+
+	// specials holds added/control tokens (GGML token types 2/3/4) that are
+	// matched verbatim during encoding rather than byte-level BPE.
+	specials      map[string]int32
+	specialsFirst map[byte][]specialToken
+}
+
+type specialToken struct {
+	s  string
+	id int32
 }
 
 // pretokRe approximates the Qwen/GPT-4 pre-tokenization pattern. Go's regexp is
@@ -37,11 +50,13 @@ func NewVocab(tokens []string) *Vocab {
 
 func newVocab(tokens []string, merges []string) *Vocab {
 	v := &Vocab{
-		Tokens:  tokens,
-		rev:     map[rune]byte{},
-		enc:     map[byte]rune{},
-		tokenID: make(map[string]int32, len(tokens)),
-		merges:  make(map[[2]string]int, len(merges)),
+		Tokens:        tokens,
+		rev:           map[rune]byte{},
+		enc:           map[byte]rune{},
+		tokenID:       make(map[string]int32, len(tokens)),
+		merges:        make(map[[2]string]int, len(merges)),
+		specials:      map[string]int32{},
+		specialsFirst: map[byte][]specialToken{},
 	}
 	buildByteAlphabet(v.enc, v.rev)
 	for i, t := range tokens {
@@ -59,7 +74,14 @@ func newVocab(tokens []string, merges []string) *Vocab {
 	return v
 }
 
-// FromGGUF reads the token list, merges, and special token ids.
+// GGML token types, matching llama.cpp's llama_token_type.
+const (
+	TokenTypeUnknown     = 2
+	TokenTypeControl     = 3
+	TokenTypeUserDefined = 4
+)
+
+// FromGGUF reads the token list, merges, special token types, and special ids.
 func FromGGUF(g *gguf.File) (*Vocab, error) {
 	toks, ok := g.Strings("tokenizer.ggml.tokens")
 	if !ok {
@@ -67,13 +89,49 @@ func FromGGUF(g *gguf.File) (*Vocab, error) {
 	}
 	merges, _ := g.Strings("tokenizer.ggml.merges")
 	v := newVocab(toks, merges)
+	v.Pre, _ = g.Str("tokenizer.ggml.pre")
 	if id, ok := g.Int("tokenizer.ggml.eos_token_id"); ok {
 		v.EOS = append(v.EOS, int32(id))
 	}
 	if id, ok := g.Int("tokenizer.ggml.bos_token_id"); ok {
 		v.BOS = append(v.BOS, int32(id))
 	}
+	v.readTokenTypes(g, toks)
 	return v, nil
+}
+
+// readTokenTypes collects the added/control tokens (GGML types 2/3/4) so that
+// Encode matches them verbatim instead of byte-level BPE.
+func (v *Vocab) readTokenTypes(g *gguf.File, toks []string) {
+	tv, ok := g.Get("tokenizer.ggml.token_type")
+	if !ok || tv.Type != gguf.ValueTypeArray {
+		return
+	}
+	for i := 0; i < len(tv.Array) && i < len(toks); i++ {
+		t, ok := tv.Array[i].AsInt()
+		if !ok {
+			continue
+		}
+		switch int(t) {
+		case TokenTypeUnknown, TokenTypeControl, TokenTypeUserDefined:
+		default:
+			continue
+		}
+		s := toks[i]
+		if s == "" {
+			continue
+		}
+		if _, dup := v.specials[s]; dup {
+			continue
+		}
+		id := int32(i)
+		v.specials[s] = id
+		v.specialsFirst[s[0]] = append(v.specialsFirst[s[0]], specialToken{s: s, id: id})
+	}
+	for b, list := range v.specialsFirst {
+		sort.Slice(list, func(i, j int) bool { return len(list[i].s) > len(list[j].s) })
+		v.specialsFirst[b] = list
+	}
 }
 
 // Token returns the raw string for a token id.
@@ -121,10 +179,61 @@ func (v *Vocab) Decode(ids []int32) string {
 	return string(buf)
 }
 
-// Encode converts text to token ids using byte-level BPE.
+// Encode converts text to token ids using byte-level BPE. Added/control tokens
+// (types 2/3/4) present in the vocabulary are matched verbatim and emitted as
+// their own ids; the text between them is byte-level BPE.
 func (v *Vocab) Encode(text string) []int32 {
+	if text == "" {
+		return nil
+	}
+	if len(v.specialsFirst) == 0 {
+		return v.encodePlain(text)
+	}
 	var out []int32
-	for _, piece := range pretokRe.FindAllString(text, -1) {
+	start := 0
+	for i := 0; i < len(text); {
+		if id, n, ok := v.matchSpecial(text[i:]); ok {
+			if i > start {
+				out = append(out, v.encodePlain(text[start:i])...)
+			}
+			out = append(out, id)
+			i += n
+			start = i
+		} else {
+			i++
+		}
+	}
+	if start < len(text) {
+		out = append(out, v.encodePlain(text[start:])...)
+	}
+	return out
+}
+
+// matchSpecial returns the longest special token that prefixes s.
+func (v *Vocab) matchSpecial(s string) (int32, int, bool) {
+	if len(s) == 0 {
+		return 0, 0, false
+	}
+	for _, st := range v.specialsFirst[s[0]] {
+		if len(st.s) <= len(s) && s[:len(st.s)] == st.s {
+			return st.id, len(st.s), true
+		}
+	}
+	return 0, 0, false
+}
+
+func (v *Vocab) encodePlain(text string) []int32 {
+	if text == "" {
+		return nil
+	}
+	var pieces []string
+	if v.Pre == "qwen35" {
+		pieces = SplitQwen35(text)
+	} else {
+		pieces = pretokRe.FindAllString(text, -1)
+	}
+	var out []int32
+	for _, piece := range pieces {
 		out = append(out, v.encodePiece(piece)...)
 	}
 	return out
