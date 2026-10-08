@@ -322,8 +322,76 @@ func TestDequantIQ3S(t *testing.T) {
 }
 
 func TestQuantizeUnsupported(t *testing.T) {
-	_, err := Quantize(TypeQ4_K, make([]float32, 256))
+	_, err := Quantize(TypeQ2_K, make([]float32, 256))
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("expected ErrUnsupported, got %v", err)
+	}
+}
+
+func TestQuantizeQ4KRoundTrip(t *testing.T) {
+	src := make([]float32, 512)
+	for i := range src {
+		src[i] = float32(math.Sin(float64(i)*0.7)) * 0.9
+	}
+	enc, err := Quantize(TypeQ4_K, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(enc) != 2*144 {
+		t.Fatalf("encoded %d bytes, want %d", len(enc), 2*144)
+	}
+	dec, err := Dequant(TypeQ4_K, enc, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maxErr float64
+	for i := range src {
+		d := math.Abs(float64(src[i] - dec[i]))
+		if d > maxErr {
+			maxErr = d
+		}
+	}
+	if maxErr > 0.15 {
+		t.Fatalf("q4_K max error %v too high", maxErr)
+	}
+}
+
+func TestQuantizeAllTypesRoundTrip(t *testing.T) {
+	cases := []struct {
+		typ   Type
+		n     int
+		bound float64
+	}{
+		{TypeQ4_K, 512, 0.15},
+		{TypeQ5_K, 512, 0.12},
+		{TypeQ6_K, 512, 0.05},
+		{TypeQ3_K, 512, 0.35},
+		{TypeIQ4_NL, 64, 0.18},
+		{TypeIQ4_XS, 512, 0.18},
+		{TypeIQ3_S, 512, 0.4},
+	}
+	for _, c := range cases {
+		src := make([]float32, c.n)
+		for i := range src {
+			src[i] = float32(math.Sin(float64(i)*0.7)) * 0.9
+		}
+		enc, err := Quantize(c.typ, src)
+		if err != nil {
+			t.Fatalf("%s: %v", c.typ, err)
+		}
+		dec, err := Dequant(c.typ, enc, int64(c.n))
+		if err != nil {
+			t.Fatalf("%s: %v", c.typ, err)
+		}
+		var maxErr float64
+		for i := range src {
+			d := math.Abs(float64(src[i] - dec[i]))
+			if d > maxErr {
+				maxErr = d
+			}
+		}
+		if maxErr > c.bound {
+			t.Fatalf("%s: max error %v exceeds bound %v", c.typ, maxErr, c.bound)
+		}
 	}
 }

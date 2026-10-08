@@ -145,6 +145,33 @@ func (g *File) ReadTensor(t *TensorInfo) ([]byte, error) {
 	return buf, nil
 }
 
+// CopyTensor streams a tensor's raw bytes to w without buffering the whole
+// tensor.
+func (g *File) CopyTensor(t *TensorInfo, w io.Writer) error {
+	n, err := t.ByteSize()
+	if err != nil {
+		return err
+	}
+	off := g.dataStart + int64(t.Offset)
+	buf := make([]byte, 1<<20)
+	remaining := n
+	for remaining > 0 {
+		chunk := int64(len(buf))
+		if chunk > remaining {
+			chunk = remaining
+		}
+		if _, err := g.r.ReadAt(buf[:chunk], off); err != nil {
+			return fmt.Errorf("gguf: copy tensor %s: %w", t.Name, err)
+		}
+		if _, err := w.Write(buf[:chunk]); err != nil {
+			return err
+		}
+		off += chunk
+		remaining -= chunk
+	}
+	return nil
+}
+
 // ReadTensorF32 reads a tensor and dequantizes it to float32.
 func (g *File) ReadTensorF32(t *TensorInfo) ([]float32, error) {
 	raw, err := g.ReadTensor(t)
