@@ -1,0 +1,12 @@
+# Build artifacts
+/build/
+/bin/
+
+# Downloaded models and datasets
+/models/
+/datasets/
+
+# Local scratch
+*.part
+*.tmp
+.DS_Store
