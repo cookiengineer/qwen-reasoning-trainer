@@ -10,7 +10,8 @@ var ErrShape = errors.New("compute: shape mismatch")
 
 // MatMul computes the GGML-style matrix product of a [K,N] and b [K,M],
 // producing [N,M]. This matches ggml_mul_mat: the reduction dimension is Dims[0]
-// of both inputs.
+// of both inputs and the result uses GGML layout, i.e. element (i,j) is stored
+// at i + j*N. Weight matrices are passed as a and activations as b.
 func MatMul(a, b *Tensor) (*Tensor, error) {
 	k, n, m := a.Ne(0), a.Ne(1), b.Ne(1)
 	if b.Ne(0) != k {
@@ -25,7 +26,7 @@ func MatMul(a, b *Tensor) (*Tensor, error) {
 			for ki := 0; ki < k; ki++ {
 				acc += float64(aRow[ki]) * float64(bRow[ki])
 			}
-			out.F32[ni*m+mi] = float32(acc)
+			out.F32[ni+mi*n] = float32(acc)
 		}
 	}
 	return out, nil

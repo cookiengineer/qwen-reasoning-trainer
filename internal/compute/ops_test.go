@@ -19,7 +19,7 @@ func TestMatMul(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []float32{17, 23, 39, 53}
+	want := []float32{17, 39, 23, 53}
 	for i, w := range want {
 		if c.F32[i] != w {
 			t.Errorf("c[%d] = %v, want %v", i, c.F32[i], w)
