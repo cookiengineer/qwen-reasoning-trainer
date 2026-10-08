@@ -99,6 +99,36 @@ func TestBuildExampleTruncation(t *testing.T) {
 	}
 }
 
+func TestExamplesAutoLoadTools(t *testing.T) {
+	v := testVocab(t)
+	d, err := Open(filepath.Join("testdata", "extractor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, err := d.Sessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture records carry no per-session tools, so the free builder with
+	// empty options renders no tools preamble.
+	free, err := BuildExamples(v, recs, DefaultBuildOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Dataset.Examples auto-loads the manifest registry, which adds the tools
+	// preamble and therefore more tokens.
+	auto, err := d.Examples(v, DefaultBuildOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(auto) != len(free) {
+		t.Fatalf("example count changed: %d vs %d", len(auto), len(free))
+	}
+	if TotalTokens(auto) <= TotalTokens(free) {
+		t.Fatalf("auto-loaded tools did not add tokens: %d <= %d", TotalTokens(auto), TotalTokens(free))
+	}
+}
+
 func TestIterMatchesBuild(t *testing.T) {
 	v := testVocab(t)
 	d, err := Open(filepath.Join("testdata", "extractor"))

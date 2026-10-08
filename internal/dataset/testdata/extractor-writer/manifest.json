@@ -16,5 +16,22 @@
   },
   "agents": {
     "build": 1
-  }
+  },
+  "tools": [
+    {
+      "name": "read",
+      "description": "Read a file or directory from the local filesystem.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filePath": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "filePath"
+        ]
+      }
+    }
+  ]
 }

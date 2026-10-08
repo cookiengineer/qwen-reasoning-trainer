@@ -31,6 +31,12 @@ func TestReaderExtractorWriterOutput(t *testing.T) {
 	if rec.Meta.Tokens == nil || rec.Meta.Tokens.Reasoning != 3 {
 		t.Fatalf("tokens = %+v", rec.Meta.Tokens)
 	}
+	if len(rec.Meta.Tools) != 1 || rec.Meta.Tools[0].Name != "read" {
+		t.Fatalf("meta tools = %+v", rec.Meta.Tools)
+	}
+	if len(d.Manifest.Tools) != 1 || d.Manifest.Tools[0].Name != "read" {
+		t.Fatalf("manifest tools = %+v", d.Manifest.Tools)
+	}
 	if len(rec.Messages) != 5 {
 		t.Fatalf("messages = %d", len(rec.Messages))
 	}

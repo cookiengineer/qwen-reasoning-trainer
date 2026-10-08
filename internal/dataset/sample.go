@@ -51,6 +51,9 @@ func SessionKey(rec *SessionRecord) string {
 // BuildExample renders and tokenizes one session. It returns (nil, nil) when
 // the session has no trainable tokens (or is otherwise unusable).
 func BuildExample(v *tokenizer.Vocab, rec *SessionRecord, opt BuildOptions) (*Example, error) {
+	if len(opt.Render.Tools) == 0 && len(rec.Meta.Tools) > 0 {
+		opt.Render.Tools = rec.Meta.Tools
+	}
 	segs, err := RenderSegments(rec.Messages, opt.Render)
 	if err != nil {
 		return nil, err
@@ -93,9 +96,25 @@ func BuildExamples(v *tokenizer.Vocab, recs []SessionRecord, opt BuildOptions) (
 	return out, nil
 }
 
+// Examples builds all examples, auto-loading the run-level tool registry from
+// the manifest when the options do not set one.
+func (d *Dataset) Examples(v *tokenizer.Vocab, opt BuildOptions) ([]Example, error) {
+	if len(opt.Render.Tools) == 0 {
+		opt.Render.Tools = d.Manifest.Tools
+	}
+	recs, err := d.Sessions()
+	if err != nil {
+		return nil, err
+	}
+	return BuildExamples(v, recs, opt)
+}
+
 // Iter streams examples from a dataset. The caller must drain ex until closed;
 // any build error is delivered on errs. Cancel ctx to stop early.
 func Iter(ctx context.Context, d *Dataset, v *tokenizer.Vocab, opt BuildOptions) (<-chan Example, <-chan error) {
+	if len(opt.Render.Tools) == 0 {
+		opt.Render.Tools = d.Manifest.Tools
+	}
 	buf := opt.Prefetch
 	if buf <= 0 {
 		buf = 1

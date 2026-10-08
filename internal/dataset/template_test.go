@@ -1,12 +1,39 @@
 package dataset
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/tokenizer"
 )
+
+func TestRenderToolsPreamble(t *testing.T) {
+	msgs := []ChatMessage{{Role: "user", Content: "u"}, {Role: "assistant", Content: "a"}}
+	opt := DefaultRenderOptions()
+	opt.Tools = []ToolSchema{{
+		Name:        "bash",
+		Description: "Run a command",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`),
+	}}
+	segs, err := RenderSegments(msgs, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) == 0 || segs[0].Loss {
+		t.Fatalf("preamble segment = %+v", segs)
+	}
+	p := segs[0].Text
+	for _, want := range []string{
+		"<|im_start|>system\n", "# Tools", "<tools>", "\n</tools>",
+		`"type":"function"`, `"name":"bash"`, `"parameters"`, `"command"`, "<|im_end|>\n",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("tools preamble missing %q:\n%s", want, p)
+		}
+	}
+}
 
 func TestRenderSimple(t *testing.T) {
 	msgs := []ChatMessage{

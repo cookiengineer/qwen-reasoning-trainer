@@ -551,6 +551,7 @@ func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
 	opt.MinTargetTokens = *minTarget
 	opt.Render.ReasoningEffort = *effort
 	opt.Render.EnableThinking = !*noThink
+	opt.Render.Tools = d.Manifest.Tools
 	exs, err := dataset.BuildExamples(vocab, recs, opt)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)

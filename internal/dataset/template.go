@@ -254,10 +254,27 @@ func reasoningInstructions(opt RenderOptions) (string, error) {
 	}
 }
 
-// renderTool serializes a tool for the tools preamble. This is only exercised
-// once the extractor ships a tool registry.
+// renderTool serializes a tool schema as an OpenAI function definition, the
+// shape HF chat templates receive in their `tools` argument. Note the encoder
+// emits compact JSON; Python's Jinja `tojson` adds insignificant whitespace.
 func renderTool(t ToolSchema) string {
-	b, err := json.Marshal(t)
+	type function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description,omitempty"`
+		Parameters  json.RawMessage `json:"parameters,omitempty"`
+	}
+	wrapped := struct {
+		Type     string   `json:"type"`
+		Function function `json:"function"`
+	}{
+		Type: "function",
+		Function: function{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		},
+	}
+	b, err := json.Marshal(wrapped)
 	if err != nil {
 		return "{}"
 	}
