@@ -6,6 +6,9 @@
 /models/
 /datasets/
 
+# Read-only upstream reference checkouts (llama.cpp, heretic)
+/references/
+
 # Local Python venv for the e2e references
 /e2e-tests/.venv/
 

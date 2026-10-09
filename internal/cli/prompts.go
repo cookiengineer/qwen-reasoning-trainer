@@ -8,6 +8,29 @@ import (
 	"strings"
 )
 
+// Default prompt sets bundled in prompts/, mirroring Heretic's defaults (the
+// mlabonne datasets published under heretic-org on Hugging Face). Paths are
+// relative to the working directory. See the README for the mapping.
+const (
+	DefaultGoodPrompts     = "prompts/harmless_alpaca_train.jsonl"
+	DefaultBadPrompts      = "prompts/harmful_behaviors_train.jsonl"
+	DefaultEvalGoodPrompts = "prompts/harmless_alpaca_test.jsonl"
+	DefaultEvalBadPrompts  = "prompts/harmful_behaviors_test.jsonl"
+)
+
+// loadPrompts reads a prompt file and returns a helpful error when it is
+// missing or empty (the default sets live in prompts/).
+func loadPrompts(path, column string, limit int) ([]string, error) {
+	rows, err := readPromptFile(path, column, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("%s: no prompts found", path)
+	}
+	return rows, nil
+}
+
 // readPromptFile loads prompts from either a plain-text file (one prompt per
 // line, blank lines and lines starting with '#' skipped) or a JSONL/NDJSON file
 // (one JSON object per line), in which case column selects the string field to

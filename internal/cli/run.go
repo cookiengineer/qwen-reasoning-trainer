@@ -136,8 +136,8 @@ func cmdDownload(cfg *Config, stdout, stderr io.Writer) int {
 func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("abliterate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	goodFile := fs.String("good", "", "file with one desirable prompt per line")
-	badFile := fs.String("bad", "", "file with one undesirable prompt per line")
+	goodFile := fs.String("good", DefaultGoodPrompts, "file with desirable prompts (text or JSONL)")
+	badFile := fs.String("bad", DefaultBadPrompts, "file with undesirable prompts (text or JSONL)")
 	out := fs.String("out", "", "output GGUF path")
 	system := fs.String("system", "You are a helpful assistant.", "system prompt")
 	rowNorm := fs.String("row-norm", "full", "row normalization: none|pre|full")
@@ -148,21 +148,27 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	mlpMax := fs.Float64("mlp-max-weight", 0.0, "MLP ablation max weight")
 	maxPosFrac := fs.Float64("max-weight-position-frac", 0.75, "max weight position / layer count")
 	minDistFrac := fs.Float64("min-weight-distance-frac", 0.5, "min weight distance / layer count")
-	limit := fs.Int("limit", 0, "max prompts per set (0 = all)")
+	limit := fs.Int("limit", 400, "max prompts per set (0 = all; default matches Heretic)")
 	winsorize := fs.Float64("winsorize", 0, "winsorization quantile in [0,1) (0 = off)")
+	promptCol := fs.String("prompt-col", "", "JSONL prompt column (default: text)")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
-	if *goodFile == "" || *badFile == "" || *out == "" {
-		fmt.Fprintln(stderr, "error: --good, --bad and --out are required")
+	if *out == "" {
+		fmt.Fprintln(stderr, "error: --out is required")
 		return 2
 	}
-	goodLines := readLines(*goodFile, *limit)
-	badLines := readLines(*badFile, *limit)
-	if len(goodLines) == 0 || len(badLines) == 0 {
-		fmt.Fprintln(stderr, "error: need at least one prompt in --good and --bad")
-		return 2
+	goodLines, err := loadPrompts(*goodFile, *promptCol, *limit)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
 	}
+	badLines, err := loadPrompts(*badFile, *promptCol, *limit)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "prompts: good=%s (%d) bad=%s (%d)\n", *goodFile, len(goodLines), *badFile, len(badLines))
 
 	path, err := resolveModel(cfg, stderr)
 	if err != nil {
@@ -245,71 +251,77 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	goodFile := fs.String("good", "", "file with desirable (residual) prompts")
-	badFile := fs.String("bad", "", "file with undesirable (residual) prompts")
-	evalGood := fs.String("eval-good", "", "KL evaluation prompts (default: --good)")
-	evalBad := fs.String("eval-bad", "", "refusal evaluation prompts (default: --bad)")
+	goodFile := fs.String("good", DefaultGoodPrompts, "desirable (residual) prompts, text or JSONL")
+	badFile := fs.String("bad", DefaultBadPrompts, "undesirable (residual) prompts, text or JSONL")
+	evalGood := fs.String("eval-good", "", "KL evaluation prompts (default: bundled test set)")
+	evalBad := fs.String("eval-bad", "", "refusal evaluation prompts (default: bundled test set)")
 	promptCol := fs.String("prompt-col", "", "JSONL prompt column (default: text)")
 	out := fs.String("out", "", "output GGUF for the best trial (optional)")
 	system := fs.String("system", "You are a helpful assistant.", "system prompt")
 	rowNorm := fs.String("row-norm", "full", "row normalization: none|pre|full")
 	orthogonalize := fs.Bool("orthogonalize", true, "orthogonalize against the good direction")
-	limit := fs.Int("limit", 0, "max residual prompts per set (0 = all)")
-	evalLimit := fs.Int("eval-limit", 0, "max evaluation prompts per set (0 = all)")
+	limit := fs.Int("limit", 400, "max residual prompts per set (0 = all; default matches Heretic)")
+	evalLimit := fs.Int("eval-limit", 100, "max evaluation prompts per set (0 = all; default matches Heretic)")
 	trials := fs.Int("trials", 20, "total number of trials")
 	lambda := fs.Float64("lambda", 1.0, "KL weight in the objective refusal + lambda*KL")
 	seed := fs.Int64("seed", 1, "random seed")
-	samplerName := fs.String("sampler", "random", "sampler: random|halton")
+	samplerName := fs.String("sampler", "random", "sampler: random|halton|tpe")
 	study := fs.String("study", "", "JSONL study checkpoint (resumed if present)")
 	maxTokens := fs.Int("max-tokens", 32, "tokens generated per refusal prompt")
 	winsorize := fs.Float64("winsorize", 0, "winsorization quantile in [0,1) (0 = off)")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 	if *goodFile == "" || *badFile == "" {
-		fmt.Fprintln(stderr, "error: --good and --bad are required")
+		fmt.Fprintln(stderr, "error: --good and --bad must not be empty")
 		return 2
 	}
 	if *rowNorm != "none" && *rowNorm != "pre" && *rowNorm != "full" {
 		fmt.Fprintln(stderr, "error: --row-norm must be none, pre, or full")
 		return 2
 	}
-	goodLines, err := readPromptFile(*goodFile, *promptCol, *limit)
+	goodLines, err := loadPrompts(*goodFile, *promptCol, *limit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	badLines, err := readPromptFile(*badFile, *promptCol, *limit)
+	badLines, err := loadPrompts(*badFile, *promptCol, *limit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	if len(goodLines) == 0 || len(badLines) == 0 {
-		fmt.Fprintln(stderr, "error: need at least one prompt in --good and --bad")
-		return 2
-	}
+	// When --eval-good/--eval-bad are omitted, a custom residual set scores
+	// against itself; the bundled defaults use the heretic test splits.
 	klPath := *evalGood
 	if klPath == "" {
-		klPath = *goodFile
+		if setFlags["good"] {
+			klPath = *goodFile
+		} else {
+			klPath = DefaultEvalGoodPrompts
+		}
 	}
 	rfPath := *evalBad
 	if rfPath == "" {
-		rfPath = *badFile
+		if setFlags["bad"] {
+			rfPath = *badFile
+		} else {
+			rfPath = DefaultEvalBadPrompts
+		}
 	}
-	klLines, err := readPromptFile(klPath, *promptCol, *evalLimit)
+	klLines, err := loadPrompts(klPath, *promptCol, *evalLimit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	rfLines, err := readPromptFile(rfPath, *promptCol, *evalLimit)
+	rfLines, err := loadPrompts(rfPath, *promptCol, *evalLimit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	if len(klLines) == 0 || len(rfLines) == 0 {
-		fmt.Fprintln(stderr, "error: evaluation prompt sets must not be empty")
-		return 2
-	}
+	fmt.Fprintf(stderr, "prompts: good=%s (%d) bad=%s (%d) eval-good=%s (%d) eval-bad=%s (%d)\n",
+		*goodFile, len(goodLines), *badFile, len(badLines), klPath, len(klLines), rfPath, len(rfLines))
 
 	path, err := resolveModel(cfg, stderr)
 	if err != nil {

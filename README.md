@@ -5,6 +5,13 @@ quantization. It implements a complete GGUF/quant stack, a CPU + Vulkan compute
 backend, the Qwen3.8 forward pass (full attention + GatedDeltaNet), abliteration,
 and a dataset pipeline for SFT Training (QLoRA).
 
+## Requirements
+
+- Go 1.27 (build and tests).
+- `glslc` and `spirv-val` to rebuild the committed SPIR-V shaders.
+- A Vulkan device for GPU acceleration and the GPU tests (the CLI selects it automatically when it has enough memory).
+- `python3` with venv support only for the external `verify-*` tests.
+
 ## Prerequisites
 
 1. Download **Qwen3.8-27B** (Unsloth Dynamic **Q4_K_M**) from Hugging Face:
@@ -44,31 +51,76 @@ make;
 # tokenize/validate the extractor output and report loss-mask statistics
 ./build/qwen-trainer dataset \
   --input /path/to/my/own/reasoning-traces/from/opencode;
-
-# remove refusal directions and write an abliterated GGUF
-./build/qwen-trainer abliterate \
-  --good prompts/good.txt \
-  --bad prompts/bad.txt \
-  --out models/abliterated.gguf;
-
-# search abliteration parameters (refusal + lambda*KL) and write the best trial
-./build/qwen-trainer search \
-  --good prompts/good.txt \
-  --bad prompts/bad.txt \
-  --trials 25 --sampler tpe --study models/search.jsonl \
-  --out models/search-best.gguf;
-
-# score a model's refusal rate and KL divergence from the base
-./build/qwen-trainer \
-  --model models/abliterated.gguf \
-  evaluate \
-  --prompts prompts/bad.txt \
-  --max-tokens 32;
 ```
 
 The compute backend is chosen automatically: Vulkan is used when a device is
 present and it has enough device memory for the model, otherwise the CPU
 reference runs. `gpu-info` reports the detected device and memory.
+
+See [Abliteration](#abliteration) for removing refusal directions and for the
+parameter search.
+
+## Abliteration
+
+Remove the refusal/safety direction from the weights with Heretic-style
+directional ablation (projected / magnitude-preserving orthogonal ablation,
+MPOA), then optionally optimize the ablation hyperparameters.
+
+```sh
+# 1. Ablate with the default parameters and write a full Q4_K_M GGUF.
+./build/qwen-trainer abliterate --out models/abliterated.gguf;
+
+# 2. (optional) search direction index + per-component weight kernels and write
+#    the best trial. Trials persist to the study file and resume automatically.
+./build/qwen-trainer search \
+  --trials 25 \
+  --sampler tpe \
+  --study models/search.jsonl \
+  --out models/search-best.gguf;
+
+# 3. Score the result: refusal-keyword rate and KL divergence from the base.
+./build/qwen-trainer --model models/abliterated.gguf evaluate \
+  --prompts prompts/harmful_behaviors_test.jsonl \
+  --max-tokens 32;
+```
+
+### Prompt sets and limits
+
+`prompts/` bundles the same datasets Heretic uses, pre-converted to JSON Lines
+(one `{"text": "..."}` object per line), so no download is needed. `abliterate`
+and `search` use them by default; override with `--good`/`--bad`
+(`--eval-good`/`--eval-bad` for `search`). Files may be plain text (one prompt
+per line) or JSONL (`--prompt-col` selects the column, default `text`).
+
+| File | Rows | Role (default) |
+| --- | --- | --- |
+| `harmless_alpaca_train.jsonl` | 25058 | good prompts / residual directions (`--good`) |
+| `harmful_behaviors_train.jsonl` | 416 | bad prompts / residual directions (`--bad`) |
+| `harmless_alpaca_test.jsonl` | 6265 | KL divergence evaluation (`--eval-good`) |
+| `harmful_behaviors_test.jsonl` | 104 | refusal evaluation (`--eval-bad`) |
+
+The full files are large, so the limits default to Heretic's: `--limit 400`
+(residual prompts per set) and `--eval-limit 100` (evaluation prompts per set).
+Pass `--limit 0` / `--eval-limit 0` to use an entire file. Every prompt costs one
+model forward, so raising the limits directly increases runtime.
+
+These mirror `mlabonne/harmless_alpaca` and `mlabonne/harmful_behaviors` as
+published under `heretic-org` on Hugging Face.
+
+### Key flags
+
+| Flag | Command | Meaning |
+| --- | --- | --- |
+| `--row-norm none\|pre\|full` | `abliterate`, `search` | MPOA row normalization (default `full`) |
+| `--orthogonalize` | `abliterate`, `search` | project the direction orthogonal to the good direction (default true) |
+| `--direction-index` | `abliterate` | single global direction layer index (`-1` = per layer, default) |
+| `--winsorize` | `abliterate`, `search` | clamp residual components to a quantile in `[0,1)` |
+| `--sampler random\|halton\|tpe` | `search` | optimizer (default `random`) |
+| `--lambda` | `search` | KL weight in the objective `refusal + lambda*KL` (default `1.0`) |
+| `--seed`, `--study` | `search` | reproducible seed and resumable JSON Lines checkpoint |
+
+Note: the first-token KL is a weak signal for a thinking model (it emits
+`<think>` first), so small divergence scores are expected on short generations.
 
 ## Testing
 
@@ -86,7 +138,7 @@ works on any machine:
 - Real-model tests (tokenizer specials, example building) skip when no GGUF is
   present under `models/`.
 
-### External reference checks
+### External verification checks
 
 Independent cross-checks live in the isolated [e2e-tests/](e2e-tests/)
 directory (Go drivers plus Python reference scripts). They are opt-in via
@@ -106,10 +158,7 @@ populated on demand from [e2e-tests/requirements.txt](e2e-tests/requirements.txt
 - `SYSTEM_PYTHON=python3.x` selects the base interpreter used to build it.
 - `E2E_PYTHON=/path/to/python` runs the references against your own environment.
 
-When a `verify-*` target is run, a missing interpreter, dependency, or model is a
-hard failure, not a skip - an explicitly requested check never silently passes.
-
-The reference scripts can also be driven directly with the usual Go env vars:
+The verification scripts can also be driven directly with the usual Go env vars:
 
 ```sh
 QWEN38_VERIFY_REF=1  QWEN38_REF_PYTHON=/path/to/python go test -run TestReferenceNumpy -v ./e2e-tests/...;
@@ -128,10 +177,3 @@ Note: this project is a clean-room reimplementation; the bundled read-only
 reference checkouts (`references/llama_cpp`, `references/heretic`) are not part
 of the build and keep their own licenses (Heretic is AGPL-3.0).
 
-## Requirements
-
-- Go 1.27 (build and tests).
-- `glslc` + `spirv-val` only to rebuild the committed SPIR-V shaders.
-- A Vulkan device for GPU acceleration and the GPU tests (the CLI selects it
-  automatically when it has enough memory).
-- `python3` with venv support only for the external reference checks.
