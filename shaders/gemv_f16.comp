@@ -1,0 +1,29 @@
+#version 450
+
+// Fused F16 dequantize + GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
+// One invocation per output row, so the weight is read once and never
+// materialized as float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint K; uint N; } p;
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float h16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        acc += h16((n * bpr + blk) * 2u) * x[blk];
+    }
+    y[n] = acc;
+}

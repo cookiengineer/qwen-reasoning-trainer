@@ -14,6 +14,34 @@ type Override struct {
 	Raw  []byte
 }
 
+// TargetTensor names an abliterable weight in a *Weights.
+type TargetTensor struct {
+	Name string
+	W    *Weight
+}
+
+// TargetWeights returns the abliterable tensors (attention / linear-attention
+// out-projection and MLP down-projection) in deterministic layer order. It is
+// the pointer-keyed counterpart to Overrides, used to snapshot and restore the
+// affected weights across abliteration search trials.
+func (w *Weights) TargetWeights() []TargetTensor {
+	var out []TargetTensor
+	for il := range w.Layers {
+		lw := &w.Layers[il]
+		if w.Cfg.IsRecurrent(il) {
+			if lw.SSMOut != nil {
+				out = append(out, TargetTensor{fmt.Sprintf("blk.%d.ssm_out.weight", il), lw.SSMOut})
+			}
+		} else if lw.AttnOutput != nil {
+			out = append(out, TargetTensor{fmt.Sprintf("blk.%d.attn_output.weight", il), lw.AttnOutput})
+		}
+		if lw.FfnDown != nil {
+			out = append(out, TargetTensor{fmt.Sprintf("blk.%d.ffn_down.weight", il), lw.FfnDown})
+		}
+	}
+	return out
+}
+
 // Overrides returns the abliterable tensors (attention out-projection / linear
 // out-projection and MLP down-projection) keyed by their GGUF tensor names.
 func (w *Weights) Overrides() map[string]Override {

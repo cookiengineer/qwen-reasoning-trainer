@@ -15,10 +15,15 @@ var errNoGemv = errors.New("vulkan: no fused gemv shader")
 
 // gemvShaders maps a quantized type to its fused dequantize+GEMV shader.
 var gemvShaders = map[quant.Type]string{
+	quant.TypeF16:    "gemv_f16",
+	quant.TypeQ8_0:   "gemv_q8_0",
 	quant.TypeQ4_K:   "gemv_q4_k",
 	quant.TypeQ5_K:   "gemv_q5_k",
 	quant.TypeQ6_K:   "gemv_q6_k",
+	quant.TypeQ3_K:   "gemv_q3_k",
 	quant.TypeIQ4_XS: "gemv_iq4_xs",
+	quant.TypeIQ4_NL: "gemv_iq4_nl",
+	quant.TypeIQ3_S:  "gemv_iq3_s",
 }
 
 // Capabilities implements compute.Backend.

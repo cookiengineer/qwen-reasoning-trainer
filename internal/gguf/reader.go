@@ -15,6 +15,19 @@ import (
 // ErrInvalid reports a malformed GGUF file.
 var ErrInvalid = errors.New("gguf: invalid file")
 
+const (
+	// maxMetadataEntries bounds the KV and tensor counts a header may declare,
+	// so a hostile file cannot trigger a huge allocation before the reads run
+	// out of data. Real files are orders of magnitude below this.
+	maxMetadataEntries = 1 << 20
+	// Lower bounds on the encoded size of one KV / tensor info, in bytes.
+	minKVBytes     = int64(12)
+	minTensorBytes = int64(32)
+	// maxStringBytes caps a single metadata string. Real strings (tokenizer
+	// pieces, templates) are tiny; this only stops a hostile length field.
+	maxStringBytes = 1 << 26
+)
+
 // File is an open GGUF file. It retains the underlying ReaderAt so tensor data
 // can be read on demand.
 type File struct {
@@ -232,8 +245,15 @@ func (c *cursor) str() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if c.max > 0 && int64(n) > c.max-c.off {
+	remaining := c.max - c.off
+	if remaining < 0 {
+		remaining = 0
+	}
+	if c.max > 0 && n > uint64(remaining) {
 		return "", fmt.Errorf("%w: string length %d exceeds file", ErrInvalid, n)
+	}
+	if n > maxStringBytes {
+		return "", fmt.Errorf("%w: string length %d too large", ErrInvalid, n)
 	}
 	b := make([]byte, n)
 	if err := c.read(b); err != nil {
@@ -293,7 +313,19 @@ func readFrom(r io.ReaderAt, size int64) (*File, error) {
 		byName:  make(map[string]*TensorInfo),
 	}
 
-	g.KVs = make([]KV, 0, kvCount)
+	// Bound the metadata counts so a hostile header cannot force an enormous
+	// allocation before the reads above run out of bytes. A KV needs at least
+	// a key length plus a value type (12 bytes); a tensor needs its name,
+	// dimensions, type and offset (>=32 bytes).
+	if kvCount > maxMetadataEntries || tensorCount > maxMetadataEntries {
+		return nil, fmt.Errorf("%w: metadata counts too large (kv=%d tensors=%d)", ErrInvalid, kvCount, tensorCount)
+	}
+	kvCap := int64(kvCount)
+	if lim := size/minKVBytes + 1; kvCap > lim {
+		kvCap = lim
+	}
+
+	g.KVs = make([]KV, 0, kvCap)
 	for i := uint64(0); i < kvCount; i++ {
 		key, err := c.str()
 		if err != nil {
@@ -312,7 +344,11 @@ func readFrom(r io.ReaderAt, size int64) (*File, error) {
 		g.Alignment = v
 	}
 
-	g.Tensors = make([]*TensorInfo, 0, tensorCount)
+	tensorCap := int64(tensorCount)
+	if lim := size/minTensorBytes + 1; tensorCap > lim {
+		tensorCap = lim
+	}
+	g.Tensors = make([]*TensorInfo, 0, tensorCap)
 	for i := uint64(0); i < tensorCount; i++ {
 		name, err := c.str()
 		if err != nil {
@@ -353,13 +389,16 @@ func readFrom(r io.ReaderAt, size int64) (*File, error) {
 
 	// Validate tensor bounds.
 	for _, t := range g.Tensors {
+		if t.Offset > uint64(size) {
+			return nil, fmt.Errorf("%w: tensor %q offset %d exceeds file size %d", ErrInvalid, t.Name, t.Offset, size)
+		}
 		sz, err := t.ByteSize()
 		if err != nil {
 			return nil, fmt.Errorf("gguf: tensor %q: %w", t.Name, err)
 		}
-		end := g.dataStart + int64(t.Offset) + sz
-		if end > size {
-			return nil, fmt.Errorf("%w: tensor %q extends past end of file (%d > %d)", ErrInvalid, t.Name, end, size)
+		start := g.dataStart + int64(t.Offset)
+		if sz < 0 || start < 0 || start > size || sz > size-start {
+			return nil, fmt.Errorf("%w: tensor %q extends past end of file (offset %d size %d, file %d)", ErrInvalid, t.Name, start, sz, size)
 		}
 	}
 
@@ -431,13 +470,26 @@ func readValueOfType(c *cursor, t ValueType, depth int) (Value, error) {
 		if c.max > 0 && count > uint64(c.max) {
 			return Value{}, fmt.Errorf("%w: array count %d too large", ErrInvalid, count)
 		}
-		arr := make([]Value, count)
+		// Preallocate conservatively and grow as elements are actually read, so
+		// a declared count far larger than the data cannot force a huge alloc.
+		remaining := c.max - c.off
+		if remaining < 0 {
+			remaining = 0
+		}
+		capHint := count
+		if capHint > uint64(remaining)+1 {
+			capHint = uint64(remaining) + 1
+		}
+		if capHint > maxMetadataEntries {
+			capHint = maxMetadataEntries
+		}
+		arr := make([]Value, 0, capHint)
 		for i := uint64(0); i < count; i++ {
 			v, err := readValueOfType(c, elemType, depth+1)
 			if err != nil {
 				return Value{}, err
 			}
-			arr[i] = v
+			arr = append(arr, v)
 		}
 		return Value{Type: t, Array: arr}, nil
 	default:

@@ -1,0 +1,82 @@
+#version 450
+
+// Fused Q3_K dequantize + GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
+// One invocation per output row, so the weight is read once and never
+// materialized as float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint K; uint N; } p;
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+uint u32at(uint o) {
+    return getb(o) | (getb(o + 1u) << 8u) | (getb(o + 2u) << 16u) | (getb(o + 3u) << 24u);
+}
+
+const uint KMASK1 = 0x03030303u;
+const uint KMASK2 = 0x0f0f0f0fu;
+
+uint g_x0, g_x1, g_x2, g_x3;
+
+int scAt(uint i) {
+    uint g = i >> 2u;
+    uint k = i & 3u;
+    uint v = (g == 0u) ? g_x0 : (g == 1u) ? g_x1 : (g == 2u) ? g_x2 : g_x3;
+    v = (v >> (k * 8u)) & 0xFFu;
+    return (v >= 128u) ? int(v) - 256 : int(v);
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint base = (n * bpr + blk) * 110u;
+        uint xb = blk * 256u;
+        float d = f16(base + 108u);
+
+        uint a0 = u32at(base + 96u);
+        uint a1 = u32at(base + 100u);
+        uint tmp = u32at(base + 104u);
+        g_x0 = (a0 & KMASK2) | (((tmp >> 0u) & KMASK1) << 4u);
+        g_x1 = (a1 & KMASK2) | (((tmp >> 2u) & KMASK1) << 4u);
+        g_x2 = ((a0 >> 4u) & KMASK2) | (((tmp >> 4u) & KMASK1) << 4u);
+        g_x3 = ((a1 >> 4u) & KMASK2) | (((tmp >> 6u) & KMASK1) << 4u);
+
+        uint q = base + 32u;
+        uint is = 0u;
+        uint m = 1u;
+        uint idx = 0u;
+        for (uint nn = 0u; nn < 256u; nn += 128u) {
+            uint shift = 0u;
+            for (uint j = 0u; j < 4u; j++) {
+                float dl = d * float(scAt(is) - 32); is++;
+                for (uint l = 0u; l < 16u; l++) {
+                    int v = int((getb(q + l) >> shift) & 3u);
+                    if ((getb(base + l) & m) == 0u) { v -= 4; }
+                    acc += dl * float(v) * x[xb + idx];
+                    idx++;
+                }
+                dl = d * float(scAt(is) - 32); is++;
+                for (uint l = 0u; l < 16u; l++) {
+                    int v = int((getb(q + l + 16u) >> shift) & 3u);
+                    if ((getb(base + l + 16u) & m) == 0u) { v -= 4; }
+                    acc += dl * float(v) * x[xb + idx];
+                    idx++;
+                }
+                shift += 2u;
+                m <<= 1u;
+            }
+            q += 32u;
+        }
+    }
+    y[n] = acc;
+}

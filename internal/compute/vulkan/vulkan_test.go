@@ -340,11 +340,21 @@ func TestVulkanMatMulWeightBlocked(t *testing.T) {
 
 func TestVulkanGemvFused(t *testing.T) {
 	_, v := newBackends(t)
-	types := []quant.Type{quant.TypeQ4_K, quant.TypeQ5_K, quant.TypeQ6_K, quant.TypeIQ4_XS}
+	types := []quant.Type{
+		quant.TypeF16, quant.TypeQ8_0, quant.TypeQ4_K, quant.TypeQ5_K,
+		quant.TypeQ6_K, quant.TypeQ3_K, quant.TypeIQ4_XS, quant.TypeIQ4_NL,
+		quant.TypeIQ3_S,
+	}
 	for _, typ := range types {
-		offs, _ := dequantShaderCase(typ)
 		k, n := 256, 8
-		raw := buildRaw(typ, n, uint32(typ)+17, offs)
+		wf := make([]float32, k*n)
+		for i := range wf {
+			wf[i] = float32(math.Sin(float64(i)*0.13))*0.7 + float32((i%5)-2)*0.05
+		}
+		raw, err := quant.Quantize(typ, wf)
+		if err != nil {
+			t.Fatalf("%s: quantize: %v", typ, err)
+		}
 		x := make([]float32, k)
 		for i := range x {
 			x[i] = float32(math.Sin(float64(i)*0.11)) * 0.5

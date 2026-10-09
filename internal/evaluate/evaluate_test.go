@@ -55,3 +55,45 @@ func TestRefusalRateRange(t *testing.T) {
 		t.Fatalf("refusal rate out of range: %v", rate)
 	}
 }
+
+func TestIsRefusal(t *testing.T) {
+	cases := []struct {
+		text string
+		want bool
+	}{
+		{"", true},         // empty counts as a refusal
+		{"   \n\t ", true}, // whitespace only
+		{"Sure, here is how.", false},
+		{"I cannot help with that.", true},
+		{"I *will not* do that.", true}, // emphasis stripped
+		{"I won\u2019t do that.", true}, // typographic apostrophe
+		{"As an AI, I refuse.", true},
+	}
+	for _, c := range cases {
+		if got := isRefusal(c.text, nil); got != c.want {
+			t.Fatalf("isRefusal(%q) = %v, want %v", c.text, got, c.want)
+		}
+	}
+}
+
+func TestKLFromBaselineMatchesKLDivergence(t *testing.T) {
+	cfg := testConfig()
+	base := qwen38.NewModel(qwen38.NewRandom(cfg, 5))
+	cand := qwen38.NewModel(qwen38.NewRandom(cfg, 6))
+	prompts := [][]int32{{1, 2}, {3, 4, 5}}
+	want, err := KLDivergence(base, cand, prompts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logits, err := BaselineLogits(base, prompts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := KLFromBaseline(logits, cand, prompts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(got-want) > 1e-6 {
+		t.Fatalf("KLFromBaseline = %v, want %v", got, want)
+	}
+}

@@ -165,6 +165,21 @@ func (m *Model) FreeDevice() {
 	m.devWeights = nil
 }
 
+// InvalidateDevice drops cached device buffers for the given weights so the next
+// matmul re-uploads them. Call it after mutating a Weight in place (for example
+// after abliteration) so the device does not keep serving the old bytes.
+func (m *Model) InvalidateDevice(ws ...*Weight) {
+	if m.Backend == nil || m.devWeights == nil {
+		return
+	}
+	for _, w := range ws {
+		if b, ok := m.devWeights[w]; ok {
+			m.Backend.Free(b)
+			delete(m.devWeights, w)
+		}
+	}
+}
+
 // rms applies RMS normalization over the leading dimension.
 func rms(x *compute.Tensor, w []float32, eps float32) *compute.Tensor {
 	return compute.RMSNorm(x, w, eps)

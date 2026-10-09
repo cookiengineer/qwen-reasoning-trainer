@@ -7,6 +7,7 @@ package gguf
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
@@ -157,9 +158,25 @@ func (t *TensorInfo) RowLen() int64 {
 	return int64(t.Dims[0])
 }
 
-// ByteSize returns the number of bytes occupied by the tensor data.
+// ByteSize returns the number of bytes occupied by the tensor data. It detects
+// dimension overflow so a hostile header cannot produce a bogus (negative or
+// wrapped) size that would later be handed to make.
 func (t *TensorInfo) ByteSize() (int64, error) {
-	return t.Type.Size(t.NumElements())
+	elems := int64(1)
+	for _, d := range t.Dims {
+		if d == 0 {
+			elems = 0
+			break
+		}
+		if d > math.MaxInt64 {
+			return 0, fmt.Errorf("gguf: tensor %q dimension %d overflows", t.Name, d)
+		}
+		if elems > math.MaxInt64/int64(d) {
+			return 0, fmt.Errorf("gguf: tensor %q element count overflows", t.Name)
+		}
+		elems *= int64(d)
+	}
+	return t.Type.Size(elems)
 }
 
 func (t *TensorInfo) String() string {

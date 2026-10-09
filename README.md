@@ -51,6 +51,13 @@ make;
   --bad prompts/bad.txt \
   --out models/abliterated.gguf;
 
+# search abliteration parameters (refusal + lambda*KL) and write the best trial
+./build/qwen-trainer search \
+  --good prompts/good.txt \
+  --bad prompts/bad.txt \
+  --trials 25 --sampler tpe --study models/search.jsonl \
+  --out models/search-best.gguf;
+
 # score a model's refusal rate and KL divergence from the base
 ./build/qwen-trainer \
   --model models/abliterated.gguf \
@@ -112,6 +119,14 @@ QWEN38_VERIFY_DATA=1 QWEN38_REF_PYTHON=/path/to/python go test -run TestReferenc
 The dataset reader is additionally checked against a fixture emitted by the
 `opencode-reasoning-extractor`'s own writer
 (`internal/dataset/testdata/extractor-writer/`).
+
+## License
+
+Released under the MIT License. See [LICENSE.txt](LICENSE.txt).
+
+Note: this project is a clean-room reimplementation; the bundled read-only
+reference checkouts (`references/llama_cpp`, `references/heretic`) are not part
+of the build and keep their own licenses (Heretic is AGPL-3.0).
 
 ## Requirements
 

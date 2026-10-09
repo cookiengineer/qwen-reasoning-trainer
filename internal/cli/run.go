@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -21,6 +20,7 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/hf"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/tokenizer"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/train"
 )
@@ -36,6 +36,7 @@ Commands:
   gpu-info   Print Vulkan device capabilities
   run        Load the model and greedily generate tokens
   abliterate Remove refusal directions and write an abliterated GGUF
+  search     Search abliteration parameters (refusal + lambda*KL) and write the best
   evaluate   Score a model's refusal rate and KL divergence from a base
   dataset    Build tokenized, loss-masked examples from extractor JSONL
   train      QLoRA fine-tune on the extractor dataset (reference host path)
@@ -77,6 +78,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return cmdRun(cfg, stdout, stderr)
 	case "abliterate":
 		return cmdAbliterate(cfg, stdout, stderr)
+	case "search":
+		return cmdAbliterateSearch(cfg, stdout, stderr)
 	case "evaluate":
 		return cmdEvaluate(cfg, stdout, stderr)
 	case "dataset":
@@ -239,24 +242,226 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("search", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	goodFile := fs.String("good", "", "file with desirable (residual) prompts")
+	badFile := fs.String("bad", "", "file with undesirable (residual) prompts")
+	evalGood := fs.String("eval-good", "", "KL evaluation prompts (default: --good)")
+	evalBad := fs.String("eval-bad", "", "refusal evaluation prompts (default: --bad)")
+	promptCol := fs.String("prompt-col", "", "JSONL prompt column (default: text)")
+	out := fs.String("out", "", "output GGUF for the best trial (optional)")
+	system := fs.String("system", "You are a helpful assistant.", "system prompt")
+	rowNorm := fs.String("row-norm", "full", "row normalization: none|pre|full")
+	orthogonalize := fs.Bool("orthogonalize", true, "orthogonalize against the good direction")
+	limit := fs.Int("limit", 0, "max residual prompts per set (0 = all)")
+	evalLimit := fs.Int("eval-limit", 0, "max evaluation prompts per set (0 = all)")
+	trials := fs.Int("trials", 20, "total number of trials")
+	lambda := fs.Float64("lambda", 1.0, "KL weight in the objective refusal + lambda*KL")
+	seed := fs.Int64("seed", 1, "random seed")
+	samplerName := fs.String("sampler", "random", "sampler: random|halton")
+	study := fs.String("study", "", "JSONL study checkpoint (resumed if present)")
+	maxTokens := fs.Int("max-tokens", 32, "tokens generated per refusal prompt")
+	winsorize := fs.Float64("winsorize", 0, "winsorization quantile in [0,1) (0 = off)")
+	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if *goodFile == "" || *badFile == "" {
+		fmt.Fprintln(stderr, "error: --good and --bad are required")
+		return 2
+	}
+	if *rowNorm != "none" && *rowNorm != "pre" && *rowNorm != "full" {
+		fmt.Fprintln(stderr, "error: --row-norm must be none, pre, or full")
+		return 2
+	}
+	goodLines, err := readPromptFile(*goodFile, *promptCol, *limit)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	badLines, err := readPromptFile(*badFile, *promptCol, *limit)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if len(goodLines) == 0 || len(badLines) == 0 {
+		fmt.Fprintln(stderr, "error: need at least one prompt in --good and --bad")
+		return 2
+	}
+	klPath := *evalGood
+	if klPath == "" {
+		klPath = *goodFile
+	}
+	rfPath := *evalBad
+	if rfPath == "" {
+		rfPath = *badFile
+	}
+	klLines, err := readPromptFile(klPath, *promptCol, *evalLimit)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	rfLines, err := readPromptFile(rfPath, *promptCol, *evalLimit)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if len(klLines) == 0 || len(rfLines) == 0 {
+		fmt.Fprintln(stderr, "error: evaluation prompt sets must not be empty")
+		return 2
+	}
+
+	path, err := resolveModel(cfg, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	g, err := gguf.Open(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	defer g.Close()
+	mc, err := modelcfg.FromGGUF(g)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	vocab, err := tokenizer.FromGGUF(g)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "loading weights from %s...\n", path)
+	w, err := qwen38.LoadFromGGUF(g, mc)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	m := qwen38.NewModel(w)
+	if be := resolveGPU(modelBytes(g)+gpuHeadroomBytes, cfg, stderr); be != nil {
+		defer func() { m.FreeDevice(); be.Close() }()
+		m.Backend = be
+	}
+
+	good := encodePrompts(vocab, *system, goodLines)
+	bad := encodePrompts(vocab, *system, badLines)
+	fmt.Fprintf(stderr, "collecting residuals (%d good, %d bad prompts)...\n", len(good), len(bad))
+	gm, err := abliterate.CollectResiduals(m, good, *winsorize)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	bm, err := abliterate.CollectResiduals(m, bad, *winsorize)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	dirs := abliterate.Directions(gm, bm, *orthogonalize)
+
+	rfPrompts := encodePrompts(vocab, *system, rfLines)
+	klPrompts := encodePrompts(vocab, *system, klLines)
+	fmt.Fprintf(stderr, "computing baseline logits (%d KL prompts)...\n", len(klPrompts))
+	baseLogits, err := evaluate.BaselineLogits(m, klPrompts)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+
+	// Snapshot the abliterable weights so each trial starts from the pristine
+	// bytes. Ablate replaces Raw; it never mutates the input slice.
+	targets := w.TargetWeights()
+	snapTyp := make([]quant.Type, len(targets))
+	snapRaw := make([][]byte, len(targets))
+	ws := make([]*qwen38.Weight, len(targets))
+	for i, t := range targets {
+		snapTyp[i] = t.W.Typ
+		snapRaw[i] = append([]byte(nil), t.W.Raw...)
+		ws[i] = t.W
+	}
+	restore := func() {
+		for i, t := range targets {
+			t.W.Typ = snapTyp[i]
+			t.W.Raw = snapRaw[i]
+		}
+		m.InvalidateDevice(ws...)
+	}
+
+	L := m.Cfg.TrunkLayers()
+	space := abliterate.NewSearchSpace(L)
+	var prior []abliterate.TrialResult
+	if *study != "" {
+		prior, err = abliterate.LoadStudy(*study)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+	}
+	if len(prior) >= *trials {
+		fmt.Fprintf(stderr, "study already has %d trials (>= --trials %d); nothing to do\n", len(prior), *trials)
+	}
+	sampler := abliterate.NewSampler(*samplerName, space.Dims(), *seed)
+	fmt.Fprintf(stderr, "search: sampler=%s dims=%d trials=%d lambda=%.3f refusals=%d kl=%d\n",
+		sampler.Name(), space.Dims(), *trials, *lambda, len(rfPrompts), len(klPrompts))
+	if len(prior) > 0 {
+		fmt.Fprintf(stderr, "resuming from %d trials (%s)\n", len(prior), *study)
+	}
+
+	var lastRefusal, lastKL float64
+	obj := func(tp abliterate.TrialParams) (float64, error) {
+		restore()
+		if _, err := abliterate.Ablate(w, dirs, tp.Params()); err != nil {
+			return 0, err
+		}
+		refusal, err := evaluate.RefusalRate(m, vocab, rfPrompts, *maxTokens, nil)
+		if err != nil {
+			return 0, err
+		}
+		kl, err := evaluate.KLFromBaseline(baseLogits, m, klPrompts)
+		if err != nil {
+			return 0, err
+		}
+		lastRefusal, lastKL = refusal, kl
+		return refusal + *lambda*kl, nil
+	}
+	onTrial := func(tr abliterate.TrialResult) {
+		fmt.Fprintf(stderr, "trial %d/%d: refusal=%.3f kl=%.4f score=%.4f\n",
+			tr.Index+1, *trials, lastRefusal, lastKL, tr.Score)
+		if *study != "" {
+			if err := abliterate.AppendStudy(*study, tr); err != nil {
+				fmt.Fprintf(stderr, "warn: study append: %v\n", err)
+			}
+		}
+	}
+
+	result, err := space.Search(sampler, abliterate.SearchOptions{Trials: *trials, Prior: prior, OnTrial: onTrial}, obj)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "best score %.4f\n", result.BestScore)
+
+	if *out != "" {
+		restore()
+		if _, err := abliterate.Ablate(w, dirs, result.Best.Params()); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		if err := qwen38.RewriteGGUF(g, w.Overrides(), *out); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "wrote %s (best score %.4f)\n", *out, result.BestScore)
+	} else {
+		fmt.Fprintf(stdout, "best score %.4f (no --out; nothing written)\n", result.BestScore)
+	}
+	return 0
+}
+
 func readLines(path string, limit int) []string {
-	f, err := os.Open(path)
+	out, err := readPromptFile(path, "", limit)
 	if err != nil {
 		return nil
-	}
-	defer f.Close()
-	var out []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		out = append(out, line)
-		if limit > 0 && len(out) >= limit {
-			break
-		}
 	}
 	return out
 }

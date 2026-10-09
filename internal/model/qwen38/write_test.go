@@ -73,3 +73,31 @@ func TestRewriteGGUF(t *testing.T) {
 		}
 	}
 }
+
+func TestTargetWeights(t *testing.T) {
+	w := NewRandom(tinyConfig(), 7)
+	targets := w.TargetWeights()
+	overrides := w.Overrides()
+
+	if len(targets) != len(overrides) {
+		t.Fatalf("targets %d != overrides %d", len(targets), len(overrides))
+	}
+	seen := map[string]bool{}
+	for _, tt := range targets {
+		ov, ok := overrides[tt.Name]
+		if !ok {
+			t.Fatalf("target %q has no override", tt.Name)
+		}
+		if ov.Type != tt.W.Typ || len(ov.Raw) != len(tt.W.Raw) {
+			t.Fatalf("target %q override does not match weight", tt.Name)
+		}
+		if seen[tt.Name] {
+			t.Fatalf("duplicate target %q", tt.Name)
+		}
+		seen[tt.Name] = true
+	}
+	// 3 linear ssm_out + 1 full attn_output + 4 ffn_down.
+	if len(targets) != 8 {
+		t.Fatalf("target count = %d, want 8", len(targets))
+	}
+}

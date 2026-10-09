@@ -1,0 +1,40 @@
+#version 450
+
+// Fused IQ4_NL dequantize + GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
+// One invocation per output row, so the weight is read once and never
+// materialized as float32.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint K; uint N; } p;
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+
+const float KV[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 32u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint base = (n * bpr + blk) * 18u;
+        uint xb = blk * 32u;
+        float d = f16(base);
+        for (uint j = 0u; j < 16u; j++) {
+            uint q = getb(base + 2u + j);
+            acc += d * KV[q & 0xFu] * x[xb + j];
+            acc += d * KV[q >> 4u] * x[xb + j + 16u];
+        }
+    }
+    y[n] = acc;
+}
