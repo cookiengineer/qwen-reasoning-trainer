@@ -1,0 +1,173 @@
+#version 450
+
+// Attention backward pass 1 (per query): dQ plus the per-query statistics
+// (m, l, pd) used by attn_back_dkv. Fast path: one workgroup per query, 64
+// lanes cooperate, keys are processed in a single tile of up to TILE.
+//
+// This is the tiled analogue of attn_back_dq.comp: it computes each q.k and
+// dOut.v once (the previous revision recomputed them up to four times) and
+// writes the same stats layout, so it is a drop-in when nQ == nKV is not
+// required and maxJ <= TILE.
+//
+// Matches compute.Attention / autograd.AttentionBackward: GQA and causal
+// masking when causal && nQ == nKV.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer Q     { float q[];     };
+layout(binding = 1) readonly buffer K     { float k[];     };
+layout(binding = 2) readonly buffer V     { float v[];     };
+layout(binding = 3) readonly buffer DOut  { float dout[];  };
+layout(binding = 4)          buffer Stats { float stats[]; };
+layout(binding = 5)          buffer DQ    { float dq[];    };
+// Intermediates for attn_back_dkv_tile: p in the first half, ds in the second,
+// both laid out [key e][query qid] so the dK/dV pass reads them coalesced.
+layout(binding = 6)          buffer PDS   { float pds[];   };
+
+layout(push_constant) uniform P {
+    uint  hd;
+    uint  nQ;
+    uint  nKV;
+    uint  nHead;
+    uint  nHeadKV;
+    uint  causal;
+    float scale;
+    uint  base;
+} p;
+
+#define LS 64
+#define MAX_HD 256
+#define TILE 1024
+
+shared float logits[TILE];
+shared float dps[TILE];
+shared float qs[MAX_HD];
+shared float red[LS];
+
+void main() {
+    uint qid = p.base + gl_WorkGroupID.x;
+    uint n = p.nHead * p.nQ;
+    if (qid >= n) {
+        return;
+    }
+    uint hd = p.hd;
+    if (hd > MAX_HD) {
+        return;
+    }
+    uint i = qid % p.nQ;
+    uint h = qid / p.nQ;
+    uint group = p.nHead / p.nHeadKV;
+    uint kv = h / group;
+    uint lane = gl_LocalInvocationID.x;
+
+    uint maxJ = p.nKV;
+    if (p.causal == 1u && p.nQ == p.nKV) {
+        maxJ = i + 1u;
+    }
+    if (maxJ > TILE) {
+        return;
+    }
+
+    uint qb = (i * p.nHead + h) * hd;
+    for (uint d = lane; d < hd; d += LS) {
+        qs[d] = q[qb + d];
+    }
+    barrier();
+
+    // logits = scale * q . k
+    for (uint e = lane; e < maxJ; e += LS) {
+        uint kb = (e * p.nHeadKV + kv) * hd;
+        float dot = 0.0;
+        for (uint d = 0u; d < hd; d++) {
+            dot += qs[d] * k[kb + d];
+        }
+        logits[e] = dot * p.scale;
+    }
+    barrier();
+
+    // max
+    float lm = -1e30;
+    for (uint e = lane; e < maxJ; e += LS) {
+        lm = max(lm, logits[e]);
+    }
+    red[lane] = lm;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] = max(red[lane], red[lane + s]);
+        }
+        barrier();
+    }
+    float m = red[0];
+
+    // p = exp(logit - m), sum
+    float lsum = 0.0;
+    for (uint e = lane; e < maxJ; e += LS) {
+        float pe = exp(logits[e] - m);
+        logits[e] = pe;
+        lsum += pe;
+    }
+    red[lane] = lsum;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] += red[lane + s];
+        }
+        barrier();
+    }
+    float l = red[0];
+    float invl = 1.0 / l;
+
+    // dp = dOut . v, and normalize p in place.
+    for (uint e = lane; e < maxJ; e += LS) {
+        uint vb = (e * p.nHeadKV + kv) * hd;
+        float dp = 0.0;
+        for (uint d = 0u; d < hd; d++) {
+            dp += dout[qb + d] * v[vb + d];
+        }
+        dps[e] = dp;
+        logits[e] *= invl;
+    }
+    barrier();
+
+    // pd = sum_j p_j dp_j
+    float pd = 0.0;
+    for (uint e = lane; e < maxJ; e += LS) {
+        pd += logits[e] * dps[e];
+    }
+    red[lane] = pd;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] += red[lane + s];
+        }
+        barrier();
+    }
+    pd = red[0];
+
+    if (lane == 0u) {
+        stats[qid] = m;
+        stats[n + qid] = l;
+        stats[2u * n + qid] = pd;
+    }
+
+    // Persist p and ds for the dK/dV pass, and accumulate dQ.
+    uint strideQ = p.nHead * p.nQ;
+    uint dsBase = p.nKV * strideQ;
+    for (uint e = lane; e < maxJ; e += LS) {
+        float ds = logits[e] * (dps[e] - pd) * p.scale;
+        pds[e * strideQ + qid] = logits[e];
+        pds[dsBase + e * strideQ + qid] = ds;
+    }
+
+    // dQ[d] = sum_j p_j (dp_j - pd) scale k_j[d]
+    for (uint d = lane; d < hd; d += LS) {
+        float acc = 0.0;
+        for (uint e = 0u; e < maxJ; e++) {
+            uint kb = (e * p.nHeadKV + kv) * hd;
+            float ds = logits[e] * (dps[e] - pd) * p.scale;
+            acc += ds * k[kb + d];
+        }
+        dq[qb + d] = acc;
+    }
+}

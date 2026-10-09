@@ -1,6 +1,18 @@
 #version 450
 
-layout(local_size_x = 1) in;
+// Attention forward, GQA + optional causal masking (nQ == nKV).
+//
+// One workgroup per (head, query). 64 lanes cooperate on the query: keys are
+// streamed in tiles of TILE with an online (running) softmax for numerical
+// stability, so arbitrary sequence lengths work and the sequence dimension is
+// never reparsed. Logits are computed once per key instead of once per
+// (key, output-dimension) as the previous revision did.
+//
+// q, k, v are [headDim, nHead/nHeadKV, nTok]; out is [headDim, nHead, nTok].
+// The descriptor push constants and workgroup count match attention_naive.comp
+// (one workgroup per query); only the local size differs.
+
+layout(local_size_x = 64) in;
 
 layout(binding = 0) readonly  buffer Q { float q[]; };
 layout(binding = 1) readonly  buffer K { float k[]; };
@@ -17,50 +29,105 @@ layout(push_constant) uniform P {
     uint  base;
 } p;
 
+#define LS 64
+#define MAX_HD 256
+#define TILE 1024
+
+shared float logits[TILE];
+shared float acc[MAX_HD];
+shared float qs[MAX_HD];
+shared float red[LS];
+
 void main() {
-    uint gid = p.base + gl_GlobalInvocationID.x;
-    uint total = p.nHead * p.nTok;
-    if (gid >= total) {
+    uint qid = p.base + gl_WorkGroupID.x;
+    if (qid >= p.nHead * p.nTok) {
         return;
     }
-    uint i = gid % p.nTok;
-    uint h = gid / p.nTok;
+    uint hd = p.headDim;
+    if (hd > MAX_HD) {
+        return;
+    }
+    uint i = qid % p.nTok;
+    uint h = qid / p.nTok;
     uint group = p.nHead / p.nHeadKV;
     uint kv = h / group;
-    uint maxJ = (p.causal == 1u) ? (i + 1u) : p.nTok;
+    uint lane = gl_LocalInvocationID.x;
 
-    uint qOff = (i * p.nHead + h) * p.headDim;
+    uint maxJ = p.nTok;
+    if (p.causal == 1u) {
+        maxJ = i + 1u;
+    }
+
+    uint qOff = (i * p.nHead + h) * hd;
+    for (uint d = lane; d < hd; d += LS) {
+        qs[d] = q[qOff + d];
+        acc[d] = 0.0;
+    }
+    barrier();
+
     float m = -1e30;
-    for (uint j = 0; j < maxJ; j++) {
-        uint kOff = (j * p.nHeadKV + kv) * p.headDim;
-        float dot = 0.0;
-        for (uint d = 0; d < p.headDim; d++) {
-            dot += q[qOff + d] * k[kOff + d];
-        }
-        dot *= p.scale;
-        m = max(m, dot);
-    }
-    float sum = 0.0;
-    for (uint j = 0; j < maxJ; j++) {
-        uint kOff = (j * p.nHeadKV + kv) * p.headDim;
-        float dot = 0.0;
-        for (uint d = 0; d < p.headDim; d++) {
-            dot += q[qOff + d] * k[kOff + d];
-        }
-        sum += exp(dot * p.scale - m);
-    }
-    uint oOff = qOff;
-    for (uint d = 0; d < p.headDim; d++) {
-        float acc = 0.0;
-        for (uint j = 0; j < maxJ; j++) {
-            uint kOff = (j * p.nHeadKV + kv) * p.headDim;
+    float l = 0.0;
+    for (uint t0 = 0u; t0 < maxJ; t0 += TILE) {
+        uint tlen = min(uint(TILE), maxJ - t0);
+
+        // Tile logits: one lane per key, serial over headDim.
+        for (uint e = lane; e < tlen; e += LS) {
+            uint kb = ((t0 + e) * p.nHeadKV + kv) * hd;
             float dot = 0.0;
-            for (uint dd = 0; dd < p.headDim; dd++) {
-                dot += q[qOff + dd] * k[kOff + dd];
+            for (uint d = 0u; d < hd; d++) {
+                dot += qs[d] * k[kb + d];
             }
-            uint vOff = (j * p.nHeadKV + kv) * p.headDim;
-            acc += exp(dot * p.scale - m) * v[vOff + d];
+            logits[e] = dot * p.scale;
         }
-        o[oOff + d] = acc / sum;
+        barrier();
+
+        // Running max.
+        float lm = -1e30;
+        for (uint e = lane; e < tlen; e += LS) {
+            lm = max(lm, logits[e]);
+        }
+        red[lane] = lm;
+        barrier();
+        for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                red[lane] = max(red[lane], red[lane + s]);
+            }
+            barrier();
+        }
+        float newM = max(m, red[0]);
+        float corr = exp(m - newM);
+
+        // Tile exponentials and sum.
+        float ls = 0.0;
+        for (uint e = lane; e < tlen; e += LS) {
+            float pe = exp(logits[e] - newM);
+            logits[e] = pe;
+            ls += pe;
+        }
+        red[lane] = ls;
+        barrier();
+        for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                red[lane] += red[lane + s];
+            }
+            barrier();
+        }
+        l = l * corr + red[0];
+
+        // Output: one lane owns headDim/LS dimensions; accumulate over the tile.
+        for (uint d = lane; d < hd; d += LS) {
+            float a = acc[d] * corr;
+            for (uint e = 0u; e < tlen; e++) {
+                uint vb = ((t0 + e) * p.nHeadKV + kv) * hd;
+                a += logits[e] * v[vb + d];
+            }
+            acc[d] = a;
+        }
+        m = newM;
+        barrier();
+    }
+
+    for (uint d = lane; d < hd; d += LS) {
+        o[qOff + d] = acc[d] / l;
     }
 }

@@ -12,13 +12,13 @@ layout(push_constant) uniform P {
     uint  nTok;
     uint  nDims;
     float theta;
-    uint  pad;
+    uint  base;
 } p;
 
 void main() {
     uint hd = p.nDims / 2u;
     uint total = p.nTok * p.nHead * hd;
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = p.base + gl_GlobalInvocationID.x;
     if (gid >= total) {
         return;
     }

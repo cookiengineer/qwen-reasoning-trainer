@@ -10,10 +10,11 @@ layout(push_constant) uniform P {
     uint rowLen;
     uint nRows;
     uint count;
+    uint base;
 } p;
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = p.base + gl_GlobalInvocationID.x;
     uint total = p.count * p.rowLen;
     if (gid >= total) {
         return;

@@ -56,4 +56,58 @@ func TestVulkanChunkedDispatch(t *testing.T) {
 		vo, _ := v.SSMConv(up(t, v, sx.Dims, sx.F32), up(t, v, cc.Dims, cc.F32))
 		compare(t, "ssm_conv big", down(t, v, vo), down(t, c, co))
 	}
+
+	// RoPE: nTok*nHead*(nDims/2) > limit.
+	{
+		rhd, rnHead, rnTok, rnDims := 4, 8, 280000, 4 // total 4,480,000
+		rx := autograd.Random(7, 1.0, rhd, rnHead, rnTok)
+		pos := make([]int32, rnTok)
+		for i := range pos {
+			pos[i] = int32(i % 16) // keep angles small to avoid pow/argument-reduction noise
+		}
+		co, _ := c.RoPE(up(t, c, rx.Dims, rx.F32), pos, 1e7, rnDims)
+		vo, _ := v.RoPE(up(t, v, rx.Dims, rx.F32), pos, 1e7, rnDims)
+		compare(t, "rope big", down(t, v, vo), down(t, c, co))
+	}
+
+	// RepeatHeads / RepeatHeadsBack: headDim*nOut*T and headDim*nIn*T > limit.
+	{
+		rhd, rnIn, rnOut, rT := 4, 4, 4, 280000 // 4,480,000
+		rx := autograd.Random(8, 1.0, rhd, rnIn, rT)
+		co, _ := c.RepeatHeads(up(t, c, rx.Dims, rx.F32), rhd, rnIn, rnOut, rT)
+		vo, _ := v.RepeatHeads(up(t, v, rx.Dims, rx.F32), rhd, rnIn, rnOut, rT)
+		compare(t, "repeat_heads big", down(t, v, vo), down(t, c, co))
+
+		gy := autograd.Random(9, 1.0, rhd, rnOut, rT)
+		cb, _ := c.RepeatHeadsBack(up(t, c, gy.Dims, gy.F32), rhd, rnIn, rnOut, rT)
+		vb, _ := v.RepeatHeadsBack(up(t, v, gy.Dims, gy.F32), rhd, rnIn, rnOut, rT)
+		compare(t, "repeat_heads_back big", down(t, v, vb), down(t, c, cb))
+	}
+
+	// GatherHeads / GatherHeadsBack: headDim*nHead*T > limit.
+	{
+		ghd, gnHead, gT, gConv := 4, 4, 280000, 16 // 4,480,000
+		conv := autograd.Random(10, 1.0, gConv, gT)
+		co, _ := c.GatherHeads(up(t, c, conv.Dims, conv.F32), 0, ghd, gnHead, gT, gConv)
+		vo, _ := v.GatherHeads(up(t, v, conv.Dims, conv.F32), 0, ghd, gnHead, gT, gConv)
+		compare(t, "gather_heads big", down(t, v, vo), down(t, c, co))
+
+		gy := autograd.Random(11, 1.0, ghd, gnHead, gT)
+		cb, _ := c.GatherHeadsBack(up(t, c, gy.Dims, gy.F32), 0, ghd, gnHead, gT, gConv)
+		vb, _ := v.GatherHeadsBack(up(t, v, gy.Dims, gy.F32), 0, ghd, gnHead, gT, gConv)
+		compare(t, "gather_heads_back big", down(t, v, vb), down(t, c, cb))
+	}
+
+	// GetRows: rowLen*count > limit.
+	{
+		rowLen, count := 64, 70000 // 4,480,000
+		tbl := autograd.Random(12, 1.0, rowLen, 64)
+		idx := make([]int32, count)
+		for i := range idx {
+			idx[i] = int32((i * 7) % 64)
+		}
+		co, _ := c.GetRows(up(t, c, tbl.Dims, tbl.F32), idx)
+		vo, _ := v.GetRows(up(t, v, tbl.Dims, tbl.F32), idx)
+		compare(t, "get_rows big", down(t, v, vo), down(t, c, co))
+	}
 }

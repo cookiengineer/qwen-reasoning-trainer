@@ -4,10 +4,11 @@
 // [gstride, H, T] (gstride 1 = scalar gate, S_v = per-element gate); beta is
 // [1, H, T]; state/newState are [S_v, S_v, H].
 //
-// Each state row j is independent of the others, so one invocation per (head, j)
-// recomputes the whole sequence for that row.
+// Each state row j is independent of the others, so one lane per (head, j)
+// recomputes the whole sequence for that row. Rows are packed into full
+// workgroups (128 lanes) so the SIMD lanes stay busy.
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 128) in;
 
 #define MAX_SV 256
 
@@ -32,7 +33,7 @@ layout(push_constant) uniform P {
 float row[MAX_SV];
 
 void main() {
-    uint gid = gl_WorkGroupID.x;
+    uint gid = gl_GlobalInvocationID.x;
     uint hh = gid / p.sv;
     uint j = gid % p.sv;
     if (hh >= p.h || j >= p.sv || p.sv > MAX_SV) {

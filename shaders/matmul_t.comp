@@ -4,11 +4,14 @@
 //
 //   O[k,m] = sum_r Ws[r,k] * D[n0 + r, m]
 //
-// Ws is a float32 weight block [K, rows] in GGML layout (row r contiguous,
-// element (k,r) at r*K + k). D is dY [N, M] in GGML layout (element (n,m) at
-// n + m*N). O is [K, M] (element (k,m) at k + m*K). When acc == 1 the partial
-// result is added to O instead of overwriting it, so a quantized weight can be
-// dequantized and multiplied in row blocks without a host round-trip.
+// Ws is a float32 weight block [rows, K] (row r contiguous, element (k,r) at
+// r*K + k). D is dY [N, M] in GGML layout (element (n,m) at n + m*N). O is
+// [K, M] (element (k,m) at k + m*K). When acc == 1 the partial result is added
+// to O instead of overwriting it, so a quantized weight can be dequantized and
+// multiplied in row blocks without a host round-trip.
+//
+// 64x64 (k,m) output tile, 16x16 threads, 4x4 register micro-tile, reduction
+// chunk TK=16.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -25,39 +28,79 @@ layout(push_constant) uniform P {
     uint acc;
 } p;
 
-shared float Ws[16][17];
-shared float Ds[16][17];
+#define TM 64
+#define TN 64
+#define TK 16
+#define TKMICRO 4
+#define TNMICRO 4
+
+shared float Ws[TK][TM + 4];
+shared float Ds[TK][TN + 4];
 
 void main() {
     uint tx = gl_LocalInvocationID.x;
     uint ty = gl_LocalInvocationID.y;
-    uint k0 = gl_WorkGroupID.x * 16u;
-    uint m0 = gl_WorkGroupID.y * 16u;
+    uint tid = ty * 16u + tx;
+    uint k0 = gl_WorkGroupID.x * TM;
+    uint m0 = gl_WorkGroupID.y * TN;
 
-    float acc = 0.0;
-    for (uint r0 = 0u; r0 < p.rows; r0 += 16u) {
-        uint r = r0 + ty;
-        uint k = k0 + tx;
-        Ws[ty][tx] = (r < p.rows && k < p.K) ? w[r * p.K + k] : 0.0;
+    float acc[TKMICRO][TNMICRO];
+    for (uint i = 0u; i < TKMICRO; i++) {
+        for (uint j = 0u; j < TNMICRO; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
 
-        uint m = m0 + tx;
-        Ds[ty][tx] = (r < p.rows && m < p.M) ? d[(p.n0 + r) + m * p.N] : 0.0;
-
+    for (uint r0 = 0u; r0 < p.rows; r0 += TK) {
+        for (uint idx = tid; idx < TK * TM; idx += 256u) {
+            uint r = idx / TM;
+            uint k = idx - r * TM;
+            uint rr = r0 + r;
+            uint kk = k0 + k;
+            Ws[r][k] = (rr < p.rows && kk < p.K) ? w[rr * p.K + kk] : 0.0;
+        }
+        for (uint idx = tid; idx < TK * TN; idx += 256u) {
+            uint r = idx % TK;
+            uint m = idx / TK;
+            uint rr = r0 + r;
+            uint mm = m0 + m;
+            Ds[r][m] = (rr < p.rows && mm < p.M) ? d[(p.n0 + rr) + mm * p.N] : 0.0;
+        }
         barrier();
-        for (uint i = 0u; i < 16u; i++) {
-            acc += Ws[i][ty] * Ds[i][tx];
+
+        for (uint r = 0u; r < TK; r++) {
+            float wv[TKMICRO];
+            float dv[TNMICRO];
+            for (uint i = 0u; i < TKMICRO; i++) {
+                wv[i] = Ws[r][ty * TKMICRO + i];
+            }
+            for (uint j = 0u; j < TNMICRO; j++) {
+                dv[j] = Ds[r][tx * TNMICRO + j];
+            }
+            for (uint i = 0u; i < TKMICRO; i++) {
+                for (uint j = 0u; j < TNMICRO; j++) {
+                    acc[i][j] += wv[i] * dv[j];
+                }
+            }
         }
         barrier();
     }
 
-    uint k = k0 + ty;
-    uint m = m0 + tx;
-    if (k < p.K && m < p.M) {
-        uint idx = k + m * p.K;
-        if (p.acc == 1u) {
-            o[idx] += acc;
-        } else {
-            o[idx] = acc;
+    for (uint i = 0u; i < TKMICRO; i++) {
+        uint k = k0 + ty * TKMICRO + i;
+        if (k >= p.K) {
+            continue;
+        }
+        for (uint j = 0u; j < TNMICRO; j++) {
+            uint m = m0 + tx * TNMICRO + j;
+            if (m < p.M) {
+                uint idx = k + m * p.K;
+                if (p.acc == 1u) {
+                    o[idx] += acc[i][j];
+                } else {
+                    o[idx] = acc[i][j];
+                }
+            }
         }
     }
 }

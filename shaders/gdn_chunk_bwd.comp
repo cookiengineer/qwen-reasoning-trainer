@@ -14,7 +14,8 @@
 #define MAX_SV 128
 #define MAX_C 64
 
-layout(local_size_x = 1) in;
+// 128 lanes: one per state row j, packed into a full workgroup.
+layout(local_size_x = 128) in;
 
 layout(binding = 0) readonly buffer Q { float qv[];    };
 layout(binding = 1) readonly buffer K { float kv[];    };
@@ -40,6 +41,9 @@ void main() {
     uint gid = gl_GlobalInvocationID.x; // hh * sv + j
     uint hh = gid / p.sv;
     uint j = gid - hh * p.sv;
+    if (hh >= p.h || j >= p.sv) {
+        return;
+    }
 
     uint offA = p.h * p.NC * p.C * p.sv;
     uint offB = offA + p.h * p.NC * p.C * p.C;

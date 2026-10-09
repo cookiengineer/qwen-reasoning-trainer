@@ -1,9 +1,11 @@
 #version 450
 
 // Tiled float32 GEMM: C[n,m] = sum_k A[n,k] * B[m,k], where A is a weight
-// matrix [K,N] and B an activation [K,M] in GGML layout. Each 16x16 workgroup
-// stages tiles of A and B in shared memory so every loaded value is reused
-// across the opposite dimension.
+// matrix [K,N] and B an activation [K,M] in GGML layout (both k-contiguous).
+//
+// 64x64 output tile, 16x16 threads, 4x4 register micro-tile per thread and a
+// 16-deep k slice staged in shared memory. Each thread performs 16 FMAs per 8
+// shared loads instead of one FMA per shared load.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -18,34 +20,73 @@ layout(push_constant) uniform P {
     uint pad;
 } p;
 
-shared float As[16][17];
-shared float Bs[16][17];
+#define TM 64
+#define TN 64
+#define TK 16
+#define TMICRO 4
+#define TNMICRO 4
+
+shared float As[TK][TM + 4];
+shared float Bs[TK][TN + 4];
 
 void main() {
-    uint tx = gl_LocalInvocationID.x;
-    uint ty = gl_LocalInvocationID.y;
-    uint n0 = gl_WorkGroupID.x * 16u;
-    uint m0 = gl_WorkGroupID.y * 16u;
+    uint tx = gl_LocalInvocationID.x; // 0..15
+    uint ty = gl_LocalInvocationID.y; // 0..15
+    uint tid = ty * 16u + tx;
+    uint n0 = gl_WorkGroupID.x * TM;
+    uint m0 = gl_WorkGroupID.y * TN;
 
-    float acc = 0.0;
-    for (uint k0 = 0u; k0 < p.K; k0 += 16u) {
-        uint n = n0 + ty;
-        uint k = k0 + tx;
-        As[ty][tx] = (n < p.N && k < p.K) ? a[n * p.K + k] : 0.0;
+    float acc[TMICRO][TNMICRO];
+    for (uint i = 0u; i < TMICRO; i++) {
+        for (uint j = 0u; j < TNMICRO; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
 
-        uint m = m0 + ty;
-        Bs[ty][tx] = (m < p.M && k < p.K) ? b[m * p.K + k] : 0.0;
-
+    for (uint k0 = 0u; k0 < p.K; k0 += TK) {
+        // A slice: As[k][r] = A[(n0+r), k0+k]
+        for (uint idx = tid; idx < TM * TK; idx += 256u) {
+            uint r = idx / TK;
+            uint k = idx - r * TK;
+            uint n = n0 + r;
+            uint kk = k0 + k;
+            As[k][r] = (n < p.N && kk < p.K) ? a[n * p.K + kk] : 0.0;
+        }
+        // B slice: Bs[k][r] = B[(m0+r), k0+k]
+        for (uint idx = tid; idx < TN * TK; idx += 256u) {
+            uint r = idx / TK;
+            uint k = idx - r * TK;
+            uint m = m0 + r;
+            uint kk = k0 + k;
+            Bs[k][r] = (m < p.M && kk < p.K) ? b[m * p.K + kk] : 0.0;
+        }
         barrier();
-        for (uint i = 0u; i < 16u; i++) {
-            acc += As[ty][i] * Bs[tx][i];
+
+        for (uint k = 0u; k < TK; k++) {
+            float av[TMICRO];
+            float bv[TNMICRO];
+            for (uint i = 0u; i < TMICRO; i++) {
+                av[i] = As[k][ty * TMICRO + i];
+            }
+            for (uint j = 0u; j < TNMICRO; j++) {
+                bv[j] = Bs[k][tx * TNMICRO + j];
+            }
+            for (uint i = 0u; i < TMICRO; i++) {
+                for (uint j = 0u; j < TNMICRO; j++) {
+                    acc[i][j] += av[i] * bv[j];
+                }
+            }
         }
         barrier();
     }
 
-    uint n = n0 + ty;
-    uint m = m0 + tx;
-    if (n < p.N && m < p.M) {
-        c[m * p.N + n] = acc;
+    for (uint i = 0u; i < TMICRO; i++) {
+        uint n = n0 + ty * TMICRO + i;
+        for (uint j = 0u; j < TNMICRO; j++) {
+            uint m = m0 + tx * TNMICRO + j;
+            if (n < p.N && m < p.M) {
+                c[m * p.N + n] = acc[i][j];
+            }
+        }
     }
 }

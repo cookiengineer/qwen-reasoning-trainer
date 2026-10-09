@@ -312,9 +312,9 @@ func (b *Backend) MatMul(a, c compute.Buffer) (compute.Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Tiled GEMM: one 16x16 workgroup tile per output block.
-	gx := ceilDiv(uint32(n), 16)
-	gy := ceilDiv(uint32(m), 16)
+	// Tiled GEMM: one 64x64 workgroup tile per output block.
+	gx := ceilDiv(uint32(n), 64)
+	gy := ceilDiv(uint32(m), 64)
 	if gx > 65535 || gy > 65535 {
 		b.Free(out)
 		return nil, fmt.Errorf("vulkan: matmul dimensions too large (%d x %d)", n, m)
@@ -671,8 +671,9 @@ func (b *Backend) GatherHeads(convOut compute.Buffer, offset, headDim, nHead, T,
 		return nil, err
 	}
 	total := uint32(headDim * nHead * T)
-	pc := push(uint32(offset), uint32(headDim), uint32(nHead), uint32(T), uint32(convDim), uint32(0))
-	if err := b.dispatch("gather_heads", []*buffer{t, out}, pc, [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+	if err := b.dispatch1D("gather_heads", []*buffer{t, out}, total, func(base uint32) []byte {
+		return push(uint32(offset), uint32(headDim), uint32(nHead), uint32(T), uint32(convDim), base)
+	}); err != nil {
 		b.Free(out)
 		return nil, err
 	}
@@ -690,8 +691,9 @@ func (b *Backend) GatherHeadsBack(dOut compute.Buffer, offset, headDim, nHead, T
 		return nil, err
 	}
 	total := uint32(headDim * nHead * T)
-	pc := push(uint32(offset), uint32(headDim), uint32(nHead), uint32(T), uint32(convDim), uint32(0))
-	if err := b.dispatch("gather_heads_back", []*buffer{t, out}, pc, [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+	if err := b.dispatch1D("gather_heads_back", []*buffer{t, out}, total, func(base uint32) []byte {
+		return push(uint32(offset), uint32(headDim), uint32(nHead), uint32(T), uint32(convDim), base)
+	}); err != nil {
 		b.Free(out)
 		return nil, err
 	}
@@ -709,8 +711,9 @@ func (b *Backend) RepeatHeads(x compute.Buffer, headDim, nIn, nOut, T int) (comp
 		return nil, err
 	}
 	total := uint32(headDim * nOut * T)
-	pc := push(uint32(headDim), uint32(nIn), uint32(nOut), uint32(T))
-	if err := b.dispatch("repeat_heads", []*buffer{t, out}, pc, [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+	if err := b.dispatch1D("repeat_heads", []*buffer{t, out}, total, func(base uint32) []byte {
+		return push(uint32(headDim), uint32(nIn), uint32(nOut), uint32(T), base)
+	}); err != nil {
 		b.Free(out)
 		return nil, err
 	}
@@ -728,8 +731,9 @@ func (b *Backend) RepeatHeadsBack(dOut compute.Buffer, headDim, nIn, nOut, T int
 		return nil, err
 	}
 	total := uint32(headDim * nIn * T)
-	pc := push(uint32(headDim), uint32(nIn), uint32(nOut), uint32(T))
-	if err := b.dispatch("repeat_heads_back", []*buffer{t, out}, pc, [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+	if err := b.dispatch1D("repeat_heads_back", []*buffer{t, out}, total, func(base uint32) []byte {
+		return push(uint32(headDim), uint32(nIn), uint32(nOut), uint32(T), base)
+	}); err != nil {
 		b.Free(out)
 		return nil, err
 	}
@@ -754,8 +758,10 @@ func (b *Backend) GetRows(table compute.Buffer, indices []int32) (compute.Buffer
 		return nil, err
 	}
 	total := uint32(rowLen * len(indices))
-	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
-	if err := b.dispatch("get_rows", []*buffer{tt, idxBuf, out}, push(uint32(rowLen), uint32(nRows), uint32(len(indices))), groups); err != nil {
+	if err := b.dispatch1D("get_rows", []*buffer{tt, idxBuf, out}, total, func(base uint32) []byte {
+		return push(uint32(rowLen), uint32(nRows), uint32(len(indices)), base)
+	}); err != nil {
+		b.Free(out)
 		return nil, err
 	}
 	return out, nil
@@ -827,8 +833,9 @@ func (b *Backend) RoPE(a compute.Buffer, positions []int32, theta float64, nDims
 		return nil, err
 	}
 	total := uint32(nTok * nHead * (nDims / 2))
-	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
-	if err := b.dispatch("rope", []*buffer{x, posBuf, out}, push(uint32(headDim), uint32(nHead), uint32(nTok), uint32(nDims), float32(theta), uint32(0)), groups); err != nil {
+	if err := b.dispatch1D("rope", []*buffer{x, posBuf, out}, total, func(base uint32) []byte {
+		return push(uint32(headDim), uint32(nHead), uint32(nTok), uint32(nDims), float32(theta), base)
+	}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -850,6 +857,7 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 	}
 	headDim := tq.Ne0()
 	nTok := dimOr1(tq.dims, 2)
+	nKV := dimOr1(tk.dims, 2)
 	out, err := b.newF32Buffer(tq.dims...)
 	if err != nil {
 		return nil, err
@@ -858,8 +866,15 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 	if causal {
 		c = 1
 	}
-	// Chunk the dispatch to stay below the per-dimension group limit. The
-	// attention shader has local_size_x = 1, so one group per element.
+	// The single-query-per-workgroup attention shader requires a square
+	// (nQ == nKV) shape and headDim <= 256 (its shared accumulator bound).
+	// Everything else uses the original per-element shader.
+	shader := "attention"
+	if nKV != nTok || headDim > 256 {
+		shader = "attention_naive"
+	}
+	// Chunk the dispatch to stay below the per-dimension group limit: one
+	// workgroup per query.
 	const maxPerDispatch = 65535
 	total := uint32(nHead * nTok)
 	for start := uint32(0); start < total; start += maxPerDispatch {
@@ -868,7 +883,7 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 			chunk = maxPerDispatch
 		}
 		groups := [3]uint32{chunk, 1, 1}
-		if err := b.dispatch("attention", []*buffer{tq, tk, tv, out}, push(uint32(headDim), uint32(nTok), uint32(nHead), uint32(nHeadKV), scale, c, start), groups); err != nil {
+		if err := b.dispatch(shader, []*buffer{tq, tk, tv, out}, push(uint32(headDim), uint32(nTok), uint32(nHead), uint32(nHeadKV), scale, c, start), groups); err != nil {
 			b.Free(out)
 			return nil, err
 		}
@@ -925,17 +940,54 @@ func (b *Backend) AttentionBackward(q, k, v, dOut compute.Buffer, nHead, nHeadKV
 	if causal {
 		c = 1
 	}
-	pc := push(uint32(hd), uint32(nQ), uint32(nKV), uint32(nHead), uint32(nHeadKV), c, scale)
-	if err := b.dispatch("attn_back_dq", []*buffer{qb, kb, vb, db, stats, dQ}, pc, [3]uint32{uint32(nHead * nQ), 1, 1}); err != nil {
+	// The tiled shaders (one workgroup per query / per key) are used when the
+	// key count fits one online-softmax tile and headDim fits their shared
+	// accumulators. They compute each q.k / dOut.v once and share the p/ds
+	// intermediates, instead of the naive shaders' repeated recomputation.
+	maxJ := nKV
+	if causal && nQ == nKV {
+		maxJ = nQ
+	}
+	freeOut := func() {
 		b.Free(dQ)
 		b.Free(dK)
 		b.Free(dV)
+	}
+	if hd <= 256 && maxJ <= 1024 {
+		// p and ds, laid out [key][query] for the dK/dV pass.
+		pds, err := b.newF32Buffer(2 * nKV * nHead * nQ)
+		if err != nil {
+			freeOut()
+			return nil, nil, nil, err
+		}
+		defer b.Free(pds)
+		const maxPerDispatch = 65535
+		total := uint32(nHead * nQ)
+		for start := uint32(0); start < total; start += maxPerDispatch {
+			chunk := total - start
+			if chunk > maxPerDispatch {
+				chunk = maxPerDispatch
+			}
+			pc := push(uint32(hd), uint32(nQ), uint32(nKV), uint32(nHead), uint32(nHeadKV), c, scale, start)
+			if err := b.dispatch("attn_back_dq_tile", []*buffer{qb, kb, vb, db, stats, dQ, pds}, pc, [3]uint32{chunk, 1, 1}); err != nil {
+				freeOut()
+				return nil, nil, nil, err
+			}
+		}
+		pcKV := push(uint32(hd), uint32(nQ), uint32(nKV), uint32(nHead), uint32(nHeadKV), c, scale)
+		if err := b.dispatch("attn_back_dkv_tile", []*buffer{qb, nil, nil, db, pds, dK, dV}, pcKV, [3]uint32{uint32(nHeadKV * nKV), 1, 1}); err != nil {
+			freeOut()
+			return nil, nil, nil, err
+		}
+		return dQ, dK, dV, nil
+	}
+	pc := push(uint32(hd), uint32(nQ), uint32(nKV), uint32(nHead), uint32(nHeadKV), c, scale)
+	if err := b.dispatch("attn_back_dq", []*buffer{qb, kb, vb, db, stats, dQ}, pc, [3]uint32{uint32(nHead * nQ), 1, 1}); err != nil {
+		freeOut()
 		return nil, nil, nil, err
 	}
 	if err := b.dispatch("attn_back_dkv", []*buffer{qb, kb, vb, db, stats, dK, dV}, pc, [3]uint32{uint32(nHeadKV * nKV), 1, 1}); err != nil {
-		b.Free(dQ)
-		b.Free(dK)
-		b.Free(dV)
+		freeOut()
 		return nil, nil, nil, err
 	}
 	return dQ, dK, dV, nil
@@ -1094,7 +1146,7 @@ func (b *Backend) GatedDeltaNet(q, k, v, g, beta, state compute.Buffer) (compute
 		return nil, nil, err
 	}
 	scale := float32(1 / math.Sqrt(float64(sv)))
-	groups := [3]uint32{uint32(h * sv), 1, 1}
+	groups := [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
 	if err := b.dispatch("gated_delta_net", []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda), groups); err != nil {
 		b.Free(out)
@@ -1312,7 +1364,7 @@ func (b *Backend) GatedDeltaNetChunkedForwardAux(q, k, v, g, beta, state compute
 		return nil, zero, err
 	}
 	if err := b.dispatch("gdn_chunk_fwd", []*buffer{tk, tv, tb, ts, work},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), g3(hhSV)); err != nil {
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), g3(ceilDiv(hhSV, 128))); err != nil {
 		b.Free(work)
 		return nil, zero, err
 	}
@@ -1440,12 +1492,12 @@ func (b *Backend) GatedDeltaNetChunkedBackward(q, k, v, g, beta, state, dOut, dN
 		return nil, nil, nil, nil, nil, nil, err
 	}
 	if err := b.dispatch("gdn_chunk_fwd", []*buffer{tk, tv, tb, ts, work},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), g3(hhSV)); err != nil {
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), g3(ceilDiv(hhSV, 128))); err != nil {
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
 	if err := b.dispatch("gdn_chunk_bwd", []*buffer{tq, tk, tv, tb, td, tn, work, dV, dState, dBeta},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), scale), g3(hhSV)); err != nil {
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), scale), g3(ceilDiv(hhSV, 128))); err != nil {
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
@@ -1834,8 +1886,8 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 
 // matmulT dispatches the transposed GEMM tile shader for one weight row block.
 func (b *Backend) matmulT(w, d, out *buffer, K, N, M, n0, rows uint32, acc bool) error {
-	gx := ceilDiv(K, 16)
-	gy := ceilDiv(M, 16)
+	gx := ceilDiv(K, 64)
+	gy := ceilDiv(M, 64)
 	if gx > 65535 || gy > 65535 {
 		return fmt.Errorf("vulkan: matmul_t dimensions too large (%d x %d)", K, M)
 	}
@@ -1894,8 +1946,8 @@ func (b *Backend) MatMulWeightGrad(x, dOut compute.Buffer) (compute.Buffer, erro
 	if err != nil {
 		return nil, err
 	}
-	gx := ceilDiv(uint32(in), 16)
-	gy := ceilDiv(uint32(out), 16)
+	gx := ceilDiv(uint32(in), 64)
+	gy := ceilDiv(uint32(out), 64)
 	if gx > 65535 || gy > 65535 {
 		b.Free(dw)
 		return nil, fmt.Errorf("vulkan: matmul_wg dimensions too large (%d x %d)", in, out)

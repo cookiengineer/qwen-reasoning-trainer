@@ -1,0 +1,75 @@
+#version 450
+
+// Attention backward pass 2 (per key): dK and dV. Fast path companion to
+// attn_back_dq_tile.comp, which wrote p and ds into PDS ([key][query] layout).
+//
+// One workgroup per (KV head, key j); 64 lanes own headDim/64 dimensions and
+// accumulate over the query heads in the GQA group and all queries. No
+// reductions and no per-(query,key) recomputation.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer Q    { float q[];    };
+layout(binding = 3) readonly buffer DOut { float dout[]; };
+layout(binding = 4) readonly buffer PDS  { float pds[];  };
+layout(binding = 5)          buffer DK   { float dk[];   };
+layout(binding = 6)          buffer DV   { float dv[];   };
+
+layout(push_constant) uniform P {
+    uint  hd;
+    uint  nQ;
+    uint  nKV;
+    uint  nHead;
+    uint  nHeadKV;
+    uint  causal;
+    float scale;
+} p;
+
+#define LS 64
+
+void main() {
+    uint gid = gl_WorkGroupID.x;
+    if (gid >= p.nHeadKV * p.nKV) {
+        return;
+    }
+    uint hd = p.hd;
+    uint j = gid % p.nKV;
+    uint kv = gid / p.nKV;
+    uint group = p.nHead / p.nHeadKV;
+    uint strideQ = p.nHead * p.nQ;
+    uint mask = (p.causal == 1u && p.nQ == p.nKV) ? 1u : 0u;
+    uint iStart = (mask == 1u) ? j : 0u;
+    uint lane = gl_LocalInvocationID.x;
+
+    float accK[4];
+    float accV[4];
+    for (uint c = 0u; c < 4u; c++) {
+        accK[c] = 0.0;
+        accV[c] = 0.0;
+    }
+
+    uint dsBase = p.nKV * strideQ;
+    for (uint hi = 0u; hi < group; hi++) {
+        uint h = kv * group + hi;
+        for (uint i = iStart; i < p.nQ; i++) {
+            uint qid = h * p.nQ + i;
+            float pj = pds[j * strideQ + qid];
+            float ds = pds[dsBase + j * strideQ + qid];
+            uint qb = (i * p.nHead + h) * hd;
+            uint c = 0u;
+            for (uint d = lane; d < hd; d += LS) {
+                accK[c] += ds * q[qb + d];
+                accV[c] += pj * dout[qb + d];
+                c++;
+            }
+        }
+    }
+
+    uint kb = (j * p.nHeadKV + kv) * hd;
+    uint c = 0u;
+    for (uint d = lane; d < hd; d += LS) {
+        dk[kb + d] = accK[c];
+        dv[kb + d] = accV[c];
+        c++;
+    }
+}

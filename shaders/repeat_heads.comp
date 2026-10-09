@@ -3,9 +3,9 @@
 layout(local_size_x = 64) in;
 layout(binding = 0) readonly  buffer X   { float x[];  };
 layout(binding = 1) writeonly buffer Out { float o[];  };
-layout(push_constant) uniform P { uint headDim; uint nIn; uint nOut; uint T; } p;
+layout(push_constant) uniform P { uint headDim; uint nIn; uint nOut; uint T; uint base; } p;
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = p.base + gl_GlobalInvocationID.x;
     if (gid >= p.headDim * p.nOut * p.T) { return; }
     uint d = gid % p.headDim;
     uint rem = gid / p.headDim;
