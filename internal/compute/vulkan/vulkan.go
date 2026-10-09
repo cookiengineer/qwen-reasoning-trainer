@@ -14,7 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -561,6 +564,10 @@ type Backend struct {
 	memProps       physicalDeviceMemoryProperties
 	caps           compute.Capabilities
 
+	// candidates lists every compute-capable physical device seen at creation,
+	// in enumeration order, for diagnostics (Backend.DeviceList).
+	candidates []deviceCandidate
+
 	mu        sync.Mutex
 	pipelines map[string]uintptr
 	closed    bool
@@ -710,30 +717,36 @@ func New() (*Backend, error) {
 		return nil, fmt.Errorf("vulkan: enumerate devices (2) failed")
 	}
 
-	selected := false
+	// Enumerate compute-capable devices with their device-local memory so a
+	// sensible default can be chosen on multi-GPU machines (the largest), and an
+	// explicit override is honored via QWEN38_VK_DEVICE (index or name
+	// substring).
+	var cands []deviceCandidate
 	for _, pd := range devs {
-		if qf, ok := pickComputeQueue(v, pd); ok {
-			b.physicalDevice = pd
-			b.queueFamily = qf
-			selected = true
-			break
+		qf, ok := pickComputeQueue(v, pd)
+		if !ok {
+			continue
 		}
+		var props physicalDeviceProperties
+		vkCall(v.GetPhysicalDeviceProperties, pd, uintptr(unsafe.Pointer(&props)))
+		nm := strings.TrimRight(string(props.deviceName[:]), "\x00")
+		var mp physicalDeviceMemoryProperties
+		vkCall(v.GetPhysicalDeviceMemoryProps, pd, uintptr(unsafe.Pointer(&mp)))
+		cands = append(cands, deviceCandidate{pd: pd, qf: qf, name: nm, typ: props.deviceType, mem: deviceLocalSize(mp)})
 	}
-	if !selected {
+	if len(cands) == 0 {
 		b.Close()
 		return nil, errors.New("vulkan: no device with a compute queue")
 	}
-
-	// Device name for diagnostics.
-	var props physicalDeviceProperties
-	vkCall(v.GetPhysicalDeviceProperties, b.physicalDevice, uintptr(unsafe.Pointer(&props)))
-	name := string(props.deviceName[:])
-	for i, c := range name {
-		if c == 0 {
-			name = name[:i]
-			break
-		}
+	b.candidates = cands
+	chosen, err := selectDeviceCandidate(cands, os.Getenv("QWEN38_VK_DEVICE"))
+	if err != nil {
+		b.Close()
+		return nil, err
 	}
+	b.physicalDevice = chosen.pd
+	b.queueFamily = chosen.qf
+	name := chosen.name
 
 	vkCall(v.GetPhysicalDeviceMemoryProps, b.physicalDevice, uintptr(unsafe.Pointer(&b.memProps)))
 
@@ -822,6 +835,134 @@ func New() (*Backend, error) {
 	}
 	b.dummy = d
 	return b, nil
+}
+
+// deviceCandidate is a compute-capable physical device with the metadata used
+// for selection.
+type deviceCandidate struct {
+	pd   uintptr
+	qf   uint32
+	name string
+	typ  uint32
+	mem  uint64
+}
+
+// Physical device type values (VkPhysicalDeviceType).
+const (
+	deviceTypeOther         = 0
+	deviceTypeIntegratedGPU = 1
+	deviceTypeDiscreteGPU   = 2
+	deviceTypeVirtualGPU    = 3
+	deviceTypeCPU           = 4
+)
+
+// deviceTypeName maps a VkPhysicalDeviceType to a short label.
+func deviceTypeName(t uint32) string {
+	switch t {
+	case deviceTypeIntegratedGPU:
+		return "integrated"
+	case deviceTypeDiscreteGPU:
+		return "discrete"
+	case deviceTypeVirtualGPU:
+		return "virtual"
+	case deviceTypeCPU:
+		return "cpu"
+	default:
+		return "other"
+	}
+}
+
+// deviceRank orders device types for default selection: discrete first, then
+// integrated, virtual, other, and CPU (software) last.
+func deviceRank(t uint32) int {
+	switch t {
+	case deviceTypeDiscreteGPU:
+		return 0
+	case deviceTypeIntegratedGPU:
+		return 1
+	case deviceTypeVirtualGPU:
+		return 2
+	case deviceTypeCPU:
+		return 4
+	default:
+		return 3
+	}
+}
+
+// selectDeviceCandidate picks a device from candidates. spec (from
+// QWEN38_VK_DEVICE) may be an index, a case-insensitive name substring, or
+// empty. The default prefers a non-CPU device by type rank, then the largest
+// device-local memory, so a discrete GPU wins over an iGPU and a software
+// rasterizer.
+func selectDeviceCandidate(cands []deviceCandidate, spec string) (deviceCandidate, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		best := cands[0]
+		for _, c := range cands[1:] {
+			if deviceRank(c.typ) < deviceRank(best.typ) ||
+				(deviceRank(c.typ) == deviceRank(best.typ) && c.mem > best.mem) {
+				best = c
+			}
+		}
+		return best, nil
+	}
+	if idx, err := strconv.Atoi(spec); err == nil {
+		if idx < 0 || idx >= len(cands) {
+			return deviceCandidate{}, fmt.Errorf("vulkan: QWEN38_VK_DEVICE index %d out of range (0..%d)", idx, len(cands)-1)
+		}
+		return cands[idx], nil
+	}
+	lwant := strings.ToLower(spec)
+	for _, c := range cands {
+		if strings.Contains(strings.ToLower(c.name), lwant) {
+			return c, nil
+		}
+	}
+	return deviceCandidate{}, fmt.Errorf("vulkan: no device matching QWEN38_VK_DEVICE=%q", spec)
+}
+
+// DeviceInfo describes one compute-capable physical device.
+type DeviceInfo struct {
+	Index       int
+	Name        string
+	Type        string
+	MemoryBytes uint64
+	Selected    bool
+}
+
+// DeviceList returns the physical devices seen at creation, marking the one in
+// use. It is used by `gpu-info` for multi-GPU diagnostics.
+func (b *Backend) DeviceList() []DeviceInfo {
+	out := make([]DeviceInfo, len(b.candidates))
+	for i, c := range b.candidates {
+		out[i] = DeviceInfo{
+			Index:       i,
+			Name:        c.name,
+			Type:        deviceTypeName(c.typ),
+			MemoryBytes: c.mem,
+			Selected:    c.pd == b.physicalDevice,
+		}
+	}
+	return out
+}
+
+// deviceLocalSize returns the total device-local heap size from memory
+// properties, falling back to the largest heap when none is marked local.
+func deviceLocalSize(mp physicalDeviceMemoryProperties) uint64 {
+	var deviceLocal, max uint64
+	for i := uint32(0); i < mp.memoryHeapCount && i < 16; i++ {
+		h := mp.memoryHeaps[i]
+		if h.flags&vkMemoryPropertyDevice != 0 {
+			deviceLocal += h.size
+		}
+		if h.size > max {
+			max = h.size
+		}
+	}
+	if deviceLocal > 0 {
+		return deviceLocal
+	}
+	return max
 }
 
 func pickComputeQueue(v *vk, pd uintptr) (uint32, bool) {
@@ -1100,20 +1241,7 @@ func (b *Backend) memoryTypeExclude(bits, flags, exclude uint32) (uint32, bool) 
 // back to the largest heap when none is marked device-local. Zero means the
 // size could not be determined.
 func (b *Backend) deviceMemorySize() uint64 {
-	var deviceLocal, max uint64
-	for i := uint32(0); i < b.memProps.memoryHeapCount && i < 16; i++ {
-		h := b.memProps.memoryHeaps[i]
-		if h.flags&vkMemoryPropertyDevice != 0 {
-			deviceLocal += h.size
-		}
-		if h.size > max {
-			max = h.size
-		}
-	}
-	if deviceLocal > 0 {
-		return deviceLocal
-	}
-	return max
+	return deviceLocalSize(b.memProps)
 }
 
 // pipeline lazily creates a compute pipeline from an embedded shader.
