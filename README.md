@@ -122,6 +122,31 @@ published under `heretic-org` on Hugging Face.
 Note: the first-token KL is a weak signal for a thinking model (it emits
 `<think>` first), so small divergence scores are expected on short generations.
 
+## Evaluation
+
+`evaluate` scores a model along three independent axes; at least one input is
+required.
+
+```sh
+# Refusal keyword rate (and KL divergence from a base with --base).
+./build/qwen-trainer --model models/abliterated.gguf evaluate \
+  --prompts prompts/harmful_behaviors_test.jsonl --max-tokens 32 \
+  --base models/Qwen3.8-27B-UD-Q4_K_M.gguf;
+
+# Corpus perplexity over a text file, scored in windows of N tokens.
+./build/qwen-trainer evaluate --perplexity corpus.txt --window 512;
+
+# Multiple-choice accuracy over JSONL {context, choices, answer} records.
+./build/qwen-trainer evaluate --tasks tasks.jsonl --tasks-verbose;
+```
+
+Perplexity uses non-overlapping windows (default 512 tokens, `--window 0` for
+the whole input); the window bounds peak memory at `vocab * window * 4` bytes,
+so it is the quality/memory knob. Because it computes full LM-head logits for
+every window it is considerably slower per token than `run`. Task accuracy is
+scored by the length-normalized log-likelihood of each choice given the context
+(`--tasks-normalize=false` for raw sums).
+
 ## Testing
 
 The default suite is pure Go and needs neither a GPU nor Python:

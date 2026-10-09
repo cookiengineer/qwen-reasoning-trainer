@@ -37,7 +37,7 @@ Commands:
   run        Load the model and greedily generate tokens
   abliterate Remove refusal directions and write an abliterated GGUF
   search     Search abliteration parameters (refusal + lambda*KL) and write the best
-  evaluate   Score a model's refusal rate and KL divergence from a base
+  evaluate   Score refusal/KL, corpus perplexity, and JSONL multiple-choice tasks
   dataset    Build tokenized, loss-masked examples from extractor JSONL
   train      QLoRA fine-tune on the extractor dataset (reference host path)
   help       Show this help
@@ -618,21 +618,21 @@ func argmax(logits *compute.Tensor) int32 {
 func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("evaluate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	promptsFile := fs.String("prompts", "", "file with one prompt per line")
+	promptsFile := fs.String("prompts", "", "file with one refusal prompt per line")
 	baseFile := fs.String("base", "", "optional base GGUF to compute KL divergence against")
 	system := fs.String("system", "You are a helpful assistant.", "system prompt")
 	maxTokens := fs.Int("max-tokens", 32, "tokens to generate per prompt for refusal detection")
 	kw := fs.String("keywords", "", "comma-separated refusal keywords (default built-in)")
+	pplFile := fs.String("perplexity", "", "text file to score for corpus perplexity")
+	window := fs.Int("window", evaluate.DefaultPPLWindow, "tokens per perplexity forward pass (0 = whole file)")
+	tasksFile := fs.String("tasks", "", "JSONL multiple-choice tasks to score for accuracy")
+	tasksNormalize := fs.Bool("tasks-normalize", true, "length-normalize each choice score")
+	tasksVerbose := fs.Bool("tasks-verbose", false, "print per-item task scores")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
-	if *promptsFile == "" {
-		fmt.Fprintln(stderr, "error: --prompts is required")
-		return 2
-	}
-	lines := readLines(*promptsFile, 0)
-	if len(lines) == 0 {
-		fmt.Fprintln(stderr, "error: no prompts loaded")
+	if *promptsFile == "" && *pplFile == "" && *tasksFile == "" {
+		fmt.Fprintln(stderr, "error: one of --prompts, --perplexity, or --tasks is required")
 		return 2
 	}
 
@@ -686,31 +686,75 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer cleanup()
-	keywords := evaluate.DefaultKeywords
-	if *kw != "" {
-		keywords = strings.Split(*kw, ",")
-	}
-	prompts := encodePrompts(vocab, *system, lines)
-	rate, err := evaluate.RefusalRate(m, vocab, prompts, *maxTokens, keywords)
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "refusal_rate: %.4f (%d prompts, up to %d tokens)\n", rate, len(prompts), *maxTokens)
 
-	if *baseFile != "" {
-		base, _, baseCleanup, err := newModel(*baseFile, be)
+	if *pplFile != "" {
+		data, err := os.ReadFile(*pplFile)
 		if err != nil {
 			fmt.Fprintln(stderr, "error:", err)
 			return 1
 		}
-		defer baseCleanup()
-		kl, err := evaluate.KLDivergence(base, m, prompts)
+		tokens := vocab.Encode(string(data))
+		res, err := evaluate.PerplexityWindowed(m, tokens, *window)
 		if err != nil {
 			fmt.Fprintln(stderr, "error:", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "kl_divergence: %.5f\n", kl)
+		fmt.Fprintf(stdout, "perplexity: %.4f (nll %.4f, %d tokens, window %d)\n",
+			res.Perplexity, res.NLL, res.Tokens, *window)
+	}
+
+	if *tasksFile != "" {
+		items, err := evaluate.LoadTasks(*tasksFile)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		results, acc, err := evaluate.MultipleChoice(m, vocab, items, *tasksNormalize)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		if *tasksVerbose {
+			for _, r := range results {
+				fmt.Fprintf(stdout, "  %-20s predicted=%d correct=%t scores=%v\n",
+					r.ID, r.Predicted, r.Correct, r.Scores)
+			}
+		}
+		fmt.Fprintf(stdout, "accuracy: %.4f (%d items, normalise=%t)\n", acc, len(items), *tasksNormalize)
+	}
+
+	if *promptsFile != "" {
+		lines := readLines(*promptsFile, 0)
+		if len(lines) == 0 {
+			fmt.Fprintln(stderr, "error: no prompts loaded")
+			return 2
+		}
+		keywords := evaluate.DefaultKeywords
+		if *kw != "" {
+			keywords = strings.Split(*kw, ",")
+		}
+		prompts := encodePrompts(vocab, *system, lines)
+		rate, err := evaluate.RefusalRate(m, vocab, prompts, *maxTokens, keywords)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "refusal_rate: %.4f (%d prompts, up to %d tokens)\n", rate, len(prompts), *maxTokens)
+
+		if *baseFile != "" {
+			base, _, baseCleanup, err := newModel(*baseFile, be)
+			if err != nil {
+				fmt.Fprintln(stderr, "error:", err)
+				return 1
+			}
+			defer baseCleanup()
+			kl, err := evaluate.KLDivergence(base, m, prompts)
+			if err != nil {
+				fmt.Fprintln(stderr, "error:", err)
+				return 1
+			}
+			fmt.Fprintf(stdout, "kl_divergence: %.5f\n", kl)
+		}
 	}
 	return 0
 }

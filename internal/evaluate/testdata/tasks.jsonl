@@ -1,0 +1,3 @@
+{"id":"cap","context":"The capital of France is","choices":[" Paris"," Berlin"],"answer":0}
+{"id":"math","context":"Two plus two equals","choices":[" four"," five"],"answer":0}
+{"id":"lang","context":"Bonjour means","choices":["hello","goodbye","jellyfish"],"answer":0}
