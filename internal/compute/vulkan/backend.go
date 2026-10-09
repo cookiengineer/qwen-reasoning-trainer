@@ -191,8 +191,9 @@ func (b *Backend) Unary(op compute.UnaryOp, a compute.Buffer) (compute.Buffer, e
 		return nil, err
 	}
 	n := uint32(x.NumElements())
-	groups := [3]uint32{ceilDiv(n, 64), 1, 1}
-	if err := b.dispatch("unary", []*buffer{x, out}, push(n, uint32(op), float32(0)), groups); err != nil {
+	if err := b.dispatch1D("unary", []*buffer{x, out}, n, func(base uint32) []byte {
+		return push(n, uint32(op), float32(0), base)
+	}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -209,8 +210,9 @@ func (b *Backend) Scale(a compute.Buffer, s float32) (compute.Buffer, error) {
 		return nil, err
 	}
 	n := uint32(x.NumElements())
-	groups := [3]uint32{ceilDiv(n, 64), 1, 1}
-	if err := b.dispatch("unary", []*buffer{x, out}, push(n, uint32(9), s), groups); err != nil {
+	if err := b.dispatch1D("unary", []*buffer{x, out}, n, func(base uint32) []byte {
+		return push(n, uint32(9), s, base)
+	}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -282,8 +284,9 @@ func (b *Backend) Binary(op compute.BinaryOp, a, c compute.Buffer) (compute.Buff
 		return nil, err
 	}
 	n := uint32(x.NumElements())
-	groups := [3]uint32{ceilDiv(n, 64), 1, 1}
-	if err := b.dispatch("binary", []*buffer{x, y, out}, push(n, uint32(op)), groups); err != nil {
+	if err := b.dispatch1D("binary", []*buffer{x, y, out}, n, func(base uint32) []byte {
+		return push(n, uint32(op), base)
+	}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -400,8 +403,9 @@ func (b *Backend) SiluBack(x, dOut compute.Buffer) (compute.Buffer, error) {
 		return nil, err
 	}
 	n := uint32(xa.NumElements())
-	groups := [3]uint32{ceilDiv(n, 64), 1, 1}
-	if err := b.dispatch("silu_back", []*buffer{xa, da, out}, push(n), groups); err != nil {
+	if err := b.dispatch1D("silu_back", []*buffer{xa, da, out}, n, func(base uint32) []byte {
+		return push(n, base)
+	}); err != nil {
 		b.Free(out)
 		return nil, err
 	}
@@ -557,8 +561,9 @@ func (b *Backend) SplitQG(qg compute.Buffer, hd, nHead, T int) (compute.Buffer, 
 		return nil, nil, err
 	}
 	total := uint32(hd * nHead * T)
-	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
-	if err := b.dispatch("qg_split", []*buffer{x, q, gate}, push(uint32(hd), uint32(nHead), uint32(T), uint32(0)), groups); err != nil {
+	if err := b.dispatch1D("qg_split", []*buffer{x, q, gate}, total, func(base uint32) []byte {
+		return push(uint32(hd), uint32(nHead), uint32(T), base)
+	}); err != nil {
 		b.Free(q)
 		b.Free(gate)
 		return nil, nil, err
@@ -584,8 +589,9 @@ func (b *Backend) SplitQGBack(dq, dgate compute.Buffer) (compute.Buffer, error) 
 		return nil, err
 	}
 	total := uint32(hd * nHead * T)
-	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
-	if err := b.dispatch("qg_merge", []*buffer{a, g, dqg}, push(uint32(hd), uint32(nHead), uint32(T), uint32(0)), groups); err != nil {
+	if err := b.dispatch1D("qg_merge", []*buffer{a, g, dqg}, total, func(base uint32) []byte {
+		return push(uint32(hd), uint32(nHead), uint32(T), base)
+	}); err != nil {
 		b.Free(dqg)
 		return nil, err
 	}
@@ -624,7 +630,9 @@ func (b *Backend) ConvInput(qkv compute.Buffer, dConv, convDim, T int) (compute.
 		return nil, err
 	}
 	total := uint32(convDim * T)
-	if err := b.dispatch("conv_input", []*buffer{t, out}, push(uint32(dConv), uint32(convDim), uint32(T), uint32(ncs)), [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+	if err := b.dispatch1D("conv_input", []*buffer{t, out}, total, func(base uint32) []byte {
+		return push(uint32(dConv), uint32(convDim), uint32(T), uint32(ncs), base)
+	}); err != nil {
 		b.Free(out)
 		return nil, err
 	}
@@ -643,7 +651,9 @@ func (b *Backend) ConvInputBack(dConvIn compute.Buffer, dConv, convDim, T int) (
 		return nil, err
 	}
 	total := uint32(convDim * T)
-	if err := b.dispatch("conv_input_back", []*buffer{t, out}, push(uint32(dConv), uint32(convDim), uint32(T), uint32(ncs)), [3]uint32{ceilDiv(total, 64), 1, 1}); err != nil {
+	if err := b.dispatch1D("conv_input_back", []*buffer{t, out}, total, func(base uint32) []byte {
+		return push(uint32(dConv), uint32(convDim), uint32(T), uint32(ncs), base)
+	}); err != nil {
 		b.Free(out)
 		return nil, err
 	}
@@ -957,8 +967,9 @@ func (b *Backend) SSMConv(sx, c compute.Buffer) (compute.Buffer, error) {
 		return nil, err
 	}
 	total := uint32(dInner * nT)
-	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
-	if err := b.dispatch("ssm_conv", []*buffer{s, cc, out}, push(uint32(dConv), uint32(dInner), uint32(ncs), uint32(nT)), groups); err != nil {
+	if err := b.dispatch1D("ssm_conv", []*buffer{s, cc, out}, total, func(base uint32) []byte {
+		return push(uint32(dConv), uint32(dInner), uint32(ncs), uint32(nT), base)
+	}); err != nil {
 		b.Free(out)
 		return nil, err
 	}
@@ -1017,8 +1028,9 @@ func (b *Backend) SSMConvBack(sx, c, dOut compute.Buffer) (compute.Buffer, compu
 		return nil, nil, err
 	}
 	pc := push(uint32(dConv), uint32(dInner), uint32(ncs), uint32(nT))
-	gx := ceilDiv(uint32(dInner*ncs), 64)
-	if err := b.dispatch("ssm_conv_back_sx", []*buffer{cc, d, dSx}, pc, [3]uint32{gx, 1, 1}); err != nil {
+	if err := b.dispatch1D("ssm_conv_back_sx", []*buffer{cc, d, dSx}, uint32(dInner*ncs), func(base uint32) []byte {
+		return push(uint32(dConv), uint32(dInner), uint32(ncs), uint32(nT), base)
+	}); err != nil {
 		b.Free(dSx)
 		b.Free(dC)
 		return nil, nil, err
@@ -1919,6 +1931,29 @@ func dimOr1(dims []int, i int) int {
 		return 1
 	}
 	return dims[i]
+}
+
+// maxWorkGroups is the per-dimension Vulkan compute dispatch limit
+// (maxComputeWorkGroupCount). A larger dispatch hangs or loses the device.
+const maxWorkGroups = 65535
+
+// dispatch1D dispatches a 1D elementwise shader in chunks so that no grid
+// dimension exceeds maxWorkGroups. pushFn receives the element base offset for
+// the chunk and returns the shader's push constants (which must include that
+// base); the chunked shaders index gid = gl_GlobalInvocationID.x + base but
+// still guard against the total element count.
+func (b *Backend) dispatch1D(name string, bindings []*buffer, total uint32, pushFn func(base uint32) []byte) error {
+	const per = uint32(maxWorkGroups) * 64
+	for base := uint32(0); base < total; base += per {
+		n := total - base
+		if n > per {
+			n = per
+		}
+		if err := b.dispatch(name, bindings, pushFn(base), [3]uint32{ceilDiv(n, 64), 1, 1}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ceilDiv(a, b uint32) uint32 {

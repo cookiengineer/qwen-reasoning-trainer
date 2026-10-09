@@ -2,6 +2,7 @@ package train
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/gguf"
@@ -280,11 +281,23 @@ func (m *DeviceModel) backwardCheckpoint(ctx *ModelCtx, dLogits compute.Buffer) 
 	m.be.Free(ctx.xFinal)
 
 	var all []adapterGrad
+	trace := os.Getenv("QWEN38_TRACE_LAYER") != ""
 	for i := len(m.layers) - 1; i >= 0; i-- {
+		if trace {
+			fmt.Fprintf(os.Stderr, "layer %d (gdn=%v)\n", i, m.layers[i].gdn != nil)
+		}
 		prev := dX
 		m.be.BeginScope()
 		_, lc, err := m.layers[i].forward(ctx.xs[i], ctx.positions)
 		if err != nil {
+			m.be.EndScope()
+			return nil, err
+		}
+		// Flush the forward recompute before the backward. Recording a whole
+		// layer's recompute+backward into one submission is too large at long
+		// sequence lengths and makes the driver soft-recover (observed at
+		// T=512); splitting the submission avoids it.
+		if err := m.be.Sync(); err != nil {
 			m.be.EndScope()
 			return nil, err
 		}
@@ -349,13 +362,17 @@ func (m *DeviceModel) Overrides() (map[string]qwen38.Override, error) {
 }
 
 // WriteMerged streams a copy of the base GGUF to outPath with all adapters
-// merged and requantized.
+// merged and requantized, materializing one tensor at a time.
 func (m *DeviceModel) WriteMerged(base *gguf.File, outPath string) error {
-	ov, err := m.Overrides()
-	if err != nil {
+	if err := m.SyncAdapters(); err != nil {
 		return err
 	}
-	return qwen38.RewriteGGUF(base, ov, outPath)
+	lins := m.AdapterLins()
+	items := make([]mergeItem, 0, len(lins))
+	for _, l := range lins {
+		items = append(items, mergeItem{name: l.name, l: l.lora, w: l.w})
+	}
+	return qwen38.RewriteGGUFStream(base, newMergeSource(items), outPath)
 }
 
 // release frees the activation buffers retained by a checkpointed forward.

@@ -74,6 +74,79 @@ func TestRewriteGGUF(t *testing.T) {
 	}
 }
 
+// mapSource is a test OverrideSource.
+type mapSource struct{ m map[string]Override }
+
+func (s mapSource) OverrideMeta(name string, dims []uint64, baseType quant.Type) (quant.Type, int64, bool) {
+	ov, ok := s.m[name]
+	if !ok {
+		return 0, 0, false
+	}
+	return ov.Type, int64(len(ov.Raw)), true
+}
+func (s mapSource) OverrideBytes(name string) ([]byte, error) { return s.m[name].Raw, nil }
+
+func TestRewriteGGUFStream(t *testing.T) {
+	kvs := []gguf.KV{
+		{Key: "general.architecture", Value: gguf.StringValue("qwen35")},
+		{Key: "general.alignment", Value: gguf.Uint32Value(32)},
+	}
+	aData := make([]byte, 8*4)
+	for i, v := range []float32{1, 2, 3, 4, 5, 6, 7, 8} {
+		binary.LittleEndian.PutUint32(aData[i*4:], math.Float32bits(v))
+	}
+	bData := make([]byte, 2*4)
+	for i, v := range []float32{9, 10} {
+		binary.LittleEndian.PutUint32(bData[i*4:], math.Float32bits(v))
+	}
+	buf, err := gguf.Encode(kvs, []gguf.WriteTensor{
+		{Name: "a", Dims: []uint64{4, 2}, Type: quant.TypeF32, Data: aData},
+		{Name: "b", Dims: []uint64{2}, Type: quant.TypeF32, Data: bData},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := gguf.ReadFrom(bytes.NewReader(buf), int64(len(buf)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newA := []float32{-1, -2, -3, -4}
+	rawA, err := quant.Quantize(quant.TypeF32, newA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "out.gguf")
+	src := mapSource{map[string]Override{"a": {Type: quant.TypeF32, Raw: rawA}}}
+	if err := RewriteGGUFStream(base, src, out); err != nil {
+		t.Fatal(err)
+	}
+	g, err := gguf.Open(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	ta, _ := g.Tensor("a")
+	gotA, err := g.ReadTensorF32(ta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, w := range newA {
+		if gotA[i] != w {
+			t.Fatalf("a[%d] = %v, want %v", i, gotA[i], w)
+		}
+	}
+	tb, _ := g.Tensor("b")
+	gotB, err := g.ReadTensorF32(tb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, w := range []float32{9, 10} {
+		if gotB[i] != w {
+			t.Fatalf("b[%d] = %v, want %v", i, gotB[i], w)
+		}
+	}
+}
+
 func TestTargetWeights(t *testing.T) {
 	w := NewRandom(tinyConfig(), 7)
 	targets := w.TargetWeights()

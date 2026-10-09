@@ -3,6 +3,7 @@ package train
 import (
 	"fmt"
 	"math"
+	"os"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
@@ -360,6 +361,9 @@ func (d *DeviceGDN) Backward(ctx *gdnCtx, dY compute.Buffer) (*gdnGrads, error) 
 	if err != nil {
 		return nil, err
 	}
+	if os.Getenv("QWEN38_TRACE_LAYER") != "" {
+		fmt.Fprintln(os.Stderr, "  gdn: chunked backward start")
+	}
 	var dQ48, dK48, dV, dGate, dBeta compute.Buffer
 	if cb, ok := be.(chunkedGDNBackend); ok {
 		dQ48, dK48, dV, dGate, dBeta, _, err = cb.GatedDeltaNetChunkedBackward(
@@ -370,6 +374,9 @@ func (d *DeviceGDN) Backward(ctx *gdnCtx, dY compute.Buffer) (*gdnGrads, error) 
 	}
 	if err != nil {
 		return nil, err
+	}
+	if os.Getenv("QWEN38_TRACE_LAYER") != "" {
+		fmt.Fprintln(os.Stderr, "  gdn: chunked backward done")
 	}
 	// gate = softplus(pre) * A; pre = alpha + dt.
 	dGate2, err := be.Reshape(dGate, []int{cfg.DtRank, T})

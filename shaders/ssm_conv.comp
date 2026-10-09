@@ -15,10 +15,11 @@ layout(push_constant) uniform P {
     uint dInner;
     uint ncs;
     uint nT;
+    uint base;
 } p;
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + p.base;
     if (gid >= p.dInner * p.nT) {
         return;
     }

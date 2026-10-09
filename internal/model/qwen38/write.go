@@ -62,6 +62,52 @@ func (w *Weights) Overrides() map[string]Override {
 	return out
 }
 
+// OverrideSource resolves tensor replacements lazily. OverrideMeta reports the
+// output type and byte size (metadata only, no materialization); OverrideBytes
+// materializes the replacement bytes later, so a merge never holds more than one
+// large tensor in memory at a time.
+type OverrideSource interface {
+	OverrideMeta(name string, dims []uint64, baseType quant.Type) (typ quant.Type, size int64, ok bool)
+	OverrideBytes(name string) ([]byte, error)
+}
+
+// RewriteGGUFStream writes a copy of base to outPath, replacing tensors via src
+// and streaming everything else unchanged. Unlike RewriteGGUF it materializes
+// each replacement on demand rather than holding them all in memory.
+func RewriteGGUFStream(base *gguf.File, src OverrideSource, outPath string) error {
+	tensors := make([]gguf.StreamTensor, 0, len(base.Tensors))
+	for _, ti := range base.Tensors {
+		ti := ti
+		if typ, size, ok := src.OverrideMeta(ti.Name, ti.Dims, ti.Type); ok {
+			name, want := ti.Name, size
+			tensors = append(tensors, gguf.StreamTensor{
+				Name: ti.Name, Dims: ti.Dims, Type: typ, Size: size,
+				Write: func(w io.Writer) error {
+					raw, err := src.OverrideBytes(name)
+					if err != nil {
+						return err
+					}
+					if int64(len(raw)) != want {
+						return fmt.Errorf("qwen38: override %s size %d != declared %d", name, len(raw), want)
+					}
+					_, err = w.Write(raw)
+					return err
+				},
+			})
+			continue
+		}
+		size, err := ti.ByteSize()
+		if err != nil {
+			return err
+		}
+		tensors = append(tensors, gguf.StreamTensor{
+			Name: ti.Name, Dims: ti.Dims, Type: ti.Type, Size: size,
+			Write: func(w io.Writer) error { return base.CopyTensor(ti, w) },
+		})
+	}
+	return gguf.WriteStreamToFile(outPath, base.KVs, tensors)
+}
+
 // RewriteGGUF writes a copy of base to outPath, replacing the tensors listed in
 // overrides and streaming every other tensor unchanged.
 func RewriteGGUF(base *gguf.File, overrides map[string]Override, outPath string) error {

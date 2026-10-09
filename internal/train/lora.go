@@ -2,6 +2,8 @@ package train
 
 import (
 	"math"
+	"runtime"
+	"sync"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
@@ -74,17 +76,52 @@ func (l *LoRA) Update(x *compute.Tensor) (*compute.Tensor, error) {
 
 // MergeInto adds the adapter into a dequantized float32 weight [K,N] in place:
 // W <- W + scale * B A.
+//
+// It is expressed as r rank-1 updates so the inner loop over k is contiguous in
+// both W and A (the naive n/k/j loop strides through A by K and is dominated by
+// cache misses). Large weights are split across goroutines by output row.
 func (l *LoRA) MergeInto(w *compute.Tensor) {
 	K := w.Ne(0)
 	N := w.Ne(1)
 	r := l.A.Ne(1)
-	for n := 0; n < N; n++ {
-		for k := 0; k < K; k++ {
-			var s float32
-			for j := 0; j < r; j++ {
-				s += l.B.F32[n*r+j] * l.A.F32[j*K+k]
+	workers := runtime.GOMAXPROCS(0)
+	if workers > N {
+		workers = N
+	}
+	if workers <= 1 || int64(K)*int64(N) < 1<<20 {
+		l.mergeRows(w.F32, 0, N, K, r)
+		return
+	}
+	block := (N + workers - 1) / workers
+	var wg sync.WaitGroup
+	for n0 := 0; n0 < N; n0 += block {
+		n1 := n0 + block
+		if n1 > N {
+			n1 = N
+		}
+		wg.Add(1)
+		go func(n0, n1 int) {
+			defer wg.Done()
+			l.mergeRows(w.F32, n0, n1, K, r)
+		}(n0, n1)
+	}
+	wg.Wait()
+}
+
+// mergeRows applies the adapter to output rows [n0,n1) of a [K,N] GGML weight.
+func (l *LoRA) mergeRows(w []float32, n0, n1, K, r int) {
+	scale := l.Scale
+	for n := n0; n < n1; n++ {
+		wrow := w[n*K : (n+1)*K]
+		for j := 0; j < r; j++ {
+			bn := scale * l.B.F32[n*r+j]
+			if bn == 0 {
+				continue
 			}
-			w.F32[n*K+k] += l.Scale * s
+			arow := l.A.F32[j*K : (j+1)*K]
+			for k := range wrow {
+				wrow[k] += bn * arow[k]
+			}
 		}
 	}
 }
@@ -98,7 +135,7 @@ func (l *LoRA) MergeToQuant(baseType quant.Type, baseRaw []byte, dims []int) (qu
 	for _, d := range dims {
 		n *= d
 	}
-	f32, err := quant.Dequant(baseType, baseRaw, int64(n))
+	f32, err := quant.DequantParallel(baseType, baseRaw, int64(n))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -108,7 +145,7 @@ func (l *LoRA) MergeToQuant(baseType quant.Type, baseRaw []byte, dims []int) (qu
 	if !quant.CanQuantize(outType) {
 		outType = quant.TypeQ4_K
 	}
-	raw, err := quant.Quantize(outType, wt.F32)
+	raw, err := quant.QuantizeParallel(outType, wt.F32)
 	if err != nil {
 		return 0, nil, err
 	}

@@ -58,6 +58,10 @@ func BenchmarkGDNBackward160(b *testing.B)   { benchGDNBackward(b, 128, 48, 160)
 func BenchmarkGDNBackwardSmall(b *testing.B) { benchGDNBackward(b, 64, 16, 64) }
 
 func benchGDNChunkedBackward(b *testing.B, sv, h, nTok, chunk int) {
+	benchGDNChunkedBackwardKDA(b, sv, h, nTok, chunk, true)
+}
+
+func benchGDNChunkedBackwardKDA(b *testing.B, sv, h, nTok, chunk int, kda bool) {
 	v, err := New()
 	if err != nil {
 		b.Skip(err)
@@ -76,7 +80,12 @@ func benchGDNChunkedBackward(b *testing.B, sv, h, nTok, chunk int) {
 	q := autograd.Random(1, 1.0, sv, h, nTok)
 	k := autograd.Random(2, 1.0, sv, h, nTok)
 	vv := autograd.Random(3, 1.0, sv, h, nTok)
-	g := autograd.Random(4, 0.3, sv, h, nTok)
+	var g *compute.Tensor
+	if kda {
+		g = autograd.Random(4, 0.3, sv, h, nTok)
+	} else {
+		g = autograd.Random(4, 0.3, 1, h, nTok)
+	}
 	beta := autograd.Random(5, 0.5, 1, h, nTok)
 	state := autograd.Random(6, 0.5, sv, sv, h)
 	dOut := autograd.Random(7, 1.0, sv, h, nTok)
@@ -103,6 +112,9 @@ func BenchmarkGDNChunked128(b *testing.B)  { benchGDNChunkedBackward(b, 128, 48,
 func BenchmarkGDNChunked512(b *testing.B)  { benchGDNChunkedBackward(b, 128, 48, 512, 64) }
 func BenchmarkGDNChunked1024(b *testing.B) { benchGDNChunkedBackward(b, 128, 48, 1024, 64) }
 
+func BenchmarkGDNChunked512Scalar(b *testing.B) {
+	benchGDNChunkedBackwardKDA(b, 128, 48, 512, 64, false)
+}
 func BenchmarkGDNChunked512C16(b *testing.B)  { benchGDNChunkedBackward(b, 128, 48, 512, 16) }
 func BenchmarkGDNChunked512C32(b *testing.B)  { benchGDNChunkedBackward(b, 128, 48, 512, 32) }
 func BenchmarkGDNChunked512C48(b *testing.B)  { benchGDNChunkedBackward(b, 128, 48, 512, 48) }

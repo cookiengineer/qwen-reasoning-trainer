@@ -1,6 +1,7 @@
 package quant
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"math"
@@ -325,6 +326,51 @@ func TestQuantizeUnsupported(t *testing.T) {
 	_, err := Quantize(TypeQ2_K, make([]float32, 256))
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("expected ErrUnsupported, got %v", err)
+	}
+}
+
+// TestParallelMatchesSequential checks the block-aligned parallel Dequant and
+// Quantize above the parallel threshold against the sequential codecs.
+func TestParallelMatchesSequential(t *testing.T) {
+	const n = 1 << 20 // > parallelThreshold, multiple of 256
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(math.Sin(float64(i)*0.001)) * 3
+	}
+	for _, ty := range []Type{
+		TypeF32, TypeF16, TypeQ8_0, TypeQ4_0, TypeQ4_K, TypeQ5_K, TypeQ6_K,
+		TypeQ3_K, TypeIQ4_NL, TypeIQ4_XS, TypeIQ3_S,
+	} {
+		if !CanQuantize(ty) {
+			continue
+		}
+		want, err := Quantize(ty, src)
+		if err != nil {
+			t.Fatalf("%s quantize: %v", ty, err)
+		}
+		got, err := QuantizeParallel(ty, src)
+		if err != nil {
+			t.Fatalf("%s quantize parallel: %v", ty, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: QuantizeParallel != Quantize", ty)
+		}
+		dseq, err := Dequant(ty, want, n)
+		if err != nil {
+			t.Fatalf("%s dequant: %v", ty, err)
+		}
+		dpar, err := DequantParallel(ty, got, n)
+		if err != nil {
+			t.Fatalf("%s dequant parallel: %v", ty, err)
+		}
+		if len(dseq) != len(dpar) {
+			t.Fatalf("%s dequant length %d != %d", ty, len(dpar), len(dseq))
+		}
+		for i := range dseq {
+			if dseq[i] != dpar[i] {
+				t.Fatalf("%s: DequantParallel[%d]=%v != Dequant %v", ty, i, dpar[i], dseq[i])
+			}
+		}
 	}
 }
 

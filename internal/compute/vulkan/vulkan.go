@@ -1433,12 +1433,20 @@ func (b *Backend) copyRows(dst, src *buffer, rows, m, outRows, rowOffset int) er
 	}
 	vkCall(b.vk.UpdateDescriptorSets, b.device, uintptr(len(writes)), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
 	total := uint32(rows * m)
-	groups := [3]uint32{ceilDiv(total, 64), 1, 1}
 	vkCall(b.vk.CmdBindPipeline, b.cmdBuffer, vkPipelineBindPointCompute, pipe)
 	vkCall(b.vk.CmdBindDescriptorSets, b.cmdBuffer, vkPipelineBindPointCompute, b.pipeLayout, 0, 1, uintptr(unsafe.Pointer(&set)), 0, 0)
-	p := push(uint32(rows), uint32(m), uint32(outRows), uint32(rowOffset))
-	vkCall(b.vk.CmdPushConstants, b.cmdBuffer, b.pipeLayout, vkShaderStageComputeBit, 0, uintptr(len(p)), uintptr(unsafe.Pointer(&p[0])))
-	vkCall(b.vk.CmdDispatch, b.cmdBuffer, uintptr(groups[0]), uintptr(groups[1]), uintptr(groups[2]))
+	// Chunk the copy so the grid stays under maxComputeWorkGroupCount.
+	const per = uint32(maxWorkGroups) * 64
+	for base := uint32(0); base < total; base += per {
+		n := total - base
+		if n > per {
+			n = per
+		}
+		groups := [3]uint32{ceilDiv(n, 64), 1, 1}
+		p := push(uint32(rows), uint32(m), uint32(outRows), uint32(rowOffset), base)
+		vkCall(b.vk.CmdPushConstants, b.cmdBuffer, b.pipeLayout, vkShaderStageComputeBit, 0, uintptr(len(p)), uintptr(unsafe.Pointer(&p[0])))
+		vkCall(b.vk.CmdDispatch, b.cmdBuffer, uintptr(groups[0]), uintptr(groups[1]), uintptr(groups[2]))
+	}
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
 		srcAccessMask: vkAccessShaderRead | vkAccessShaderWrite,

@@ -8,10 +8,10 @@ layout(binding = 0) readonly buffer X    { float x[];    };
 layout(binding = 1) readonly buffer DOut { float dout[]; };
 layout(binding = 2) writeonly buffer DX  { float dx[];   };
 
-layout(push_constant) uniform P { uint n; uint pad0; uint pad1; uint pad2; } p;
+layout(push_constant) uniform P { uint n; uint base; uint pad1; uint pad2; } p;
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + p.base;
     if (gid >= p.n) {
         return;
     }

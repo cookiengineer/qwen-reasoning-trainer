@@ -6,9 +6,9 @@
 layout(local_size_x = 64) in;
 layout(binding = 0) readonly  buffer QKV    { float qkv[];    };
 layout(binding = 1) writeonly buffer ConvIn { float conin[];  };
-layout(push_constant) uniform P { uint dConv; uint convDim; uint T; uint ncs; } p;
+layout(push_constant) uniform P { uint dConv; uint convDim; uint T; uint ncs; uint base; } p;
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + p.base;
     if (gid >= p.convDim * p.T) { return; }
     uint ch = gid % p.convDim;
     uint t = gid / p.convDim;

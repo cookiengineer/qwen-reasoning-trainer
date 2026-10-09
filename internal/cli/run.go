@@ -938,11 +938,13 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "wrote adapters: %s\n", *adapterOut)
 	}
 	if *out != "" {
+		fmt.Fprintf(stderr, "merging adapters into %s...\n", *out)
+		t0 := time.Now()
 		if err := tm.WriteMerged(g, *out); err != nil {
 			fmt.Fprintln(stderr, "error:", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "wrote merged model: %s\n", *out)
+		fmt.Fprintf(stdout, "wrote merged model: %s (%s)\n", *out, time.Since(t0).Round(time.Second))
 	}
 	return 0
 }
@@ -1024,11 +1026,13 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 		fmt.Fprintf(stdout, "wrote adapters: %s\n", o.adapterOut)
 	}
 	if o.out != "" {
+		fmt.Fprintf(stderr, "merging %d adapters into %s...\n", len(dm.AdapterLins()), o.out)
+		t0 := time.Now()
 		if err := dm.WriteMerged(g, o.out); err != nil {
 			fmt.Fprintln(stderr, "error:", err)
 			return 1
 		}
-		fmt.Fprintf(stdout, "wrote merged model: %s\n", o.out)
+		fmt.Fprintf(stdout, "wrote merged model: %s (%s)\n", o.out, time.Since(t0).Round(time.Second))
 	}
 	return 0
 }

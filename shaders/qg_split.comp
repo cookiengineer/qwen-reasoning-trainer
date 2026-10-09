@@ -14,11 +14,11 @@ layout(push_constant) uniform P {
     uint hd;
     uint nHead;
     uint T;
-    uint pad;
+    uint base;
 } p;
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + p.base;
     uint total = p.hd * p.nHead * p.T;
     if (gid >= total) {
         return;
