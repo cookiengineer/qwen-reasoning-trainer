@@ -59,6 +59,118 @@ func TestVulkanMatMulLargeParity(t *testing.T) {
 	}
 }
 
+// TestVulkanAttentionNonSquareAndWideHead exercises the two fallback paths of
+// Attention: a non-square (nQ != nKV) shape, which must use the host oracle, and
+// a head dimension above the tile shader's shared-accumulator bound (256), which
+// must use attention_naive.
+func TestVulkanAttentionNonSquareAndWideHead(t *testing.T) {
+	c, v := newBackends(t)
+
+	// Incremental decode (nQ != nKV), non-causal -> host fallback.
+	{
+		hd, nh, nhkv, nQ, nKV := 3, 2, 1, 2, 4
+		q := autograd.Random(81, 1.0, hd, nh, nQ)
+		k := autograd.Random(82, 1.0, hd, nhkv, nKV)
+		vv := autograd.Random(83, 1.0, hd, nhkv, nKV)
+		scale := float32(1.0 / math.Sqrt(float64(hd)))
+		f := func(b compute.Backend) (compute.Buffer, error) {
+			return b.Attention(up(t, b, q.Dims, q.F32), up(t, b, k.Dims, k.F32),
+				up(t, b, vv.Dims, vv.F32), nh, nhkv, scale, false)
+		}
+		co, _ := f(c)
+		vo, _ := f(v)
+		compare(t, "attention non-square", down(t, v, vo), down(t, c, co))
+	}
+
+	// Wide head (headDim > 256), square causal -> attention_naive.
+	{
+		hd, nh, nhkv, T := 300, 2, 1, 3
+		q := autograd.Random(84, 1.0, hd, nh, T)
+		k := autograd.Random(85, 1.0, hd, nhkv, T)
+		vv := autograd.Random(86, 1.0, hd, nhkv, T)
+		scale := float32(1.0 / math.Sqrt(float64(hd)))
+		f := func(b compute.Backend) (compute.Buffer, error) {
+			return b.Attention(up(t, b, q.Dims, q.F32), up(t, b, k.Dims, k.F32),
+				up(t, b, vv.Dims, vv.F32), nh, nhkv, scale, true)
+		}
+		co, _ := f(c)
+		vo, _ := f(v)
+		compare(t, "attention wide-head", down(t, v, vo), down(t, c, co))
+	}
+}
+
+// TestVulkanAttentionBackwardFD checks the attention backward shaders against
+// central finite differences of the (independent) GPU forward, so a bug shared
+// between the analytic backward and the CPU/autograd oracles is still caught.
+func TestVulkanAttentionBackwardFD(t *testing.T) {
+	_, v := newBackends(t)
+	cases := []struct {
+		hd, nh, nhkv, T int
+		causal          bool
+	}{
+		{4, 2, 1, 3, true},
+		{8, 4, 2, 5, true},
+		{8, 4, 2, 5, false},
+	}
+	const step = float32(1e-2)
+	for _, tc := range cases {
+		scale := float32(1.0 / math.Sqrt(float64(tc.hd)))
+		q := autograd.Random(71, 1.0, tc.hd, tc.nh, tc.T)
+		k := autograd.Random(72, 1.0, tc.hd, tc.nhkv, tc.T)
+		vv := autograd.Random(73, 1.0, tc.hd, tc.nhkv, tc.T)
+		dO := autograd.Random(74, 1.0, tc.hd, tc.nh, tc.T)
+
+		dqb, dkb, dvb, err := v.AttentionBackward(
+			up(t, v, q.Dims, q.F32), up(t, v, k.Dims, k.F32),
+			up(t, v, vv.Dims, vv.F32), up(t, v, dO.Dims, dO.F32),
+			tc.nh, tc.nhkv, scale, tc.causal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dq, dk, dv := down(t, v, dqb), down(t, v, dkb), down(t, v, dvb)
+
+		fwd := func(qq, kk, vvv []float32) []float32 {
+			o, err := v.Attention(up(t, v, q.Dims, qq), up(t, v, k.Dims, kk),
+				up(t, v, vv.Dims, vvv), tc.nh, tc.nhkv, scale, tc.causal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return down(t, v, o)
+		}
+		check := func(label string, grad []float32, which int) {
+			for j := range grad {
+				qp := append([]float32(nil), q.F32...)
+				kp := append([]float32(nil), k.F32...)
+				vp := append([]float32(nil), vv.F32...)
+				qm := append([]float32(nil), q.F32...)
+				km := append([]float32(nil), k.F32...)
+				vm := append([]float32(nil), vv.F32...)
+				switch which {
+				case 0:
+					qp[j] += step
+					qm[j] -= step
+				case 1:
+					kp[j] += step
+					km[j] -= step
+				case 2:
+					vp[j] += step
+					vm[j] -= step
+				}
+				op := fwd(qp, kp, vp)
+				om := fwd(qm, km, vm)
+				num := (vecDot(op, dO.F32) - vecDot(om, dO.F32)) / float64(2*step)
+				if d := math.Abs(num - float64(grad[j])); d > 5e-2+5e-2*math.Abs(num) {
+					t.Fatalf("attention_back %s FD hd=%d nh=%d nhkv=%d T=%d causal=%v [%d]: numeric %g vs kernel %g",
+						label, tc.hd, tc.nh, tc.nhkv, tc.T, tc.causal, j, num, grad[j])
+				}
+			}
+		}
+		check("dq", dq, 0)
+		check("dk", dk, 1)
+		check("dv", dv, 2)
+	}
+}
+
 // TestVulkanAttentionTileParity checks the single-query-per-workgroup attention
 // kernel against the CPU oracle across GQA, causal/non-causal, the real head
 // dimension, and a sequence that spans more than one online-softmax tile.

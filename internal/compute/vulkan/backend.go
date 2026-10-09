@@ -858,6 +858,12 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 	headDim := tq.Ne0()
 	nTok := dimOr1(tq.dims, 2)
 	nKV := dimOr1(tk.dims, 2)
+	// Both attention shaders assume a square (nQ == nKV) shape: they index keys
+	// with the query length. A mismatch (incremental decoding) is handled by the
+	// host oracle instead.
+	if nKV != nTok {
+		return b.attentionHost(tq, tk, tv, nHead, nHeadKV, scale, causal)
+	}
 	out, err := b.newF32Buffer(tq.dims...)
 	if err != nil {
 		return nil, err
@@ -866,11 +872,10 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 	if causal {
 		c = 1
 	}
-	// The single-query-per-workgroup attention shader requires a square
-	// (nQ == nKV) shape and headDim <= 256 (its shared accumulator bound).
-	// Everything else uses the original per-element shader.
+	// The single-query-per-workgroup shader bounds its shared accumulator at
+	// headDim <= 256; wider heads use the original per-element shader.
 	shader := "attention"
-	if nKV != nTok || headDim > 256 {
+	if headDim > 256 {
 		shader = "attention_naive"
 	}
 	// Chunk the dispatch to stay below the per-dimension group limit: one
@@ -889,6 +894,29 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 		}
 	}
 	return out, nil
+}
+
+// attentionHost is the fallback for attention shapes the shaders do not cover:
+// a non-square query/key length (incremental decoding). It runs the CPU oracle
+// on downloaded buffers and re-uploads the result.
+func (b *Backend) attentionHost(q, k, v *buffer, nHead, nHeadKV int, scale float32, causal bool) (compute.Buffer, error) {
+	dq, err := b.Download(q)
+	if err != nil {
+		return nil, err
+	}
+	dk, err := b.Download(k)
+	if err != nil {
+		return nil, err
+	}
+	dv, err := b.Download(v)
+	if err != nil {
+		return nil, err
+	}
+	out, err := compute.Attention(dq, dk, dv, nHead, nHeadKV, scale, causal)
+	if err != nil {
+		return nil, err
+	}
+	return b.Upload(out)
 }
 
 // AttentionBackward implements compute.Backend with the two-pass atomic-free
