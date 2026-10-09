@@ -1223,6 +1223,228 @@ func (b *Backend) GatedDeltaNetBackward(q, k, v, g, beta, state, dOut, dNewState
 	return dQ, dK, dV, dG, dBeta, dState, nil
 }
 
+// GDNChunkLayout is the packed float32 scratch layout shared by the chunked
+// GatedDeltaNet kernels (see shaders/gdn_chunk_cumsum.comp). Offsets are in
+// elements. It is exported for the parity test.
+type GDNChunkLayout struct {
+	SV, H, NT, C, NC                   int
+	Gc, A, Bt, Delta, Bnd              int
+	Zsol, ScEnd, DA, DBt, DBeta, Total int
+}
+
+// GDNChunkOffsets returns the scratch layout for a call.
+func GDNChunkOffsets(sv, h, nTok, c int) GDNChunkLayout {
+	if c < 1 {
+		c = 1
+	}
+	nc := (nTok + c - 1) / c
+	cc := h * nc * c * c
+	l := GDNChunkLayout{SV: sv, H: h, NT: nTok, C: c, NC: nc}
+	l.Gc = 0
+	l.A = l.Gc + h*nc*c*sv
+	l.Bt = l.A + cc
+	l.Delta = l.Bt + cc
+	l.Bnd = l.Delta + h*nc*c*sv
+	l.Zsol = l.Bnd + h*(nc+1)*sv*sv
+	l.ScEnd = l.Zsol + h*nc*c*sv
+	l.DA = l.ScEnd + h*nc*sv*sv
+	l.DBt = l.DA + cc
+	l.DBeta = l.DBt + cc
+	l.Total = l.DBeta + h*nTok
+	return l
+}
+
+// GatedDeltaNetChunkedForwardAux runs the chunked forward passes (cumsum, A/Bt,
+// boundary/delta solve) without the backward and returns the packed scratch. It
+// exists so tests can validate the device intermediates against a Go reference.
+func (b *Backend) GatedDeltaNetChunkedForwardAux(q, k, v, g, beta, state compute.Buffer, chunk int) (compute.Buffer, GDNChunkLayout, error) {
+	var zero GDNChunkLayout
+	tq, err := asBuffer(q)
+	if err != nil {
+		return nil, zero, err
+	}
+	tk, _ := asBuffer(k)
+	tv, _ := asBuffer(v)
+	tg, _ := asBuffer(g)
+	tb, _ := asBuffer(beta)
+	ts, _ := asBuffer(state)
+	sv := tq.Ne0()
+	h := dimOr1(tq.dims, 1)
+	nTok := dimOr1(tq.dims, 2)
+	gstride := tg.Ne0()
+	kda := uint32(0)
+	if gstride == sv {
+		kda = 1
+	} else if gstride != 1 {
+		return nil, zero, compute.ErrShape
+	}
+	L := GDNChunkOffsets(sv, h, nTok, chunk)
+	if sv > 128 || L.C > 64 || nTok == 0 {
+		return nil, zero, fmt.Errorf("vulkan: GatedDeltaNetChunkedForwardAux unsupported shape")
+	}
+	work, err := b.newZeroF32Buffer(L.Total)
+	if err != nil {
+		return nil, zero, err
+	}
+	hhNC := uint32(h * L.NC)
+	hhSV := uint32(h * sv)
+	g3 := func(n uint32) [3]uint32 { return [3]uint32{n, 1, 1} }
+	if err := b.dispatch("gdn_chunk_cumsum", []*buffer{tg, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC), uint32(gstride), kda), g3(hhNC)); err != nil {
+		b.Free(work)
+		return nil, zero, err
+	}
+	if err := b.dispatch("gdn_chunk_ab", []*buffer{tk, tq, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), g3(hhNC)); err != nil {
+		b.Free(work)
+		return nil, zero, err
+	}
+	if err := b.dispatch("gdn_chunk_fwd", []*buffer{tk, tv, tb, ts, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), g3(hhSV)); err != nil {
+		b.Free(work)
+		return nil, zero, err
+	}
+	return work, L, nil
+}
+
+// GatedDeltaNetChunkedBackward computes the GatedDeltaNet gradients with the
+// matrix-based (FLA-style) chunked algorithm instead of the naive atomic kernel.
+// It removes the naive kernel's scratch cap (real sequence lengths) and the
+// O(T*S_v^2) cross-row atomics: within a chunk the solve/scan is row-independent
+// and the cross-row reductions are the small C x C matrices dA/dBt. It falls
+// back to GatedDeltaNetBackward for shapes or devices the shaders do not cover.
+func (b *Backend) GatedDeltaNetChunkedBackward(q, k, v, g, beta, state, dOut, dNewState compute.Buffer, chunk int) (compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, error) {
+	tq, err := asBuffer(q)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	tk, _ := asBuffer(k)
+	tv, _ := asBuffer(v)
+	tg, _ := asBuffer(g)
+	tb, _ := asBuffer(beta)
+	ts, _ := asBuffer(state)
+	td, _ := asBuffer(dOut)
+	tn, _ := asBuffer(dNewState)
+	sv := tq.Ne0()
+	h := dimOr1(tq.dims, 1)
+	nTok := dimOr1(tq.dims, 2)
+	gstride := tg.Ne0()
+	kda := uint32(0)
+	if gstride == sv {
+		kda = 1
+	} else if gstride != 1 {
+		return nil, nil, nil, nil, nil, nil, compute.ErrShape
+	}
+	if sv > 128 || chunk > 64 || !b.caps.Float32Atomics || nTok == 0 {
+		return b.GatedDeltaNetBackward(q, k, v, g, beta, state, dOut, dNewState)
+	}
+	C := chunk
+	if C < 1 {
+		C = 1
+	}
+	NC := (nTok + C - 1) / C
+	scale := float32(1 / math.Sqrt(float64(sv)))
+
+	// Packed per-call scratch (see shaders/gdn_chunk_cumsum.comp).
+	cc := h * NC * C * C
+	sGc := h * NC * C * sv
+	sDelta := sGc
+	sBnd := h * (NC + 1) * sv * sv
+	sZsol := sDelta
+	sScEnd := h * NC * sv * sv
+	sDBeta := h * nTok
+	total := sGc + 4*cc + sDelta + sBnd + sZsol + sScEnd + sDBeta
+	if total <= 0 {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("vulkan: GatedDeltaNetChunkedBackward empty scratch")
+	}
+	// Zero-initialized: passes 1-3 fill Gc/A/Bt/delta/bnd, the tail stays zero
+	// for the scan's atomic reductions.
+	work, err := b.newZeroF32Buffer(total)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	defer b.Free(work)
+
+	newOut := func(dims ...int) (*buffer, error) { return b.newZeroF32Buffer(dims...) }
+	dQ, err := newOut(tq.dims...)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dK, err := newOut(tk.dims...)
+	if err != nil {
+		b.Free(dQ)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dV, err := newOut(tv.dims...)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dG, err := newOut(tg.dims...)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dBeta, err := newOut(tb.dims...)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		b.Free(dG)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	dState, err := newOut(ts.dims...)
+	if err != nil {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		b.Free(dG)
+		b.Free(dBeta)
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	freeAll := func() {
+		b.Free(dQ)
+		b.Free(dK)
+		b.Free(dV)
+		b.Free(dG)
+		b.Free(dBeta)
+		b.Free(dState)
+	}
+	hhNC := uint32(h * NC)
+	hhSV := uint32(h * sv)
+	g3 := func(n uint32) [3]uint32 { return [3]uint32{n, 1, 1} }
+
+	if err := b.dispatch("gdn_chunk_cumsum", []*buffer{tg, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), uint32(gstride), kda), g3(hhNC)); err != nil {
+		freeAll()
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	if err := b.dispatch("gdn_chunk_ab", []*buffer{tk, tq, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), g3(hhNC)); err != nil {
+		freeAll()
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	if err := b.dispatch("gdn_chunk_fwd", []*buffer{tk, tv, tb, ts, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), g3(hhSV)); err != nil {
+		freeAll()
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	if err := b.dispatch("gdn_chunk_bwd", []*buffer{tq, tk, tv, tb, td, tn, work, dV, dState, dBeta},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), scale), g3(hhSV)); err != nil {
+		freeAll()
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	if err := b.dispatch("gdn_chunk_bwd_local", []*buffer{tq, tk, tb, td, work, dQ, dK, dG},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), uint32(gstride), kda, scale), g3(hhNC)); err != nil {
+		freeAll()
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	return dQ, dK, dV, dG, dBeta, dState, nil
+}
+
 // gatedDeltaNetHost is the fallback used when the dimensions exceed the shader.
 func (b *Backend) gatedDeltaNetHost(q, k, v, g, beta, state compute.Buffer) (compute.Buffer, compute.Buffer, error) {
 	dq, err := b.Download(q)

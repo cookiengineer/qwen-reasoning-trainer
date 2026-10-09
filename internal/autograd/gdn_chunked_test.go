@@ -65,7 +65,7 @@ func TestChunkedBackwardMatches(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, chunk := range []int{1, 2, 3, 5, 19} {
+		for _, chunk := range []int{1, 2, 3, 4, 5, 6, 7, 19} {
 			cq, ck, cv, cg, cb, cs, err := GatedDeltaNetChunked(q, k, v, g, beta, state, dOut, dNew, chunk)
 			if err != nil {
 				t.Fatalf("chunk=%d: %v", chunk, err)

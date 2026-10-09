@@ -1,0 +1,61 @@
+#version 450
+
+// Chunked GatedDeltaNet, pass 2: the C x C coupling matrices.
+//
+// One workgroup per (head, chunk), thread r computes row r of
+//   A[p,r]  = sum_i exp(Gc_r[i]-Gc_p[i]) k_p[i] k_r[i]   (p < r)
+//   Bt[r,p] = sum_i exp(Gc_r[i]-Gc_p[i]) k_p[i] q_r[i]   (p <= r)
+// storing A[p*C+r] and Bt[r*C+p]. See gdn_chunk_cumsum.comp for the work layout.
+
+#define MAX_C 64
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer K { float kv[]; };
+layout(binding = 1) readonly buffer Q { float qv[]; };
+layout(binding = 2)          buffer W { float w[];  };
+
+layout(push_constant) uniform P {
+    uint sv;
+    uint h;
+    uint nTok;
+    uint C;
+    uint NC;
+} p;
+
+void main() {
+    uint r = gl_LocalInvocationID.x;
+    uint gid = gl_WorkGroupID.x; // hh * NC + c
+    uint hh = gid / p.NC;
+    uint c = gid - hh * p.NC;
+    uint t0 = c * p.C;
+    uint clen = min(p.C, p.nTok - t0);
+    if (r >= clen) {
+        return;
+    }
+    uint gcBase = ((hh * p.NC + c) * p.C) * p.sv;
+    uint offA = p.h * p.NC * p.C * p.sv;
+    uint offB = offA + p.h * p.NC * p.C * p.C;
+    uint aBase = offA + (hh * p.NC + c) * p.C * p.C;
+    uint bBase = offB + (hh * p.NC + c) * p.C * p.C;
+    for (uint pp = 0u; pp < r; pp++) {
+        float a = 0.0;
+        for (uint i = 0u; i < p.sv; i++) {
+            float gr = w[gcBase + r * p.sv + i];
+            float gp = w[gcBase + pp * p.sv + i];
+            float cexp = exp(gr - gp);
+            a += cexp * kv[((t0 + pp) * p.h + hh) * p.sv + i] * kv[((t0 + r) * p.h + hh) * p.sv + i];
+        }
+        w[aBase + pp * p.C + r] = a;
+    }
+    for (uint pp = 0u; pp <= r; pp++) {
+        float bd = 0.0;
+        for (uint i = 0u; i < p.sv; i++) {
+            float gr = w[gcBase + r * p.sv + i];
+            float gp = w[gcBase + pp * p.sv + i];
+            float cexp = exp(gr - gp);
+            bd += cexp * kv[((t0 + pp) * p.h + hh) * p.sv + i] * qv[((t0 + r) * p.h + hh) * p.sv + i];
+        }
+        w[bBase + r * p.C + pp] = bd;
+    }
+}

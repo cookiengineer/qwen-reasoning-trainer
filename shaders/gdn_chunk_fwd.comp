@@ -1,0 +1,91 @@
+#version 450
+
+// Chunked GatedDeltaNet, pass 3: forward solve, boundary states and deltas.
+//
+// One invocation per (head, state row j). Each invocation marches all chunks in
+// order, solving the within-chunk unit lower-triangular system for its own row
+// (the rows are independent) and storing the chunk-boundary states and the write
+// strengths delta[t,j] needed by the backward. Outputs are produced by the
+// caller's existing forward and are not recomputed here.
+// See gdn_chunk_cumsum.comp for the work layout.
+
+#define MAX_SV 128
+#define MAX_C 64
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly buffer K { float kv[];   };
+layout(binding = 1) readonly buffer V { float vv[];   };
+layout(binding = 2) readonly buffer B { float betav[]; };
+layout(binding = 3) readonly buffer S { float statev[]; };
+layout(binding = 4)          buffer W { float w[];    };
+
+layout(push_constant) uniform P {
+    uint sv;
+    uint h;
+    uint nTok;
+    uint C;
+    uint NC;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x; // hh * sv + j
+    uint hh = gid / p.sv;
+    uint j = gid - hh * p.sv;
+
+    uint offGc = 0u;
+    uint offA = p.h * p.NC * p.C * p.sv;
+    uint offB = offA + p.h * p.NC * p.C * p.C;
+    uint offDelta = offB + p.h * p.NC * p.C * p.C;
+    uint offBnd = offDelta + p.h * p.NC * p.C * p.sv;
+
+    float Sc[MAX_SV];
+    float newSc[MAX_SV];
+    float deltas[MAX_C];
+
+    uint sb = hh * p.sv * p.sv + j * p.sv;
+    for (uint i = 0u; i < p.sv; i++) {
+        Sc[i] = statev[sb + i];
+        w[offBnd + ((hh * (p.NC + 1u) + 0u) * p.sv + j) * p.sv + i] = Sc[i];
+    }
+
+    for (uint c = 0u; c < p.NC; c++) {
+        uint t0 = c * p.C;
+        uint clen = min(p.C, p.nTok - t0);
+        uint gcBase = ((hh * p.NC + c) * p.C) * p.sv;
+        uint aBase = offA + (hh * p.NC + c) * p.C * p.C;
+        uint bBase = offB + (hh * p.NC + c) * p.C * p.C;
+        uint dBase = offDelta + ((hh * p.NC + c) * p.C) * p.sv;
+
+        for (uint r = 0u; r < clen; r++) {
+            float b = betav[(t0 + r) * p.h + hh];
+            float s = 0.0;
+            for (uint i = 0u; i < p.sv; i++) {
+                float e = exp(w[gcBase + r * p.sv + i]);
+                s += Sc[i] * e * kv[((t0 + r) * p.h + hh) * p.sv + i];
+            }
+            float rhs = b * (vv[((t0 + r) * p.h + hh) * p.sv + j] - s);
+            for (uint pp = 0u; pp < r; pp++) {
+                rhs -= b * w[aBase + pp * p.C + r] * deltas[pp];
+            }
+            deltas[r] = rhs;
+            w[dBase + r * p.sv + j] = rhs;
+        }
+
+        uint last = clen - 1u;
+        for (uint i = 0u; i < p.sv; i++) {
+            float eLast = exp(w[gcBase + last * p.sv + i]);
+            float acc = eLast * Sc[i];
+            for (uint pp = 0u; pp < clen; pp++) {
+                float kp = kv[((t0 + pp) * p.h + hh) * p.sv + i];
+                float ww = exp(w[gcBase + last * p.sv + i] - w[gcBase + pp * p.sv + i]) * kp;
+                acc += ww * deltas[pp];
+            }
+            newSc[i] = acc;
+            w[offBnd + ((hh * (p.NC + 1u) + (c + 1u)) * p.sv + j) * p.sv + i] = acc;
+        }
+        for (uint i = 0u; i < p.sv; i++) {
+            Sc[i] = newSc[i];
+        }
+    }
+}

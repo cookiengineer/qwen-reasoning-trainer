@@ -8,6 +8,16 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 )
 
+// deviceGDNChunk is the chunk size for the resident GatedDeltaNet backward.
+const deviceGDNChunk = 64
+
+// chunkedGDNBackend is implemented by the Vulkan backend. When present, the
+// resident GDN backward uses the matrix-based chunked kernel (no atomics, no
+// sequence-length cap) instead of the naive atomic one.
+type chunkedGDNBackend interface {
+	GatedDeltaNetChunkedBackward(q, k, v, g, beta, state, dOut, dNewState compute.Buffer, chunk int) (compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, compute.Buffer, error)
+}
+
 // DeviceGDN is a resident GatedDeltaNet (linear-attention) transformer block
 // (causal conv + gated delta rule + SwiGLU FFN) with LoRA on qkv/gate/ssm_out.
 // Its forward and backward run entirely on the backend.
@@ -350,7 +360,14 @@ func (d *DeviceGDN) Backward(ctx *gdnCtx, dY compute.Buffer) (*gdnGrads, error) 
 	if err != nil {
 		return nil, err
 	}
-	dQ48, dK48, dV, dGate, dBeta, _, err := be.GatedDeltaNetBackward(ctx.q48, ctx.k48, ctx.v, ctx.gate, ctx.betaT, ctx.zeroState, dOut, zerosNew)
+	var dQ48, dK48, dV, dGate, dBeta compute.Buffer
+	if cb, ok := be.(chunkedGDNBackend); ok {
+		dQ48, dK48, dV, dGate, dBeta, _, err = cb.GatedDeltaNetChunkedBackward(
+			ctx.q48, ctx.k48, ctx.v, ctx.gate, ctx.betaT, ctx.zeroState, dOut, zerosNew, deviceGDNChunk)
+	} else {
+		dQ48, dK48, dV, dGate, dBeta, _, err = be.GatedDeltaNetBackward(
+			ctx.q48, ctx.k48, ctx.v, ctx.gate, ctx.betaT, ctx.zeroState, dOut, zerosNew)
+	}
 	if err != nil {
 		return nil, err
 	}

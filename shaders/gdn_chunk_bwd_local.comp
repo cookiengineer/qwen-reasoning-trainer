@@ -1,0 +1,159 @@
+#version 450
+
+// Chunked GatedDeltaNet, pass 5: row-independent local gradients.
+//
+// One workgroup per (head, chunk), thread i = key index. Builds dK/dQ (from the
+// A/B matrices and the Zsol/dScEnd reductions) and dG (the within-chunk
+// log-decay cumsum), with no cross-row atomics. See gdn_chunk_cumsum.comp for
+// the work layout.
+
+#extension GL_EXT_shader_atomic_float : require
+
+#define MAX_SV 128
+#define MAX_C 64
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly buffer Q { float qv[];    };
+layout(binding = 1) readonly buffer K { float kv[];    };
+layout(binding = 2) readonly buffer B { float betav[]; };
+layout(binding = 3) readonly buffer DO { float dov[];  };
+layout(binding = 4)          buffer W { float w[];     };
+layout(binding = 5)          buffer DQ { float dqv[];  };
+layout(binding = 6)          buffer DK { float dkv[];  };
+layout(binding = 7)          buffer DG { float dgv[];  };
+
+layout(push_constant) uniform P {
+    uint sv;
+    uint h;
+    uint nTok;
+    uint C;
+    uint NC;
+    uint gstride;
+    uint kda;
+    float scale;
+} p;
+
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    if (i >= p.sv) {
+        return;
+    }
+    uint gid = gl_WorkGroupID.x; // hh * NC + c
+    uint hh = gid / p.NC;
+    uint c = gid - hh * p.NC;
+    uint t0 = c * p.C;
+    uint clen = min(p.C, p.nTok - t0);
+
+    uint offA = p.h * p.NC * p.C * p.sv;
+    uint offB = offA + p.h * p.NC * p.C * p.C;
+    uint offDelta = offB + p.h * p.NC * p.C * p.C;
+    uint offBnd = offDelta + p.h * p.NC * p.C * p.sv;
+    uint offZsol = offBnd + p.h * (p.NC + 1u) * p.sv * p.sv;
+    uint offScEnd = offZsol + p.h * p.NC * p.C * p.sv;
+    uint offDA = offScEnd + p.h * p.NC * p.sv * p.sv;
+    uint offDBt = offDA + p.h * p.NC * p.C * p.C;
+
+    uint gcBase = ((hh * p.NC + c) * p.C) * p.sv;
+    uint aBase = offA + (hh * p.NC + c) * p.C * p.C;
+    uint bBase = offB + (hh * p.NC + c) * p.C * p.C;
+    uint dBase = offDelta + ((hh * p.NC + c) * p.C) * p.sv;
+    uint zBase = offZsol + ((hh * p.NC + c) * p.C) * p.sv;
+    uint seBase = offScEnd + (hh * p.NC + c) * p.sv * p.sv;
+    uint daBase = offDA + (hh * p.NC + c) * p.C * p.C;
+    uint dbBase = offDBt + (hh * p.NC + c) * p.C * p.C;
+    uint bndBase = offBnd + ((hh * (p.NC + 1u) + c) * p.sv) * p.sv;
+
+    float GcL[MAX_C];
+    float kL[MAX_C];
+    float qL[MAX_C];
+    float dktil[MAX_C];
+    float dqtil[MAX_C];
+    float dw[MAX_C];
+    float dGc[MAX_C];
+    for (uint r = 0u; r < clen; r++) {
+        GcL[r] = w[gcBase + r * p.sv + i];
+        kL[r] = kv[((t0 + r) * p.h + hh) * p.sv + i];
+        qL[r] = qv[((t0 + r) * p.h + hh) * p.sv + i];
+        dGc[r] = 0.0;
+    }
+    // Reductions over the value rows j.
+    for (uint r = 0u; r < clen; r++) {
+        float a = 0.0;
+        float bq = 0.0;
+        for (uint j = 0u; j < p.sv; j++) {
+            float sc = w[bndBase + j * p.sv + i];
+            a += w[zBase + r * p.sv + j] * sc;
+            bq += dov[((t0 + r) * p.h + hh) * p.sv + j] * sc;
+        }
+        dktil[r] = -betav[(t0 + r) * p.h + hh] * a;
+        dqtil[r] = p.scale * bq;
+    }
+    for (uint pp = 0u; pp < clen; pp++) {
+        float s = 0.0;
+        for (uint j = 0u; j < p.sv; j++) {
+            s += w[seBase + j * p.sv + i] * w[dBase + pp * p.sv + j];
+        }
+        dw[pp] = s;
+    }
+    float de = 0.0;
+    for (uint j = 0u; j < p.sv; j++) {
+        float sc = w[bndBase + j * p.sv + i];
+        de += w[seBase + j * p.sv + i] * sc;
+    }
+    // dK / dQ.
+    for (uint a = 0u; a < clen; a++) {
+        float dk = 0.0;
+        float dq = 0.0;
+        for (uint r = a + 1u; r < clen; r++) {
+            dk += w[daBase + a * p.C + r] * exp(GcL[r] - GcL[a]) * kL[r];
+        }
+        for (uint pp = 0u; pp < a; pp++) {
+            dk += w[daBase + pp * p.C + a] * exp(GcL[a] - GcL[pp]) * kL[pp];
+        }
+        for (uint r = a; r < clen; r++) {
+            dk += w[dbBase + r * p.C + a] * exp(GcL[r] - GcL[a]) * qL[r];
+        }
+        for (uint pp = 0u; pp <= a; pp++) {
+            dq += w[dbBase + a * p.C + pp] * exp(GcL[a] - GcL[pp]) * kL[pp];
+        }
+        dk += dw[a] * exp(GcL[clen - 1u] - GcL[a]) + dktil[a] * exp(GcL[a]);
+        dq += dqtil[a] * exp(GcL[a]);
+        dkv[((t0 + a) * p.h + hh) * p.sv + i] += dk;
+        dqv[((t0 + a) * p.h + hh) * p.sv + i] += dq;
+    }
+    // dG.
+    for (uint pp = 0u; pp < clen; pp++) {
+        for (uint r = pp + 1u; r < clen; r++) {
+            float hval = w[daBase + pp * p.C + r] * exp(GcL[r] - GcL[pp]) * kL[pp] * kL[r];
+            dGc[r] += hval;
+            dGc[pp] -= hval;
+        }
+        for (uint r = pp; r < clen; r++) {
+            float hval = w[dbBase + r * p.C + pp] * exp(GcL[r] - GcL[pp]) * kL[pp] * qL[r];
+            dGc[r] += hval;
+            dGc[pp] -= hval;
+        }
+    }
+    uint last = clen - 1u;
+    for (uint pp = 0u; pp < clen; pp++) {
+        float hval = dw[pp] * exp(GcL[last] - GcL[pp]) * kL[pp];
+        dGc[last] += hval;
+        dGc[pp] -= hval;
+    }
+    for (uint r = 0u; r < clen; r++) {
+        dGc[r] += (dktil[r] * kL[r] + dqtil[r] * qL[r]) * exp(GcL[r]);
+    }
+    dGc[last] += de * exp(GcL[last]);
+
+    float suf = 0.0;
+    for (int si = int(clen) - 1; si >= 0; si--) {
+        uint s = uint(si);
+        suf += dGc[s];
+        if (p.kda == 1u) {
+            dgv[((t0 + s) * p.h + hh) * p.gstride + i] += suf;
+        } else {
+            atomicAdd(dgv[(t0 + s) * p.h + hh], suf);
+        }
+    }
+}

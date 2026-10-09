@@ -1,0 +1,61 @@
+#version 450
+
+// Chunked GatedDeltaNet, pass 1: within-chunk cumulative log-decay.
+//
+// One workgroup per (head, chunk), one invocation per key index i. Writes
+// Gc[hh,c,r,i] = sum_{s<=r} g[head hh, token c*C+s, i] (the per-element gate for
+// KDA, or the repeated scalar gate otherwise).
+//
+// The packed scratch `work` layout is shared by the gdn_chunk_* shaders:
+//   Gc      h*NC*C*sv
+//   A       h*NC*C*C
+//   Bt      h*NC*C*C
+//   delta   h*NC*C*sv
+//   bnd     h*(NC+1)*sv*sv
+//   Zsol    h*NC*C*sv
+//   dScEnd  h*NC*sv*sv
+//   dA      h*NC*C*C
+//   dBt     h*NC*C*C
+//   dBeta   h*nTok
+// (NC = number of chunks.)
+
+#define MAX_SV 128
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly buffer G { float gv[]; };
+layout(binding = 1)          buffer W { float w[];  };
+
+layout(push_constant) uniform P {
+    uint sv;
+    uint h;
+    uint nTok;
+    uint C;
+    uint NC;
+    uint gstride;
+    uint kda;
+} p;
+
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    if (i >= p.sv) {
+        return;
+    }
+    uint gid = gl_WorkGroupID.x; // hh * NC + c
+    uint hh = gid / p.NC;
+    uint c = gid - hh * p.NC;
+    uint t0 = c * p.C;
+    uint clen = min(p.C, p.nTok - t0);
+    uint base = ((hh * p.NC + c) * p.C) * p.sv;
+    float cum = 0.0;
+    for (uint r = 0u; r < clen; r++) {
+        float g;
+        if (p.kda == 1u) {
+            g = gv[((t0 + r) * p.h + hh) * p.gstride + i];
+        } else {
+            g = gv[(t0 + r) * p.h + hh];
+        }
+        cum += g;
+        w[base + r * p.sv + i] = cum;
+    }
+}

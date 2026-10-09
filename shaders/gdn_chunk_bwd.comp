@@ -1,0 +1,143 @@
+#version 450
+
+// Chunked GatedDeltaNet, pass 4: reverse row scan.
+//
+// One invocation per (head, state row j). Each invocation marches the chunks in
+// reverse, solving the adjoint system M^T z = ddelta for its own row and
+// accumulating dV, the boundary-state gradient and the C x C reductions dA/dBt
+// (plus dBeta) with float32 atomics. It stores Zsol and the per-chunk boundary
+// gradient so the row-independent local pass can build dQ/dK/dG without atomics.
+// See gdn_chunk_cumsum.comp for the work layout.
+
+#extension GL_EXT_shader_atomic_float : require
+
+#define MAX_SV 128
+#define MAX_C 64
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly buffer Q { float qv[];    };
+layout(binding = 1) readonly buffer K { float kv[];    };
+layout(binding = 2) readonly buffer V { float vv[];    };
+layout(binding = 3) readonly buffer B { float betav[]; };
+layout(binding = 4) readonly buffer DO { float dov[];  };
+layout(binding = 5) readonly buffer DN { float dnv[];  };
+layout(binding = 6)          buffer W { float w[];     };
+layout(binding = 7)          buffer DV { float dvv[];  };
+layout(binding = 8)          buffer DS { float dsv[];  };
+layout(binding = 9)          buffer DBE { float dbev[]; };
+
+layout(push_constant) uniform P {
+    uint sv;
+    uint h;
+    uint nTok;
+    uint C;
+    uint NC;
+    float scale;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x; // hh * sv + j
+    uint hh = gid / p.sv;
+    uint j = gid - hh * p.sv;
+
+    uint offA = p.h * p.NC * p.C * p.sv;
+    uint offB = offA + p.h * p.NC * p.C * p.C;
+    uint offDelta = offB + p.h * p.NC * p.C * p.C;
+    uint offBnd = offDelta + p.h * p.NC * p.C * p.sv;
+    uint offZsol = offBnd + p.h * (p.NC + 1u) * p.sv * p.sv;
+    uint offScEnd = offZsol + p.h * p.NC * p.C * p.sv;
+    uint offDA = offScEnd + p.h * p.NC * p.sv * p.sv;
+    uint offDBt = offDA + p.h * p.NC * p.C * p.C;
+
+    float dS[MAX_SV];
+    float dSc[MAX_SV];
+    float Sc[MAX_SV];
+    float ddelta[MAX_C];
+    float zsol[MAX_C];
+    float deltas[MAX_C];
+
+    uint nb = hh * p.sv * p.sv + j * p.sv;
+    for (uint i = 0u; i < p.sv; i++) {
+        dS[i] = dnv[nb + i];
+    }
+
+    for (int ci = int(p.NC) - 1; ci >= 0; ci--) {
+        uint c = uint(ci);
+        uint t0 = c * p.C;
+        uint clen = min(p.C, p.nTok - t0);
+        uint gcBase = ((hh * p.NC + c) * p.C) * p.sv;
+        uint aBase = offA + (hh * p.NC + c) * p.C * p.C;
+        uint bBase = offB + (hh * p.NC + c) * p.C * p.C;
+        uint dBase = offDelta + ((hh * p.NC + c) * p.C) * p.sv;
+        uint zBase = offZsol + ((hh * p.NC + c) * p.C) * p.sv;
+        uint seBase = offScEnd + (hh * p.NC + c) * p.sv * p.sv;
+        uint daBase = offDA + (hh * p.NC + c) * p.C * p.C;
+        uint dbBase = offDBt + (hh * p.NC + c) * p.C * p.C;
+        uint last = clen - 1u;
+
+        for (uint i = 0u; i < p.sv; i++) {
+            Sc[i] = w[offBnd + ((hh * (p.NC + 1u) + c) * p.sv + j) * p.sv + i];
+            w[seBase + j * p.sv + i] = dS[i];
+        }
+        for (uint pp = 0u; pp < clen; pp++) {
+            deltas[pp] = w[dBase + pp * p.sv + j];
+        }
+        // (a) chunk-end state: ddelta from sum_p w_p (x) delta_p, dSc from e (*) S_c.
+        for (uint pp = 0u; pp < clen; pp++) {
+            float acc = 0.0;
+            for (uint i = 0u; i < p.sv; i++) {
+                float kp = kv[((t0 + pp) * p.h + hh) * p.sv + i];
+                float ww = exp(w[gcBase + last * p.sv + i] - w[gcBase + pp * p.sv + i]) * kp;
+                acc += dS[i] * ww;
+            }
+            ddelta[pp] = acc;
+        }
+        for (uint i = 0u; i < p.sv; i++) {
+            dSc[i] = exp(w[gcBase + last * p.sv + i]) * dS[i];
+        }
+        // (b) outputs.
+        for (uint r = 0u; r < clen; r++) {
+            float dor = dov[((t0 + r) * p.h + hh) * p.sv + j];
+            for (uint i = 0u; i < p.sv; i++) {
+                dSc[i] += p.scale * dor * exp(w[gcBase + r * p.sv + i]) * qv[((t0 + r) * p.h + hh) * p.sv + i];
+            }
+            for (uint pp = 0u; pp <= r; pp++) {
+                atomicAdd(w[dbBase + r * p.C + pp], p.scale * dor * deltas[pp]);
+                ddelta[pp] += p.scale * w[bBase + r * p.C + pp] * dor;
+            }
+        }
+        // (c) solve M^T z = ddelta; dM -> dA/dBeta. (d) rhs -> dV/dBeta/dSc/dktil.
+        for (int ri = int(clen) - 1; ri >= 0; ri--) {
+            uint r = uint(ri);
+            float z = ddelta[r];
+            for (uint pp = r + 1u; pp < clen; pp++) {
+                float m = betav[(t0 + pp) * p.h + hh] * w[aBase + r * p.C + pp];
+                z -= m * zsol[pp];
+            }
+            zsol[r] = z;
+            float br = betav[(t0 + r) * p.h + hh];
+            for (uint pp = 0u; pp < r; pp++) {
+                float dm = -z * deltas[pp];
+                atomicAdd(w[daBase + pp * p.C + r], br * dm);
+                atomicAdd(dbev[(t0 + r) * p.h + hh], dm * w[aBase + pp * p.C + r]);
+            }
+            dvv[((t0 + r) * p.h + hh) * p.sv + j] += br * z;
+            float s = 0.0;
+            for (uint i = 0u; i < p.sv; i++) {
+                s += Sc[i] * exp(w[gcBase + r * p.sv + i]) * kv[((t0 + r) * p.h + hh) * p.sv + i];
+            }
+            atomicAdd(dbev[(t0 + r) * p.h + hh], z * (vv[((t0 + r) * p.h + hh) * p.sv + j] - s));
+            for (uint i = 0u; i < p.sv; i++) {
+                dSc[i] -= br * z * exp(w[gcBase + r * p.sv + i]) * kv[((t0 + r) * p.h + hh) * p.sv + i];
+            }
+            w[zBase + r * p.sv + j] = z;
+        }
+        for (uint i = 0u; i < p.sv; i++) {
+            dS[i] = dSc[i];
+        }
+    }
+    for (uint i = 0u; i < p.sv; i++) {
+        dsv[nb + i] = dS[i];
+    }
+}
