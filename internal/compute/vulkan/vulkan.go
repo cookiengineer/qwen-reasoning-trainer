@@ -1319,34 +1319,38 @@ func (b *Backend) beginBatch() error {
 }
 
 // flush submits and waits for all recorded commands, then releases buffers that
-// were freed during recording.
+// were freed during recording. On any failure it clears the recording flag
+// first so a later flush (e.g. from Close after a failed submit) does not try to
+// EndCommandBuffer/QueueSubmit an already-submitted batch, which crashes the
+// driver; pending buffers are still released.
 func (b *Backend) flush() error {
+	var ferr error
 	if b.recording {
-		if res := vkCall(b.vk.EndCommandBuffer, b.cmdBuffer); res != vkSuccess {
-			return fmt.Errorf("vulkan: end command buffer failed")
-		}
-		submit := submitInfo{
-			sType:              vkStructureSubmitInfo,
-			commandBufferCount: 1,
-			pCommandBuffers:    uintptr(unsafe.Pointer(&b.cmdBuffer)),
-		}
-		if res := vkCall(b.vk.ResetFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence))); res != vkSuccess {
-			return fmt.Errorf("vulkan: reset fence failed")
-		}
-		if res := vkCall(b.vk.QueueSubmit, b.queue, 1, uintptr(unsafe.Pointer(&submit)), b.fence); res != vkSuccess {
-			return fmt.Errorf("vulkan: queue submit failed")
-		}
-		if res := vkCall(b.vk.WaitForFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence)), 1, ^uintptr(0)); res != vkSuccess {
-			return fmt.Errorf("vulkan: wait for fence failed")
-		}
-		b.stats.Submits++
 		b.recording = false
+		if res := vkCall(b.vk.EndCommandBuffer, b.cmdBuffer); res != vkSuccess {
+			ferr = fmt.Errorf("vulkan: end command buffer failed")
+		} else {
+			submit := submitInfo{
+				sType:              vkStructureSubmitInfo,
+				commandBufferCount: 1,
+				pCommandBuffers:    uintptr(unsafe.Pointer(&b.cmdBuffer)),
+			}
+			if res := vkCall(b.vk.ResetFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence))); res != vkSuccess {
+				ferr = fmt.Errorf("vulkan: reset fence failed")
+			} else if res := vkCall(b.vk.QueueSubmit, b.queue, 1, uintptr(unsafe.Pointer(&submit)), b.fence); res != vkSuccess {
+				ferr = fmt.Errorf("vulkan: queue submit failed")
+			} else if res := vkCall(b.vk.WaitForFences, b.device, 1, uintptr(unsafe.Pointer(&b.fence)), 1, ^uintptr(0)); res != vkSuccess {
+				ferr = fmt.Errorf("vulkan: wait for fence failed")
+			} else {
+				b.stats.Submits++
+			}
+		}
 	}
 	for _, x := range b.pending {
 		b.destroyBuffer(x)
 	}
 	b.pending = b.pending[:0]
-	return nil
+	return ferr
 }
 
 // dispatch records a compute dispatch into the current batch.

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/status"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/tokenizer"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/train"
 )
@@ -40,6 +42,7 @@ Commands:
   evaluate   Score refusal/KL, corpus perplexity, and JSONL multiple-choice tasks
   dataset    Build tokenized, loss-masked examples from extractor JSONL
   train      QLoRA fine-tune on the extractor dataset (reference host path)
+  status     Show the progress of a running (or last) train/abliterate/search job
   help       Show this help
 
 Global flags:
@@ -47,6 +50,8 @@ Global flags:
   --models-dir <dir>   Directory for downloaded models (default <cwd>/models)
   --repo <repo>        Hugging Face repo (default ` + hf.DefaultRepo + `)
   --file <file>        Hugging Face file (default ` + DefaultModelFile + `)
+  --status-file <path> Progress status file (default $QWEN38_STATUS_FILE or
+                       $XDG_STATE_HOME/qwen-trainer/status.json)
   --no-download        Do not auto-download a missing model
   --log-level <level>  quiet|info|debug (default info)
 `
@@ -86,6 +91,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return cmdDataset(cfg, stdout, stderr)
 	case "train":
 		return cmdTrain(cfg, stdout, stderr)
+	case "status":
+		return cmdStatus(cfg, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", cfg.Command)
 		fmt.Fprint(stderr, usage)
@@ -205,17 +212,37 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 
 	good := encodePrompts(vocab, *system, goodLines)
 	bad := encodePrompts(vocab, *system, badLines)
+
+	stPath := status.Path(cfg.StatusFile)
+	ast := status.New("abliterate", path, len(good)+len(bad), "prompt")
+	ast.Phase = "residuals"
+	ast.Message = fmt.Sprintf("good residuals (%d prompts)", len(good))
+	ast.CheckpointPath = *out
+	swa := status.NewWriter(stPath, ast)
+	if swa.Err() != nil {
+		fmt.Fprintf(stderr, "warning: cannot write status file %s: %v\n", stPath, swa.Err())
+	}
+
 	fmt.Fprintf(stderr, "collecting residuals (%d good, %d bad prompts)...\n", len(good), len(bad))
 	gm, err := abliterate.CollectResiduals(m, good, *winsorize)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
+		swa.Finish("failed")
 		return 1
 	}
+	ast.Done = len(good)
+	ast.Message = fmt.Sprintf("bad residuals (%d prompts)", len(bad))
+	swa.Save()
 	bm, err := abliterate.CollectResiduals(m, bad, *winsorize)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
+		swa.Finish("failed")
 		return 1
 	}
+	ast.Done = len(good) + len(bad)
+	ast.Phase = "directions"
+	ast.Message = "computing directions"
+	swa.Save()
 	dirs := abliterate.Directions(gm, bm, *orthogonalize)
 
 	L := m.Cfg.TrunkLayers()
@@ -234,17 +261,30 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 		di := *directionIndex
 		p.DirectionIndex = &di
 	}
+	ast.Phase = "ablating"
+	ast.Message = "applying the ablation transform"
+	swa.Save()
 	changed, err := abliterate.Ablate(w, dirs, p)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
+		swa.Finish("failed")
 		return 1
 	}
 	fmt.Fprintf(stderr, "abliterated %d weight matrices; writing %s...\n", changed, *out)
+	ast.Phase = "rewriting"
+	ast.Unit = "matrix"
+	ast.Total = changed
+	ast.Done = 0
+	ast.Message = fmt.Sprintf("rewriting %d matrices", changed)
+	swa.Save()
 	if err := qwen38.RewriteGGUF(g, w.Overrides(), *out); err != nil {
 		fmt.Fprintln(stderr, "error:", err)
+		swa.Finish("failed")
 		return 1
 	}
+	ast.Done = changed
 	fmt.Fprintf(stdout, "wrote %s (%d matrices ablated)\n", *out, changed)
+	swa.Finish("done")
 	return 0
 }
 
@@ -419,6 +459,24 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "resuming from %d trials (%s)\n", len(prior), *study)
 	}
 
+	stPath := status.Path(cfg.StatusFile)
+	sst := status.New("search", path, *trials, "trial")
+	sst.Phase = "searching"
+	sst.Done = len(prior)
+	sst.CheckpointPath = *study
+	sst.Message = fmt.Sprintf("sampler=%s lambda=%.3f", sampler.Name(), *lambda)
+	if *study != "" {
+		sst.CheckpointEvery = 1
+		sst.CheckpointTotal = *trials
+		sst.CheckpointDone = len(prior)
+	}
+	swr := status.NewWriter(stPath, sst)
+	if swr.Err() != nil {
+		fmt.Fprintf(stderr, "warning: cannot write status file %s: %v\n", stPath, swr.Err())
+	}
+	searchStart := time.Now()
+	bestScore := math.Inf(1)
+
 	var lastRefusal, lastKL float64
 	obj := func(tp abliterate.TrialParams) (float64, error) {
 		restore()
@@ -444,29 +502,48 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "warn: study append: %v\n", err)
 			}
 		}
+		sst.Done = tr.Index + 1
+		if tr.Score < bestScore {
+			bestScore = tr.Score
+		}
+		sst.Objective = bestScore
+		sst.CheckpointDone = tr.Index + 1
+		done := tr.Index + 1 - len(prior)
+		if done > 0 {
+			sst.ETASeconds = time.Since(searchStart).Seconds() / float64(done) * float64(*trials-(tr.Index+1))
+		}
+		sst.Message = fmt.Sprintf("trial %d/%d  refusal=%.3f kl=%.4f score=%.4f", tr.Index+1, *trials, lastRefusal, lastKL, tr.Score)
+		swr.Save()
 	}
 
 	result, err := space.Search(sampler, abliterate.SearchOptions{Trials: *trials, Prior: prior, OnTrial: onTrial}, obj)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
+		swr.Finish("failed")
 		return 1
 	}
 	fmt.Fprintf(stderr, "best score %.4f\n", result.BestScore)
+	sst.Objective = result.BestScore
+	sst.Phase = "writing"
+	swr.Save()
 
 	if *out != "" {
 		restore()
 		if _, err := abliterate.Ablate(w, dirs, result.Best.Params()); err != nil {
 			fmt.Fprintln(stderr, "error:", err)
+			swr.Finish("failed")
 			return 1
 		}
 		if err := qwen38.RewriteGGUF(g, w.Overrides(), *out); err != nil {
 			fmt.Fprintln(stderr, "error:", err)
+			swr.Finish("failed")
 			return 1
 		}
 		fmt.Fprintf(stdout, "wrote %s (best score %.4f)\n", *out, result.BestScore)
 	} else {
 		fmt.Fprintf(stdout, "best score %.4f (no --out; nothing written)\n", result.BestScore)
 	}
+	swr.Finish("done")
 	return 0
 }
 
@@ -836,6 +913,42 @@ func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// cmdStatus prints the progress of a running (or last finished) long job,
+// reading the status file written by train/abliterate/search.
+func cmdStatus(cfg *Config, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	file := fs.String("file", "", "status file (overrides the global --status-file)")
+	asJSON := fs.Bool("json", false, "print the raw status JSON")
+	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	path := *file
+	if path == "" {
+		path = status.Path(cfg.StatusFile)
+	}
+	st, err := status.Read(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(stdout, "no status file at %s\n", path)
+			return 0
+		}
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if *asJSON {
+		data, err := json.MarshalIndent(st, "", "  ")
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, string(data))
+		return 0
+	}
+	status.Render(stdout, st)
+	return 0
+}
+
 // cmdTrain runs QLoRA fine-tuning on the extractor dataset. This is the
 // reference host path: the quantized base is frozen and only F32 LoRA adapters
 // are trained. It is correct-first and slow on the real 27B; the device-resident
@@ -857,12 +970,16 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	adapterOut := fs.String("adapter-out", "", "LoRA adapter checkpoint path")
 	valRatio := fs.Float64("val-ratio", 0.0, "validation split ratio (0 = train on all)")
 	subagents := fs.Bool("include-subagents", false, "include the subagents/ tree")
+	limit := fs.Int("limit", 0, "use only the first N sessions (0 = all)")
 	device := fs.Bool("device", false, "train with the device-resident Vulkan graph")
 	checkpoint := fs.Bool("checkpoint", true, "activation checkpointing (device path)")
+	resume := fs.String("resume", "", "device checkpoint file to resume from (and save to)")
+	saveEvery := fs.Int("save-every", 0, "write the device checkpoint every N steps (0 = only at the end)")
+	evalCkpt := fs.String("eval-checkpoint", "", "load a device checkpoint, merge its adapters into --out on the CPU, and exit")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
-	if *input == "" {
+	if *input == "" && *evalCkpt == "" {
 		fmt.Fprintln(stderr, "error: --input is required")
 		return 2
 	}
@@ -899,6 +1016,14 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	loCfg := train.DefaultLoRA()
+	loCfg.Rank = *rank
+	loCfg.Alpha = float32(*alpha)
+
+	if *evalCkpt != "" {
+		return runEvalCheckpoint(g, w, loCfg, *evalCkpt, *out, stdout, stderr)
+	}
+
 	d, err := dataset.Open(*input, dataset.WithSubagents(*subagents))
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
@@ -908,6 +1033,9 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
+	}
+	if *limit > 0 && len(recs) > *limit {
+		recs = recs[:*limit]
 	}
 	bo := dataset.DefaultBuildOptions()
 	bo.MaxSeqLen = *seqLen
@@ -936,14 +1064,11 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	data := toTrain(trainSet)
 	valData := toTrain(valSet)
 
-	loCfg := train.DefaultLoRA()
-	loCfg.Rank = *rank
-	loCfg.Alpha = float32(*alpha)
-
 	if *device {
 		return runDeviceTrain(cfg, g, w, loCfg, data, valData, stdout, stderr, deviceTrainOpts{
 			steps: *steps, accum: *accum, warmup: *warmup, maxGrad: *maxGrad, lr: *lr,
 			seed: *seed, checkpoint: *checkpoint, adapterOut: *adapterOut, out: *out,
+			resume: *resume, saveEvery: *saveEvery,
 		})
 	}
 
@@ -1000,12 +1125,53 @@ type deviceTrainOpts struct {
 	seed                 int64
 	checkpoint           bool
 	adapterOut, out      string
+	resume               string
+	saveEvery            int
 }
 
 // deviceTrainHeadroomBytes is reserved on top of the model size when deciding
 // whether a GPU can host a resident training run (F32 adapters, their AdamW
 // moments and checkpointed activations).
 const deviceTrainHeadroomBytes = 3 << 30
+
+// runEvalCheckpoint loads a device-training checkpoint (LoRA params + optimizer
+// state), copies the adapters into a host model, and streams a merged, type-
+// preserving GGUF to out. It is CPU-only, so it can run alongside a live device
+// training job without contending for GPU memory. Evaluate the merged model with
+// the `evaluate` command (perplexity/tasks/refusal).
+func runEvalCheckpoint(g *gguf.File, w *qwen38.Weights, loCfg train.LoRAConfig, ckptPath, out string, stdout, stderr io.Writer) int {
+	ck, err := train.LoadDeviceCheckpoint(ckptPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	tm := train.NewQwenModel(w.Cfg, w, loCfg, 0)
+	params := tm.Params()
+	if len(ck.Params) != len(params) {
+		fmt.Fprintf(stderr, "error: checkpoint has %d adapter tensors, model expects %d (LoRA rank/targets must match the run)\n", len(ck.Params), len(params))
+		return 1
+	}
+	for i := range params {
+		if len(ck.Params[i].F32) != len(params[i].F32) {
+			fmt.Fprintf(stderr, "error: adapter tensor %d size mismatch\n", i)
+			return 1
+		}
+		copy(params[i].F32, ck.Params[i].F32)
+	}
+	fmt.Fprintf(stderr, "checkpoint %s: step %d, %d adapter tensors\n", ckptPath, ck.Step, len(ck.Params))
+	if out == "" {
+		fmt.Fprintln(stderr, "no --out given; nothing written (pass --out <file.gguf> to merge for evaluation)")
+		return 0
+	}
+	t0 := time.Now()
+	if err := tm.WriteMerged(g, out); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "wrote merged model: %s (%s)\n", out, time.Since(t0).Round(time.Second))
+	fmt.Fprintf(stderr, "evaluate it with: qwen-trainer --model %s evaluate --perplexity <corpus.txt> [--tasks <tasks.jsonl>]\n", out)
+	return 0
+}
 
 // runDeviceTrain runs the fully-resident Vulkan QLoRA training path.
 func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.LoRAConfig, data, valData []train.Example, stdout, stderr io.Writer, o deviceTrainOpts) int {
@@ -1028,8 +1194,30 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	fmt.Fprintf(stderr, "device training: %d examples (%d val), %d adapters\n",
-		len(data), len(valData), len(dm.AdapterLins()))
+
+	startStep := 0
+	if o.resume != "" {
+		if _, statErr := os.Stat(o.resume); statErr == nil {
+			startStep, err = dm.LoadDeviceState(o.resume, opt)
+			if err != nil {
+				fmt.Fprintln(stderr, "error: resume:", err)
+				return 1
+			}
+			fmt.Fprintf(stderr, "resumed from %s at step %d\n", o.resume, startStep)
+		} else if o.saveEvery <= 0 {
+			fmt.Fprintf(stderr, "note: %s does not exist; starting a fresh run\n", o.resume)
+		}
+	} else if o.saveEvery > 0 {
+		fmt.Fprintln(stderr, "error: --save-every requires --resume <checkpoint-path>")
+		return 1
+	}
+	if startStep >= o.steps {
+		fmt.Fprintf(stderr, "error: checkpoint step %d >= --steps %d; nothing to do\n", startStep, o.steps)
+		return 1
+	}
+
+	fmt.Fprintf(stderr, "device training: %d examples (%d val), %d adapters, steps %d..%d\n",
+		len(data), len(valData), len(dm.AdapterLins()), startStep, o.steps)
 	if len(valData) > 0 {
 		if vl, err := dm.EvalLoss(valData); err == nil {
 			fmt.Fprintf(stderr, "val loss before: %.4f\n", vl)
@@ -1038,25 +1226,107 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 
 	tr := &train.DeviceTrainer{
 		Model: dm, Opt: opt,
-		Cfg: train.DeviceTrainerConfig{Steps: o.steps, Accum: o.accum, MaxGradNorm: float32(o.maxGrad)},
+		Cfg: train.DeviceTrainerConfig{Steps: o.steps, StartStep: startStep, Accum: o.accum, MaxGradNorm: float32(o.maxGrad)},
 	}
 	sched := train.CosineSchedule(float32(o.lr), float32(o.lr)*0.1, o.warmup, o.steps)
-	hist, err := tr.Run(data, sched, func(step int, loss float32) {
-		if cfg.LogLevel != "quiet" {
-			fmt.Fprintf(stderr, "step %d/%d: loss %.4f lr %.2e\n", step+1, o.steps, loss, sched(step))
+
+	runStart := time.Now()
+	last := runStart
+	var stepTimes []time.Duration
+
+	stPath := status.Path(cfg.StatusFile)
+	st := status.New("train", cfg.Model, o.steps, "step")
+	st.Phase = "training"
+	st.Done = startStep
+	st.CheckpointPath = o.resume
+	st.CheckpointEvery = o.saveEvery
+	if o.saveEvery > 0 {
+		st.CheckpointTotal = (o.steps + o.saveEvery - 1) / o.saveEvery
+		st.CheckpointDone = startStep / o.saveEvery
+	} else {
+		st.CheckpointTotal = 1
+	}
+	st.Message = fmt.Sprintf("training steps %d..%d", startStep, o.steps)
+	sw := status.NewWriter(stPath, st)
+	if sw.Err() != nil {
+		fmt.Fprintf(stderr, "warning: cannot write status file %s: %v\n", stPath, sw.Err())
+	}
+	var bestLoss float32
+
+	onStep := func(step int, loss float32) {
+		now := time.Now()
+		dt := now.Sub(last)
+		last = now
+		stepTimes = append(stepTimes, dt)
+		if o.saveEvery > 0 && (step+1)%o.saveEvery == 0 && o.resume != "" {
+			if err := dm.SaveDeviceState(o.resume, opt); err != nil {
+				fmt.Fprintf(stderr, "warning: checkpoint save failed: %v\n", err)
+			} else {
+				st.CheckpointDone++
+				if cfg.LogLevel != "quiet" {
+					fmt.Fprintf(stderr, "checkpoint saved at step %d\n", step+1)
+				}
+			}
 		}
-	})
+
+		done := step + 1 - startStep
+		elapsed := now.Sub(runStart)
+		var remaining time.Duration
+		if done > 0 {
+			remaining = time.Duration(float64(o.steps-(step+1)) * elapsed.Seconds() / float64(done) * float64(time.Second))
+		}
+		if bestLoss == 0 || loss < bestLoss {
+			bestLoss = loss
+		}
+		st.Done = step + 1
+		st.Loss = float64(loss)
+		st.BestLoss = float64(bestLoss)
+		st.LR = float64(sched(step))
+		st.ETASeconds = remaining.Seconds()
+		st.Message = fmt.Sprintf("step %d/%d  loss %.4f  lr %.2e", step+1, o.steps, loss, sched(step))
+		sw.Save()
+
+		if cfg.LogLevel == "quiet" {
+			return
+		}
+		fmt.Fprintf(stderr, "step %d/%d: loss %.4f lr %.2e  %s/step  elapsed %s  eta %s\n",
+			step+1, o.steps, loss, sched(step),
+			dt.Round(time.Millisecond), elapsed.Round(time.Second), remaining.Round(time.Second))
+	}
+	hist, err := tr.Run(data, sched, onStep)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
+		sw.Finish("failed")
+		return 1
+	}
+	st.CheckpointDone = st.CheckpointTotal
+	st.Phase = "merging"
+	st.Message = "training complete; writing outputs"
+	sw.Save()
+	if vb, ok := be.(*vulkan.Backend); ok {
+		if st := vb.Stats(); st.PeakDeviceBytes > 0 {
+			fmt.Fprintf(stderr, "peak device memory: %s\n", humanBytes(int64(st.PeakDeviceBytes)))
+		}
+	}
+	if len(hist) == 0 {
+		fmt.Fprintln(stderr, "error: no steps run")
 		return 1
 	}
 	fmt.Fprintf(stdout, "steps: %d\n", len(hist))
 	fmt.Fprintf(stdout, "initial_loss: %.4f\n", hist[0])
 	fmt.Fprintf(stdout, "final_loss: %.4f\n", hist[len(hist)-1])
+	fmt.Fprintf(stdout, "wall_time: %s\n", time.Since(runStart).Round(time.Second))
 	if len(valData) > 0 {
 		if vl, err := dm.EvalLoss(valData); err == nil {
 			fmt.Fprintf(stdout, "val_loss: %.4f\n", vl)
 		}
+	}
+	if o.resume != "" {
+		if err := dm.SaveDeviceState(o.resume, opt); err != nil {
+			fmt.Fprintln(stderr, "error: final checkpoint save:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "checkpoint: %s\n", o.resume)
 	}
 	if o.adapterOut != "" {
 		if err := dm.SyncAdapters(); err != nil {
@@ -1078,6 +1348,7 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 		}
 		fmt.Fprintf(stdout, "wrote merged model: %s (%s)\n", o.out, time.Since(t0).Round(time.Second))
 	}
+	sw.Finish("done")
 	return 0
 }
 

@@ -17,15 +17,16 @@ type adamMoments struct {
 // device and applies fully-resident steps, so a training step never round-trips
 // the params or gradients through the host.
 type DeviceAdamW struct {
-	be  compute.Backend
-	cfg AdamWConfig
-	t   int
-	m   map[*devLin]*adamMoments
+	be    compute.Backend
+	cfg   AdamWConfig
+	t     int
+	m     map[*devLin]*adamMoments
+	order []*devLin
 }
 
 // NewDeviceAdamW allocates zeroed moment buffers for every adapter.
 func NewDeviceAdamW(be compute.Backend, cfg AdamWConfig, lins []*devLin) (*DeviceAdamW, error) {
-	o := &DeviceAdamW{be: be, cfg: cfg, m: make(map[*devLin]*adamMoments, len(lins))}
+	o := &DeviceAdamW{be: be, cfg: cfg, m: make(map[*devLin]*adamMoments, len(lins)), order: append([]*devLin(nil), lins...)}
 	for _, l := range lins {
 		mA, err := be.Upload(compute.NewF32(l.lora.A.Dims...))
 		if err != nil {
@@ -72,6 +73,56 @@ func (o *DeviceAdamW) Step(grads []adapterGrad, lr float32) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// StepCount returns the number of optimizer steps applied so far, which drives
+// the AdamW bias-correction and the learning-rate schedule on resume.
+func (o *DeviceAdamW) StepCount() int { return o.t }
+
+// Snapshot downloads every adapter's AdamW moments in AdapterLins order as
+// [mA, vA, mB, vB] per adapter, for checkpointing.
+func (o *DeviceAdamW) Snapshot() ([]*compute.Tensor, error) {
+	out := make([]*compute.Tensor, 0, 4*len(o.order))
+	for _, l := range o.order {
+		mom := o.m[l]
+		if mom == nil {
+			return nil, fmt.Errorf("train: missing optimizer moments for adapter")
+		}
+		for _, buf := range []compute.Buffer{mom.mA, mom.vA, mom.mB, mom.vB} {
+			t, err := o.be.Download(buf)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// Restore loads AdamW moments and the step counter from a checkpoint, copying
+// in place so the existing moment buffers are reused.
+func (o *DeviceAdamW) Restore(step int, moments []*compute.Tensor) error {
+	if len(moments) != 4*len(o.order) {
+		return fmt.Errorf("train: checkpoint has %d moment tensors, want %d", len(moments), 4*len(o.order))
+	}
+	i := 0
+	for _, l := range o.order {
+		mom := o.m[l]
+		if mom == nil {
+			return fmt.Errorf("train: missing optimizer moments for adapter")
+		}
+		for _, dst := range []compute.Buffer{mom.mA, mom.vA, mom.mB, mom.vB} {
+			if err := uploadInto(o.be, dst, moments[i]); err != nil {
+				return err
+			}
+			i++
+		}
+	}
+	if err := o.be.Sync(); err != nil {
+		return err
+	}
+	o.t = step
 	return nil
 }
 
@@ -179,6 +230,7 @@ func exampleTargets(ex Example) (tokens, targets []int32) {
 // DeviceTrainerConfig controls the resident device training loop.
 type DeviceTrainerConfig struct {
 	Steps       int
+	StartStep   int
 	Accum       int
 	MaxGradNorm float32
 	LogEvery    int
@@ -206,7 +258,14 @@ func (t *DeviceTrainer) Run(data []Example, sched func(step int) float32, onStep
 	be := t.Model.be
 	var history []float32
 	var err error
-	for step := 0; step < t.Cfg.Steps; step++ {
+	start := t.Cfg.StartStep
+	if start < 0 {
+		start = 0
+	}
+	if start >= t.Cfg.Steps {
+		return history, nil
+	}
+	for step := start; step < t.Cfg.Steps; step++ {
 		var acc []adapterGrad
 		accLoss := float32(0)
 		for a := 0; a < accum; a++ {

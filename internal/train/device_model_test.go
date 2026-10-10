@@ -2,6 +2,7 @@ package train
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -215,6 +216,97 @@ func TestDeviceModelStepReducesLoss(t *testing.T) {
 
 // TestDeviceTrainerReducesLoss runs the resident DeviceTrainer with gradient
 // accumulation and global-norm clipping and checks the loss falls.
+// TestDeviceCheckpointResume verifies that a device checkpoint restores the
+// adapter params, AdamW moments and step counter exactly, so a run resumed from
+// disk produces the same next step as an uninterrupted run.
+func TestDeviceCheckpointResume(t *testing.T) {
+	v, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer v.Close()
+
+	cfg := tinyCfg()
+	w := qwen38.NewRandom(cfg, 789)
+	loCfg := LoRAConfig{Rank: 3, Alpha: 6, Targets: DefaultLoRA().Targets}
+
+	tokens := []int32{1, 2, 3, 4, 5, 6, 7, 8}
+	mask := make([]bool, len(tokens))
+	for i := range mask {
+		mask[i] = true
+	}
+	data := []Example{{Tokens: tokens, LossMask: mask}}
+	sched := func(step int) float32 { return 0.03 }
+
+	m1, err := NewDeviceModel(v, cfg, w, loCfg, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1.Checkpoint = true
+	opt1, err := NewDeviceAdamW(v, DefaultAdamW(0.03), m1.AdapterLins())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr1 := &DeviceTrainer{Model: m1, Opt: opt1, Cfg: DeviceTrainerConfig{Steps: 3, Accum: 1, MaxGradNorm: 1.0}}
+	if _, err := tr1.Run(data, sched, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "train.ckpt")
+	if err := m1.SaveDeviceState(path, opt1); err != nil {
+		t.Fatal(err)
+	}
+	if opt1.StepCount() != 3 {
+		t.Fatalf("step count %d, want 3", opt1.StepCount())
+	}
+
+	// Resume into a fresh model built with a different seed: the checkpoint must
+	// fully overwrite the parameter init.
+	m2, err := NewDeviceModel(v, cfg, w, loCfg, 12345)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2.Checkpoint = true
+	opt2, err := NewDeviceAdamW(v, DefaultAdamW(0.03), m2.AdapterLins())
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := m2.LoadDeviceState(path, opt2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step != 3 || opt2.StepCount() != 3 {
+		t.Fatalf("resumed step %d/%d, want 3", step, opt2.StepCount())
+	}
+	if err := m2.SyncAdapters(); err != nil {
+		t.Fatal(err)
+	}
+	for i, p := range m1.Params() {
+		if d := maxAbsDiff(p.F32, m2.Params()[i].F32); d != 0 {
+			t.Fatalf("adapter param %d differs after resume: %g", i, d)
+		}
+	}
+
+	// The next step must match the uninterrupted run.
+	cont := &DeviceTrainer{Model: m1, Opt: opt1, Cfg: DeviceTrainerConfig{Steps: 4, StartStep: 3, Accum: 1, MaxGradNorm: 1.0}}
+	hist1, err := cont.Run(data, sched, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := &DeviceTrainer{Model: m2, Opt: opt2, Cfg: DeviceTrainerConfig{Steps: 4, StartStep: 3, Accum: 1, MaxGradNorm: 1.0}}
+	hist2, err := res.Run(data, sched, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist1) != 1 || len(hist2) != 1 {
+		t.Fatalf("expected one resumed step, got %d and %d", len(hist1), len(hist2))
+	}
+	if d := math.Abs(float64(hist1[0] - hist2[0])); d > 1e-4 {
+		t.Fatalf("resumed loss %g != continued loss %g (diff %g)", hist2[0], hist1[0], d)
+	}
+	t.Logf("resume step loss %.6f == continued %.6f", hist2[0], hist1[0])
+}
+
 func TestDeviceTrainerReducesLoss(t *testing.T) {
 	v, err := vulkan.New()
 	if err != nil {

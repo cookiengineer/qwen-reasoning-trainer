@@ -22,6 +22,9 @@ type Config struct {
 	Repo string
 	File string
 
+	// StatusFile overrides the progress status file path (empty = default).
+	StatusFile string
+
 	// Command is the subcommand name.
 	Command string
 	// Args are the remaining arguments after the command.
@@ -88,6 +91,12 @@ func ParseArgs(args []string, cwd string) (*Config, error) {
 				return nil, err
 			}
 			cfg.File = v
+		case "--status-file":
+			v, err := flagValue(args, &i, value, hasValue, name)
+			if err != nil {
+				return nil, err
+			}
+			cfg.StatusFile = v
 		case "--no-download":
 			cfg.Download = false
 		case "--download":
