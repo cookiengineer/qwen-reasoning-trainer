@@ -124,7 +124,7 @@ func TestReferenceQuants(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: Go dequant: %v", c.typ, err)
 			}
-			want, err := runRefQuants(bin, c.id, n, nbytes, raw)
+			want, err := runRefQuants(bin, "dequant", c.id, n, nbytes, raw)
 			if err != nil {
 				t.Fatalf("%s: ref harness: %v", c.typ, err)
 			}
@@ -154,8 +154,8 @@ func TestReferenceQuants(t *testing.T) {
 	}
 }
 
-func runRefQuants(bin string, id, n, nbytes int, raw []byte) ([]float32, error) {
-	cmd := exec.Command(bin, strconv.Itoa(id), strconv.Itoa(n), strconv.Itoa(nbytes))
+func runRefQuants(bin, mode string, id, n, nbytes int, raw []byte) ([]float32, error) {
+	cmd := exec.Command(bin, mode, strconv.Itoa(id), strconv.Itoa(n), strconv.Itoa(nbytes))
 	cmd.Stdin = bytes.NewReader(raw)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
@@ -172,6 +172,131 @@ func runRefQuants(bin string, id, n, nbytes int, raw []byte) ([]float32, error) 
 		want[i] = math.Float32frombits(binary.LittleEndian.Uint32(wantBytes[i*4:]))
 	}
 	return want, nil
+}
+
+// runRefQuantize sends n float32 values to the harness quantizer and returns the
+// raw quantized blocks it produced.
+func runRefQuantize(bin string, id, n, nbytes int, f []float32) ([]byte, error) {
+	in := make([]byte, n*4)
+	for i, v := range f {
+		binary.LittleEndian.PutUint32(in[i*4:], math.Float32bits(v))
+	}
+	cmd := exec.Command(bin, "quantize", strconv.Itoa(id), strconv.Itoa(n), strconv.Itoa(nbytes))
+	cmd.Stdin = bytes.NewReader(in)
+	var out, errb bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%v: %s", err, errb.String())
+	}
+	if out.Len() != nbytes {
+		return nil, fmt.Errorf("harness returned %d bytes, want %d", out.Len(), nbytes)
+	}
+	return out.Bytes(), nil
+}
+
+// byteExactEncoders lists the types whose Go encoder must be byte-identical to
+// llama.cpp's reference quantizer. It grows as each encoder is ported; types not
+// listed are only reported (so `make verify-quants` stays green during the port).
+var byteExactEncoders = map[quant.Type]bool{
+	quant.TypeQ8_0:   true,
+	quant.TypeQ4_K:   true,
+	quant.TypeQ5_K:   true,
+	quant.TypeQ6_K:   true,
+	quant.TypeQ3_K:   true,
+	quant.TypeIQ4_NL: true,
+	quant.TypeIQ4_XS: true,
+	quant.TypeIQ3_S:  true,
+}
+
+// TestReferenceQuantize diffs internal/quant's block *encoders* against
+// llama.cpp's reference quantizers (quantize_row_*_ref) on identical float input.
+// It is opt-in and reuses the harness built by TestReferenceQuants. Types in
+// byteExactEncoders must match exactly; the rest are logged.
+//
+//	QWEN38_VERIFY_QUANTS=1 go test ./e2e-tests/verify-quants -run TestReferenceQuantize -v
+func TestReferenceQuantize(t *testing.T) {
+	if os.Getenv("QWEN38_VERIFY_QUANTS") == "" {
+		t.Skip("set QWEN38_VERIFY_QUANTS=1 to run the llama.cpp quant reference check")
+	}
+	src := os.Getenv("QWEN38_LLAMA_SRC")
+	if src == "" {
+		src = filepath.Join("third_party", "ggml")
+	}
+	cc := os.Getenv("CC")
+	if cc == "" {
+		cc = "cc"
+	}
+	bin := filepath.Join(t.TempDir(), "ref_quants")
+	build := exec.Command(cc, "-O1", "-w",
+		"-I", filepath.Join(src, "include"),
+		"-I", filepath.Join(src, "src"),
+		"-I", filepath.Join(src, "src", "ggml-cpu"),
+		"-o", bin,
+		filepath.Join("harness", "ref_quants.c"),
+		filepath.Join(src, "src", "ggml-quants.c"),
+		"-lm",
+	)
+	build.Stderr = os.Stderr
+	if out, err := build.Output(); err != nil {
+		t.Fatalf("build harness: %v\n%s", err, out)
+	}
+
+	cases := []struct {
+		typ   quant.Type
+		id    int
+		block int
+		size  int
+	}{
+		{quant.TypeQ8_0, 0, 32, 34},
+		{quant.TypeQ4_K, 1, 256, 144},
+		{quant.TypeQ5_K, 2, 256, 176},
+		{quant.TypeQ6_K, 3, 256, 210},
+		{quant.TypeQ3_K, 4, 256, 110},
+		{quant.TypeIQ4_NL, 5, 32, 18},
+		{quant.TypeIQ4_XS, 6, 256, 136},
+		{quant.TypeIQ3_S, 7, 256, 110},
+	}
+	rng := rand.New(rand.NewSource(0x5eed))
+	const blocksPerFixture = 8
+	for _, c := range cases {
+		n := c.block * blocksPerFixture
+		nbytes := c.size * blocksPerFixture
+		var totalBytes, differBytes, trialsDiffer, trials int
+		for trial := 0; trial < 8; trial++ {
+			f := make([]float32, n)
+			scale := []float64{1.5, 0.05, 12, 1e-3, 3, 0.7, 40, 0.2}[trial]
+			for j := range f {
+				f[j] = float32(rng.NormFloat64() * scale)
+			}
+			got, err := quant.Quantize(c.typ, f)
+			if err != nil {
+				t.Fatalf("%s: quantize: %v", c.typ, err)
+			}
+			want, err := runRefQuantize(bin, c.id, n, nbytes, f)
+			if err != nil {
+				t.Fatalf("%s: ref quantize: %v", c.typ, err)
+			}
+			trials++
+			totalBytes += nbytes
+			trialDiff := 0
+			for i := range want {
+				if got[i] != want[i] {
+					differBytes++
+					trialDiff++
+				}
+			}
+			if trialDiff > 0 {
+				trialsDiffer++
+			}
+		}
+		pct := 100 * float64(totalBytes-differBytes) / float64(totalBytes)
+		t.Logf("%s: encoder byte-match %.2f%% (%d/%d bytes differ across %d trials)",
+			c.typ, pct, differBytes, totalBytes, trials)
+		if byteExactEncoders[c.typ] && differBytes > 0 {
+			t.Errorf("%s: encoder is not byte-exact: %d/%d bytes differ", c.typ, differBytes, totalBytes)
+		}
+	}
 }
 
 func allFinite(v []float32) bool {

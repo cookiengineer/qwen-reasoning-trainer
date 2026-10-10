@@ -94,10 +94,10 @@ verify-ref: $(E2E_STAMP)
 verify-data: $(E2E_STAMP)
 	QWEN38_VERIFY_DATA=1 QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) test -run TestReferenceData -v ./e2e-tests/...
 
-# Diff our block decoders against a vendored copy of llama.cpp's ggml-quants.c
-# (needs a C compiler; self-contained, no references/ dependency).
+# Diff our block decoders and encoders against a vendored copy of llama.cpp's
+# ggml-quants.c (needs a C compiler; self-contained).
 verify-quants:
-	QWEN38_VERIFY_QUANTS=1 $(GO) test -run TestReferenceQuants -v ./e2e-tests/verify-quants/...
+	QWEN38_VERIFY_QUANTS=1 $(GO) test -run 'TestReferenceQuant' -v ./e2e-tests/verify-quants/...
 
 inspect: build
 	$(BIN) inspect
