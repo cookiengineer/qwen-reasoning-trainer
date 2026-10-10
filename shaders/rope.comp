@@ -1,5 +1,10 @@
 #version 450
 
+// GPT-NeoX partial RoPE. One invocation per (token, head, dim) element so the
+// non-rotary dims are copied through (partial rotary leaves [nDims, headDim)
+// untouched, matching compute.RoPENeoX's x.Clone()). The rotary pair (e, e+hd)
+// is written by the e < hd invocation.
+
 layout(local_size_x = 64) in;
 
 layout(binding = 0) readonly  buffer X   { float x[]; };
@@ -17,21 +22,25 @@ layout(push_constant) uniform P {
 
 void main() {
     uint hd = p.nDims / 2u;
-    uint total = p.nTok * p.nHead * hd;
+    uint total = p.nTok * p.nHead * p.headDim;
     uint gid = p.base + gl_GlobalInvocationID.x;
     if (gid >= total) {
         return;
     }
-    uint i = gid % hd;
-    uint t = (gid / hd) / p.nHead;
-    uint h = (gid / hd) % p.nHead;
+    uint e = gid % p.headDim;
+    uint t = (gid / p.headDim) / p.nHead;
+    uint h = (gid / p.headDim) % p.nHead;
     uint base = (t * p.nHead + h) * p.headDim;
-    float freq = pow(p.theta, -2.0 * float(i) / float(p.nDims));
-    float ang = float(pos[t]) * freq;
-    float c = cos(ang);
-    float s = sin(ang);
-    float x0 = x[base + i];
-    float x1 = x[base + i + hd];
-    o[base + i] = x0 * c - x1 * s;
-    o[base + i + hd] = x0 * s + x1 * c;
+    if (e < hd) {
+        float freq = pow(p.theta, -2.0 * float(e) / float(p.nDims));
+        float ang = float(pos[t]) * freq;
+        float c = cos(ang);
+        float s = sin(ang);
+        float x0 = x[base + e];
+        float x1 = x[base + e + hd];
+        o[base + e] = x0 * c - x1 * s;
+        o[base + e + hd] = x0 * s + x1 * c;
+    } else if (e >= p.nDims) {
+        o[base + e] = x[base + e];
+    }
 }

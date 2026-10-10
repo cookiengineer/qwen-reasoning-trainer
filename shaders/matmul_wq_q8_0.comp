@@ -1,0 +1,5 @@
+#version 450
+// Fused q8_0 dequantize + GEMM (forward). Generated dispatch wrapper; the body
+// and decoder live in matmul_wq_body.glsl / quant_decode.glsl.
+#define QDECODE(n, kk) deq_q8_0(n, kk)
+#include "matmul_wq_body.glsl"

@@ -1,0 +1,4 @@
+#version 450
+// Fused q3_k dequantize + transposed GEMM (dX = W^T dY).
+#define QDECODE(n, kk) deq_q3_k(n, kk)
+#include "matmul_t_wq_body.glsl"

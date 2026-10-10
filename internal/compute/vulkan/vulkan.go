@@ -576,6 +576,16 @@ type Backend struct {
 	// in tests to exercise the row-blocking path.
 	maxScratchFloats int
 
+	// noFusedFwd / noFusedT disable the fused dequantize+GEMM paths (forward /
+	// transposed) so tests can exercise the row-blocked float32 scratch
+	// fallback.
+	noFusedFwd bool
+	noFusedT   bool
+
+	// noPool disables buffer recycling (every Free destroys the buffer). Tests
+	// only.
+	noPool bool
+
 	// forceStaging makes allocation prefer a device-local buffer that is not
 	// host-visible, exercising the staging transfer path. Tests only.
 	forceStaging bool
@@ -1181,6 +1191,9 @@ func (b *Backend) poolGet(key poolKey) (*buffer, bool) {
 
 // poolPut offers a buffer to the pool, returning false if the pool is full.
 func (b *Backend) poolPut(buf *buffer) bool {
+	if b.noPool {
+		return false
+	}
 	if b.poolBytes+buf.size > poolCap {
 		return false
 	}

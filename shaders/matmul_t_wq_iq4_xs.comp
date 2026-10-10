@@ -1,0 +1,4 @@
+#version 450
+// Fused iq4_xs dequantize + transposed GEMM (dX = W^T dY).
+#define QDECODE(n, kk) deq_iq4_xs(n, kk)
+#include "matmul_t_wq_body.glsl"

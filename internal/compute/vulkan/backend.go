@@ -26,6 +26,34 @@ var gemvShaders = map[quant.Type]string{
 	quant.TypeIQ3_S:  "gemv_iq3_s",
 }
 
+// matmulWShaders maps a quantized type to its fused dequantize+GEMM shader
+// (C = W x). It removes the float32 scratch of MatMulWeight for m > 1.
+var matmulWShaders = map[quant.Type]string{
+	quant.TypeF16:    "matmul_wq_f16",
+	quant.TypeQ8_0:   "matmul_wq_q8_0",
+	quant.TypeQ4_K:   "matmul_wq_q4_k",
+	quant.TypeQ5_K:   "matmul_wq_q5_k",
+	quant.TypeQ6_K:   "matmul_wq_q6_k",
+	quant.TypeQ3_K:   "matmul_wq_q3_k",
+	quant.TypeIQ4_XS: "matmul_wq_iq4_xs",
+	quant.TypeIQ4_NL: "matmul_wq_iq4_nl",
+	quant.TypeIQ3_S:  "matmul_wq_iq3_s",
+}
+
+// matmulTWShaders maps a quantized type to its fused dequantize+transposed GEMM
+// shader (dX = W^T dY), the backward counterpart of matmulWShaders.
+var matmulTWShaders = map[quant.Type]string{
+	quant.TypeF16:    "matmul_t_wq_f16",
+	quant.TypeQ8_0:   "matmul_t_wq_q8_0",
+	quant.TypeQ4_K:   "matmul_t_wq_q4_k",
+	quant.TypeQ5_K:   "matmul_t_wq_q5_k",
+	quant.TypeQ6_K:   "matmul_t_wq_q6_k",
+	quant.TypeQ3_K:   "matmul_t_wq_q3_k",
+	quant.TypeIQ4_XS: "matmul_t_wq_iq4_xs",
+	quant.TypeIQ4_NL: "matmul_t_wq_iq4_nl",
+	quant.TypeIQ3_S:  "matmul_t_wq_iq3_s",
+}
+
 // Capabilities implements compute.Backend.
 func (b *Backend) Capabilities() compute.Capabilities { return b.caps }
 
@@ -832,7 +860,8 @@ func (b *Backend) RoPE(a compute.Buffer, positions []int32, theta float64, nDims
 	if err != nil {
 		return nil, err
 	}
-	total := uint32(nTok * nHead * (nDims / 2))
+	// One invocation per (token, head, dim) so the non-rotary dims are copied.
+	total := uint32(nTok * nHead * headDim)
 	if err := b.dispatch1D("rope", []*buffer{x, posBuf, out}, total, func(base uint32) []byte {
 		return push(uint32(headDim), uint32(nHead), uint32(nTok), uint32(nDims), float32(theta), base)
 	}); err != nil {
@@ -1650,6 +1679,19 @@ func (b *Backend) UploadWeight(t quant.Type, raw []byte, dims []int) (compute.Bu
 // intended for tests that need to force multiple row blocks.
 func (b *Backend) SetMaxScratchFloats(n int) { b.maxScratchFloats = n }
 
+// SetNoFusedWeight disables both fused dequantize+GEMM paths so tests exercise
+// the row-blocked float32 scratch fallback. Tests only.
+func (b *Backend) SetNoFusedWeight(v bool) { b.noFusedFwd, b.noFusedT = v, v }
+
+// SetNoFusedFwd disables only the fused forward weight GEMM. Tests only.
+func (b *Backend) SetNoFusedFwd(v bool) { b.noFusedFwd = v }
+
+// SetNoFusedT disables only the fused transposed weight GEMM. Tests only.
+func (b *Backend) SetNoFusedT(v bool) { b.noFusedT = v }
+
+// SetNoPool disables buffer recycling. Tests only.
+func (b *Backend) SetNoPool(v bool) { b.noPool = v }
+
 // SetForceStaging makes buffer allocation prefer non-host-visible device-local
 // memory so tests exercise the staging transfer path.
 func (b *Backend) SetForceStaging(v bool) { b.forceStaging = v }
@@ -1774,6 +1816,24 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 		}
 	}
 
+	// Multi-token: a fused dequantize+GEMM decodes the weight in registers, so
+	// no float32 scratch is materialized (no maxStorageBufferRange pressure).
+	if name, ok := matmulWShaders[wb.typ]; ok && !b.noFusedFwd {
+		gx := ceilDiv(uint32(n), 64)
+		gy := ceilDiv(uint32(m), 64)
+		if gx <= maxWorkGroups && gy <= maxWorkGroups {
+			out, err := b.newF32Buffer(n, m)
+			if err != nil {
+				return nil, err
+			}
+			if err := b.dispatch(name, []*buffer{wb, xb, out}, push(uint32(k), uint32(n), uint32(m), uint32(0)), [3]uint32{gx, gy, 1}); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
+	}
+
 	// Bound the float32 scratch to ~256 MiB and the block count per dequant
 	// call below the dispatch limit.
 	maxFloats := b.maxScratchFloats
@@ -1866,6 +1926,18 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 	if sh.blockElems > 1 && k%sh.blockElems != 0 {
 		b.Free(out)
 		return nil, fmt.Errorf("vulkan: row length %d not a multiple of block %d", k, sh.blockElems)
+	}
+
+	if name, ok := matmulTWShaders[wb.typ]; ok && !b.noFusedT {
+		gx := ceilDiv(uint32(k), 64)
+		gy := ceilDiv(uint32(m), 64)
+		if gx <= maxWorkGroups && gy <= maxWorkGroups {
+			if err := b.dispatch(name, []*buffer{wb, db, out}, push(uint32(k), uint32(n), uint32(m), uint32(0), uint32(n), uint32(0)), [3]uint32{gx, gy, 1}); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
 	}
 
 	maxFloats := b.maxScratchFloats

@@ -1,0 +1,5 @@
+#version 450
+// Fused iq4_nl dequantize + GEMM (forward). Generated dispatch wrapper; the body
+// and decoder live in matmul_wq_body.glsl / quant_decode.glsl.
+#define QDECODE(n, kk) deq_iq4_nl(n, kk)
+#include "matmul_wq_body.glsl"

@@ -24,8 +24,10 @@ SHADER_DIR := shaders
 SPIRV_DIR  := internal/compute/vulkan/spirv
 SHADER_SRC := $(wildcard $(SHADER_DIR)/*.comp)
 SHADER_SPV := $(patsubst $(SHADER_DIR)/%.comp,$(SPIRV_DIR)/%.spv,$(SHADER_SRC))
+# Shared GLSL includes (decode helpers, GEMM bodies); any change rebuilds all.
+SHADER_INC := $(wildcard $(SHADER_DIR)/*.glsl)
 
-GLSL_FLAGS  := --target-env=vulkan1.1 -O
+GLSL_FLAGS  := --target-env=vulkan1.1 -O -I $(SHADER_DIR)
 SPIRV_FLAGS := --target-env vulkan1.1
 
 # Local Python environment for the opt-in external references.
@@ -37,7 +39,7 @@ E2E_PYTHON ?= $(CURDIR)/$(E2E_VENV)/bin/python
 E2E_STAMP  := $(E2E_VENV)/.deps-ok
 
 .PHONY: all build shaders test vet fmt fmt-check tidy clean check \
-        verify-ref verify-data e2e-venv inspect gpu-info
+        verify-ref verify-data verify-quants e2e-venv inspect gpu-info
 
 all: build
 
@@ -47,7 +49,7 @@ build: shaders
 	$(GO) build -o $(BIN) $(CMD)
 
 # Compile and validate each GLSL shader to SPIR-V.
-$(SPIRV_DIR)/%.spv: $(SHADER_DIR)/%.comp
+$(SPIRV_DIR)/%.spv: $(SHADER_DIR)/%.comp $(SHADER_INC)
 	@mkdir -p $(SPIRV_DIR)
 	$(GLSLC) $(GLSL_FLAGS) -o $@ $<
 	$(SPIRV_VAL) $(SPIRV_FLAGS) $@
@@ -91,6 +93,11 @@ verify-ref: $(E2E_STAMP)
 
 verify-data: $(E2E_STAMP)
 	QWEN38_VERIFY_DATA=1 QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) test -run TestReferenceData -v ./e2e-tests/...
+
+# Diff our block decoders against a vendored copy of llama.cpp's ggml-quants.c
+# (needs a C compiler; self-contained, no references/ dependency).
+verify-quants:
+	QWEN38_VERIFY_QUANTS=1 $(GO) test -run TestReferenceQuants -v ./e2e-tests/verify-quants/...
 
 inspect: build
 	$(BIN) inspect

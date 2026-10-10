@@ -1,0 +1,4 @@
+#version 450
+// Fused f16 dequantize + transposed GEMM (dX = W^T dY).
+#define QDECODE(n, kk) deq_f16(n, kk)
+#include "matmul_t_wq_body.glsl"

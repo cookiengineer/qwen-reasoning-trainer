@@ -144,6 +144,31 @@ func TestVulkanGetRowsRoPE(t *testing.T) {
 	co2, _ := cf2(c)
 	vo2, _ := cf2(v)
 	compare(t, "rope", down(t, v, vo2), down(t, c, co2))
+
+	// Partial rotary: nDims < headDim must copy the non-rotary dims.
+	for _, tc := range []struct {
+		headDim, nHead, nTok, nDims int
+	}{
+		{8, 3, 5, 4},
+		{16, 2, 7, 6},
+		{64, 4, 9, 16},
+	} {
+		n := tc.headDim * tc.nHead * tc.nTok
+		rx := make([]float32, n)
+		for i := range rx {
+			rx[i] = float32(math.Sin(float64(i)*0.3)) * 2
+		}
+		pos := make([]int32, tc.nTok)
+		for i := range pos {
+			pos[i] = int32(i * 2)
+		}
+		cfp := func(b compute.Backend) (compute.Buffer, error) {
+			return b.RoPE(up(t, b, []int{tc.headDim, tc.nHead, tc.nTok}, append([]float32(nil), rx...)), append([]int32(nil), pos...), 10000, tc.nDims)
+		}
+		co, _ := cfp(c)
+		vo, _ := cfp(v)
+		compare(t, "rope-partial", down(t, v, vo), down(t, c, co))
+	}
 }
 
 func TestVulkanAttention(t *testing.T) {
@@ -303,8 +328,10 @@ func TestVulkanMatMulWeightBlocked(t *testing.T) {
 		t.Skipf("vulkan unavailable: %v", err)
 	}
 	defer v.Close()
-	// Force a tiny scratch so the weight is processed in many row blocks.
+	// Force a tiny scratch so the weight is processed in many row blocks, and
+	// disable the fused path so this exercises the scratch fallback.
 	v.SetMaxScratchFloats(64)
+	v.SetNoFusedWeight(true)
 
 	k, n, m := 32, 200, 3
 	data := make([]float32, k*n)
@@ -336,6 +363,152 @@ func TestVulkanMatMulWeightBlocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	compare(t, "matmulweight-blocked", down(t, v, got), wantT.F32)
+}
+
+func TestVulkanMatMulWeightFusedParity(t *testing.T) {
+	_, v := newBackends(t)
+	// Shapes that cross the 64-wide GEMM tiles in both dimensions.
+	const K, N, M = 512, 128, 80
+	wf := make([]float32, K*N)
+	for i := range wf {
+		wf[i] = float32(math.Sin(float64(i)*0.017))*0.6 + float32((i%7)-3)*0.04
+	}
+	x := make([]float32, K*M)
+	for i := range x {
+		x[i] = float32(math.Cos(float64(i)*0.013)) * 0.5
+	}
+	dy := compute.NewF32(N, M)
+	for i := range dy.F32 {
+		dy.F32[i] = float32(math.Sin(float64(i)*0.021)) * 0.4
+	}
+	types := []quant.Type{
+		quant.TypeF16, quant.TypeQ8_0, quant.TypeQ4_K, quant.TypeQ5_K,
+		quant.TypeQ6_K, quant.TypeQ3_K, quant.TypeIQ4_XS, quant.TypeIQ4_NL,
+		quant.TypeIQ3_S,
+	}
+	for _, typ := range types {
+		raw, err := quant.Quantize(typ, wf)
+		if err != nil {
+			t.Fatalf("%s: quantize: %v", typ, err)
+		}
+		dq, err := quant.Dequant(typ, raw, int64(K*N))
+		if err != nil {
+			t.Fatalf("%s: dequant: %v", typ, err)
+		}
+		wantW, err := compute.MatMul(&compute.Tensor{Dims: []int{K, N}, F32: dq}, &compute.Tensor{Dims: []int{K, M}, F32: x})
+		if err != nil {
+			t.Fatal(err)
+		}
+		vw, err := v.UploadWeight(typ, raw, []int{K, N})
+		if err != nil {
+			t.Fatalf("%s: upload: %v", typ, err)
+		}
+		vx := up(t, v, []int{K, M}, append([]float32(nil), x...))
+		vout, err := v.MatMulWeight(vw, vx)
+		if err != nil {
+			t.Fatalf("%s: fused forward: %v", typ, err)
+		}
+		compare(t, "fused W "+typ.String(), down(t, v, vout), wantW.F32)
+
+		// Transposed fused path: dX = W^T dY.
+		vdy := up(t, v, []int{N, M}, append([]float32(nil), dy.F32...))
+		vdx, err := v.MatMulWeightTranspose(vw, vdy)
+		if err != nil {
+			t.Fatalf("%s: fused transpose: %v", typ, err)
+		}
+		compare(t, "fused dX "+typ.String(), down(t, v, vdx), hostTransposeReference(dq, dy, K, N, M))
+	}
+}
+
+func TestVulkanMatMulWeightFusedShapes(t *testing.T) {
+	_, v := newBackends(t)
+	shapes := [][3]int{
+		{512, 128, 80},
+		{5120, 64, 128},
+		{5120, 96, 40},
+		{2560, 200, 17},
+		{768, 512, 64},
+		{17408, 8, 64},
+		{256, 65536, 4},
+		{5120, 2000, 16},
+		{6144, 5120, 64},
+	}
+	types := []quant.Type{
+		quant.TypeQ8_0, quant.TypeQ4_K, quant.TypeQ5_K, quant.TypeQ6_K,
+		quant.TypeQ3_K, quant.TypeIQ4_XS, quant.TypeIQ4_NL, quant.TypeIQ3_S,
+	}
+	for _, sh := range shapes {
+		K, N, M := sh[0], sh[1], sh[2]
+		wf := make([]float32, K*N)
+		for i := range wf {
+			wf[i] = float32(math.Sin(float64(i)*0.017))*0.6 + float32((i%7)-3)*0.04
+		}
+		x := make([]float32, K*M)
+		for i := range x {
+			x[i] = float32(math.Cos(float64(i)*0.013)) * 0.5
+		}
+		for _, typ := range types {
+			raw, err := quant.Quantize(typ, wf)
+			if err != nil {
+				t.Fatalf("%s: quantize: %v", typ, err)
+			}
+			dq, err := quant.Dequant(typ, raw, int64(K*N))
+			if err != nil {
+				t.Fatalf("%s: dequant: %v", typ, err)
+			}
+			wantW, err := compute.MatMul(&compute.Tensor{Dims: []int{K, N}, F32: dq}, &compute.Tensor{Dims: []int{K, M}, F32: x})
+			if err != nil {
+				t.Fatal(err)
+			}
+			vw, err := v.UploadWeight(typ, raw, []int{K, N})
+			if err != nil {
+				t.Fatalf("%s: upload: %v", typ, err)
+			}
+			vx := up(t, v, []int{K, M}, append([]float32(nil), x...))
+			vout, err := v.MatMulWeight(vw, vx)
+			if err != nil {
+				t.Fatalf("%s: fused forward: %v", typ, err)
+			}
+			got := down(t, v, vout)
+			bad := 0
+			for i := range wantW.F32 {
+				tol := 1e-3 + 1e-3*float32(math.Abs(float64(wantW.F32[i])))
+				if float32(math.Abs(float64(got[i]-wantW.F32[i]))) > tol {
+					if bad < 3 {
+						t.Errorf("K=%d N=%d M=%d %s[%d]: got %v want %v", K, N, M, typ, i, got[i], wantW.F32[i])
+					}
+					bad++
+				}
+			}
+			if bad > 0 {
+				t.Fatalf("fwd K=%d N=%d M=%d %s: %d/%d mismatched", K, N, M, typ, bad, len(got))
+			}
+
+			dy := compute.NewF32(N, M)
+			for i := range dy.F32 {
+				dy.F32[i] = float32(math.Sin(float64(i)*0.021)) * 0.4
+			}
+			vdy := up(t, v, []int{N, M}, append([]float32(nil), dy.F32...))
+			vdx, err := v.MatMulWeightTranspose(vw, vdy)
+			if err != nil {
+				t.Fatalf("%s: fused transpose: %v", typ, err)
+			}
+			wantT := hostTransposeReference(dq, dy, K, N, M)
+			gotT := down(t, v, vdx)
+			for i := range wantT {
+				tol := 1e-3 + 1e-3*float32(math.Abs(float64(wantT[i])))
+				if float32(math.Abs(float64(gotT[i]-wantT[i]))) > tol {
+					if bad < 3 {
+						t.Errorf("K=%d N=%d M=%d %s dX[%d]: got %v want %v", K, N, M, typ, i, gotT[i], wantT[i])
+					}
+					bad++
+				}
+			}
+			if bad > 0 {
+				t.Fatalf("dX K=%d N=%d M=%d %s: %d mismatched", K, N, M, typ, bad)
+			}
+		}
+	}
 }
 
 func TestVulkanGemvFused(t *testing.T) {
@@ -533,8 +706,10 @@ func TestVulkanMatMulWeightTransposeBlocked(t *testing.T) {
 		t.Skipf("vulkan unavailable: %v", err)
 	}
 	defer v.Close()
-	// Force small row blocks so the accumulation path runs several times.
+	// Force small row blocks so the accumulation path runs several times, and
+	// disable the fused path so this exercises the scratch fallback.
 	v.SetMaxScratchFloats(K * 2)
+	v.SetNoFusedWeight(true)
 
 	wf := make([]float32, K*N)
 	for i := range wf {

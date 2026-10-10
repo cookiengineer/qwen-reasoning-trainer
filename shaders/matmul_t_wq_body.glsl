@@ -1,0 +1,102 @@
+// Fused transposed quantized-weight GEMM body for dX = W^T dY.
+//
+//   O[k,m] = sum_r dequant(W[n0+r, k]) * D[n0+r, m]
+//
+// W is a quantized weight [K, N] (decoded in registers into the shared W-tile);
+// D is dY [N, M] in GGML layout. When acc == 1 the partial result is added into
+// O, so a k-split can accumulate without a host round-trip. Same tiling as
+// matmul_t.comp.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) readonly buffer W { uint data[]; };
+layout(binding = 1) readonly buffer D { float d[]; };
+layout(binding = 2)          buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint M;
+    uint n0;
+    uint rows;
+    uint acc;
+} p;
+
+#include "quant_decode.glsl"
+
+#define TM 64
+#define TN 64
+#define TK 16
+#define TKMICRO 4
+#define TNMICRO 4
+
+shared float Ws[TK][TM + 4];
+shared float Ds[TK][TN + 4];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint tid = ty * 16u + tx;
+    uint k0 = gl_WorkGroupID.x * TM;
+    uint m0 = gl_WorkGroupID.y * TN;
+
+    float acc[TKMICRO][TNMICRO];
+    for (uint i = 0u; i < TKMICRO; i++) {
+        for (uint j = 0u; j < TNMICRO; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (uint r0 = 0u; r0 < p.rows; r0 += TK) {
+        for (uint idx = tid; idx < TK * TM; idx += 256u) {
+            uint r = idx / TM;
+            uint k = idx - r * TM;
+            uint rr = r0 + r;
+            uint kk = k0 + k;
+            Ws[r][k] = (rr < p.rows && kk < p.K) ? QDECODE(p.n0 + rr, kk) : 0.0;
+        }
+        for (uint idx = tid; idx < TK * TN; idx += 256u) {
+            uint r = idx % TK;
+            uint m = idx / TK;
+            uint rr = r0 + r;
+            uint mm = m0 + m;
+            Ds[r][m] = (rr < p.rows && mm < p.M) ? d[(p.n0 + rr) + mm * p.N] : 0.0;
+        }
+        barrier();
+
+        for (uint r = 0u; r < TK; r++) {
+            float wv[TKMICRO];
+            float dv[TNMICRO];
+            for (uint i = 0u; i < TKMICRO; i++) {
+                wv[i] = Ws[r][ty * TKMICRO + i];
+            }
+            for (uint j = 0u; j < TNMICRO; j++) {
+                dv[j] = Ds[r][tx * TNMICRO + j];
+            }
+            for (uint i = 0u; i < TKMICRO; i++) {
+                for (uint j = 0u; j < TNMICRO; j++) {
+                    acc[i][j] += wv[i] * dv[j];
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < TKMICRO; i++) {
+        uint k = k0 + ty * TKMICRO + i;
+        if (k >= p.K) {
+            continue;
+        }
+        for (uint j = 0u; j < TNMICRO; j++) {
+            uint m = m0 + tx * TNMICRO + j;
+            if (m < p.M) {
+                uint idx = k + m * p.K;
+                if (p.acc == 1u) {
+                    o[idx] += acc[i][j];
+                } else {
+                    o[idx] = acc[i][j];
+                }
+            }
+        }
+    }
+}
