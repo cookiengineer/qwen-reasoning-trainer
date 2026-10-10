@@ -180,9 +180,9 @@ make verify-quants; # our block decoders + encoders vs llama.cpp's ggml-quants.c
 Each is also runnable directly, e.g. `go run ./e2e-tests/verify-ref`.
 
 The Python references use a project-local virtualenv at `e2e-tests/.venv`,
-created and populated on demand from
-[e2e-tests/requirements.txt](e2e-tests/requirements.txt) (`numpy`, `jinja2`,
-`regex`). The venv is gitignored.
+created and populated on demand from each check's own `requirements.txt`
+(`e2e-tests/verify-ref/requirements.txt`, `e2e-tests/verify-data/requirements.txt`
+— `numpy`, `jinja2`, `regex`). The venv is gitignored.
 
 - `make e2e-venv` creates/populates the venv explicitly.
 - `SYSTEM_PYTHON=python3.x` selects the base interpreter used to build it.

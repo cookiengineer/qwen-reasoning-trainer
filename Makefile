@@ -30,11 +30,14 @@ SHADER_INC := $(wildcard $(SHADER_DIR)/*.glsl)
 GLSL_FLAGS  := --target-env=vulkan1.1 -O -I $(SHADER_DIR)
 SPIRV_FLAGS := --target-env vulkan1.1
 
-# Local Python environment for the opt-in external references.
-E2E_DIR    := e2e-tests
-E2E_REQS   := $(E2E_DIR)/requirements.txt
-E2E_VENV   := $(E2E_DIR)/.venv
-# Absolute so it works as an env var; `go test` runs with CWD set to the package.
+# Local Python environment for the opt-in external references. Each check keeps
+# its own requirements.txt under e2e-tests/<name>/; both are installed into one
+# shared venv (redundancy is fine).
+E2E_DIR       := e2e-tests
+E2E_REF_REQS  := $(E2E_DIR)/verify-ref/requirements.txt
+E2E_DATA_REQS := $(E2E_DIR)/verify-data/requirements.txt
+E2E_VENV      := $(E2E_DIR)/.venv
+# Absolute so it works as an env var regardless of the caller's CWD.
 E2E_PYTHON ?= $(CURDIR)/$(E2E_VENV)/bin/python
 E2E_STAMP  := $(E2E_VENV)/.deps-ok
 
@@ -82,11 +85,11 @@ check: fmt-check vet test
 # numpy+jinja2+regex).
 e2e-venv: $(E2E_STAMP)
 
-$(E2E_STAMP): $(E2E_REQS)
+$(E2E_STAMP): $(E2E_REF_REQS) $(E2E_DATA_REQS)
 	@echo "setting up $(E2E_VENV) ..."
 	@test -d $(E2E_VENV) || $(SYSTEM_PYTHON) -m venv $(E2E_VENV)
 	@$(E2E_VENV)/bin/python -m pip install --quiet --disable-pip-version-check --upgrade pip
-	@$(E2E_VENV)/bin/python -m pip install --quiet --disable-pip-version-check -r $(E2E_REQS)
+	@$(E2E_VENV)/bin/python -m pip install --quiet --disable-pip-version-check -r $(E2E_REF_REQS) -r $(E2E_DATA_REQS)
 	@touch $(E2E_STAMP)
 
 verify-ref: $(E2E_STAMP)
