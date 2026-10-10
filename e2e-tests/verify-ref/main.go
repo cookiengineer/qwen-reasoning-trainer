@@ -1,13 +1,21 @@
-package e2e
+// Command verify-ref cross-checks the Go forward pass against an independent
+// NumPy implementation (ref_numpy.py) on a tiny model. It is an opt-in external
+// check, run as:
+//
+//	go run ./e2e-tests/verify-ref          # or: make verify-ref
+//
+// It exits non-zero on any mismatch. The interpreter defaults to python3; set
+// QWEN38_REF_PYTHON (e.g. e2e-tests/.venv/bin/python) to use the project venv.
+package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"testing"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
@@ -42,19 +50,21 @@ func tinyConfig() *qwen38.Config {
 	}
 }
 
-// TestReferenceNumpy cross-checks the Go forward pass against an independent
-// NumPy implementation. Only runs when QWEN38_VERIFY_REF=1.
-func TestReferenceNumpy(t *testing.T) {
-	if os.Getenv("QWEN38_VERIFY_REF") == "" {
-		t.Skip("set QWEN38_VERIFY_REF=1 to run the NumPy reference check")
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "verify-ref:", err)
+		os.Exit(1)
 	}
+}
+
+func run() error {
 	cfg := tinyConfig()
 	w := qwen38.NewRandom(cfg, 1234)
 	m := qwen38.NewModel(w)
 	tokens := []int32{1, 5, 2, 7, 3, 9}
 	res, err := m.Forward(tokens, qwen38.ForwardOptions{RecordHidden: true})
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 
 	doc := dumpDoc{Tokens: tokens, Tensors: map[string]dumpTensor{}, GoLogits: res.Logits.F32}
@@ -112,24 +122,29 @@ func TestReferenceNumpy(t *testing.T) {
 		dumpW(p+"ffn_down", lw.FfnDown)
 	}
 
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp("", "qwen38-ref-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
 	modelPath := filepath.Join(dir, "model.json")
 	f, err := os.Create(modelPath)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	if err := json.NewEncoder(f).Encode(doc); err != nil {
 		f.Close()
-		t.Fatal(err)
+		return err
 	}
 	f.Close()
 
-	cmd := exec.Command(refPython(), scriptPath(t, "ref_numpy.py"), modelPath)
-	out, err := cmd.CombinedOutput()
-	t.Logf("python: %s", out)
+	out, err := exec.Command(refPython(), scriptPath("ref_numpy.py"), modelPath).CombinedOutput()
+	fmt.Printf("python:\n%s\n", out)
 	if err != nil {
-		t.Fatalf("numpy reference failed: %v", err)
+		return fmt.Errorf("numpy reference failed: %w", err)
 	}
+	fmt.Println("verify-ref: OK (Go forward matches ref_numpy.py)")
+	return nil
 }
 
 // refPython returns the interpreter to use for the reference scripts.
@@ -140,9 +155,8 @@ func refPython() string {
 	return "python3"
 }
 
-// scriptPath resolves a reference script next to this test file.
-func scriptPath(t *testing.T, name string) string {
-	t.Helper()
+// scriptPath resolves a reference script next to this source file.
+func scriptPath(name string) string {
 	_, thisFile, _, _ := runtime.Caller(0)
 	return filepath.Join(filepath.Dir(thisFile), name)
 }

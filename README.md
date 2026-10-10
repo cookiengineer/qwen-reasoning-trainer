@@ -165,29 +165,35 @@ works on any machine:
 
 ### External verification checks
 
-Independent cross-checks live in the isolated [e2e-tests/](e2e-tests/)
-directory (Go drivers plus Python reference scripts). They are opt-in via
-environment variables and never run as part of `make check`:
+Independent cross-checks live under [e2e-tests/](e2e-tests/), one isolated `main`
+program per check. They shell out to reference implementations and are never run
+by `make check`:
 
 ```sh
 make verify-ref;    # NumPy forward pass vs the Go tiny model (~3e-8 match)
 make verify-data;   # Jinja2 render of the model chat template + Python `regex`
                     # evaluation of the qwen35 pre-tokenizer
+make verify-quants; # our block decoders + encoders vs llama.cpp's ggml-quants.c
+                    # (needs a C compiler)
 ```
 
-These checks use a project-local virtualenv at `e2e-tests/.venv`, created and
-populated on demand from [e2e-tests/requirements.txt](e2e-tests/requirements.txt)
-(`numpy`, `jinja2`, `regex`). The venv is gitignored.
+Each is also runnable directly, e.g. `go run ./e2e-tests/verify-ref`.
+
+The Python references use a project-local virtualenv at `e2e-tests/.venv`,
+created and populated on demand from
+[e2e-tests/requirements.txt](e2e-tests/requirements.txt) (`numpy`, `jinja2`,
+`regex`). The venv is gitignored.
 
 - `make e2e-venv` creates/populates the venv explicitly.
 - `SYSTEM_PYTHON=python3.x` selects the base interpreter used to build it.
 - `E2E_PYTHON=/path/to/python` runs the references against your own environment.
 
-The verification scripts can also be driven directly with the usual Go env vars:
+The programs can also be driven directly with `QWEN38_REF_PYTHON`:
 
 ```sh
-QWEN38_VERIFY_REF=1  QWEN38_REF_PYTHON=/path/to/python go test -run TestReferenceNumpy -v ./e2e-tests/...;
-QWEN38_VERIFY_DATA=1 QWEN38_REF_PYTHON=/path/to/python go test -run TestReferenceData  -v ./e2e-tests/...;
+QWEN38_REF_PYTHON=/path/to/python go run ./e2e-tests/verify-ref
+QWEN38_REF_PYTHON=/path/to/python go run ./e2e-tests/verify-data
+go run ./e2e-tests/verify-quants     # CC=... to pick a compiler
 ```
 
 The dataset reader is additionally checked against a fixture emitted by the

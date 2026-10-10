@@ -64,10 +64,10 @@ vet:
 	$(GO) vet ./...
 
 fmt:
-	gofmt -w cmd internal
+	gofmt -w cmd internal e2e-tests
 
 fmt-check:
-	@out="$$(gofmt -l cmd internal)"; \
+	@out="$$(gofmt -l cmd internal e2e-tests)"; \
 	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 
 tidy:
@@ -75,10 +75,11 @@ tidy:
 
 check: fmt-check vet test
 
-# External cross-checks live in ./e2e-tests and are opt-in via env vars. They
-# run against a project-local venv (E2E_VENV) with pinned deps, created on
-# demand. Override the interpreter with `make verify-data E2E_PYTHON=...` (then
-# create it yourself: e.g. a venv with numpy+jinja2+regex).
+# External cross-checks live in ./e2e-tests/<name> as standalone Go programs, one
+# per check, run with `go run`. They use a project-local venv (E2E_VENV) with
+# pinned deps, created on demand. Override the interpreter with
+# `make verify-data E2E_PYTHON=...` (then create it yourself: e.g. a venv with
+# numpy+jinja2+regex).
 e2e-venv: $(E2E_STAMP)
 
 $(E2E_STAMP): $(E2E_REQS)
@@ -89,15 +90,15 @@ $(E2E_STAMP): $(E2E_REQS)
 	@touch $(E2E_STAMP)
 
 verify-ref: $(E2E_STAMP)
-	QWEN38_VERIFY_REF=1 QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) test -run TestReferenceNumpy -v ./e2e-tests/...
+	QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) run ./e2e-tests/verify-ref
 
 verify-data: $(E2E_STAMP)
-	QWEN38_VERIFY_DATA=1 QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) test -run TestReferenceData -v ./e2e-tests/...
+	QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) run ./e2e-tests/verify-data
 
 # Diff our block decoders and encoders against a vendored copy of llama.cpp's
 # ggml-quants.c (needs a C compiler; self-contained).
 verify-quants:
-	QWEN38_VERIFY_QUANTS=1 $(GO) test -run 'TestReferenceQuant' -v ./e2e-tests/verify-quants/...
+	$(GO) run ./e2e-tests/verify-quants
 
 inspect: build
 	$(BIN) inspect
