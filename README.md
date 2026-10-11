@@ -44,14 +44,21 @@ opencode-reasoning-extractor ~/.local/share/opencode /my/own/reasoning-traces;
 # compile shaders, then build build/qwen-trainer
 make;
 
+# the command is always the first argument; flags (including --model) follow it
+
 # run the Qwen Trainer
-./build/qwen-trainer inspect;
-./build/qwen-trainer run --prompt "The capital of France is" --generate 8;
+./build/qwen-trainer inspect --model models/Qwen3.8-27B-UD-Q4_K_M.gguf;
+./build/qwen-trainer run --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --prompt "The capital of France is" --generate 8;
 
 # tokenize/validate the extractor output and report loss-mask statistics
-./build/qwen-trainer dataset \
-  --input /path/to/my/own/reasoning-traces/from/opencode;
+# --dataset is repeatable: pass it once per exported dataset directory
+./build/qwen-trainer dataset --model models/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --dataset /path/to/my/own/reasoning-traces/from/opencode;
 ```
+
+`--model` is required by every model command (`inspect`, `run`, `abliterate`,
+`search`, `evaluate`, `dataset`, `train`); `download`, `gpu-info`, and `status`
+do not need it. There is no implicit default model path anymore.
 
 The compute backend is chosen automatically: Vulkan is used when a device is
 present and it has enough device memory for the model, otherwise the CPU
@@ -68,18 +75,18 @@ MPOA), then optionally optimize the ablation hyperparameters.
 
 ```sh
 # 1. Ablate with the default parameters and write a full Q4_K_M GGUF.
-./build/qwen-trainer abliterate --out models/abliterated.gguf;
+./build/qwen-trainer abliterate --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --out models/abliterated.gguf;
 
 # 2. (optional) search direction index + per-component weight kernels and write
 #    the best trial. Trials persist to the study file and resume automatically.
-./build/qwen-trainer search \
+./build/qwen-trainer search --model models/Qwen3.8-27B-UD-Q4_K_M.gguf \
   --trials 25 \
   --sampler tpe \
   --study models/search.jsonl \
   --out models/search-best.gguf;
 
 # 3. Score the result: refusal-keyword rate and KL divergence from the base.
-./build/qwen-trainer --model models/abliterated.gguf evaluate \
+./build/qwen-trainer evaluate --model models/abliterated.gguf \
   --prompts prompts/harmful_behaviors_test.jsonl \
   --max-tokens 32;
 ```
@@ -129,15 +136,15 @@ required.
 
 ```sh
 # Refusal keyword rate (and KL divergence from a base with --base).
-./build/qwen-trainer --model models/abliterated.gguf evaluate \
+./build/qwen-trainer evaluate --model models/abliterated.gguf \
   --prompts prompts/harmful_behaviors_test.jsonl --max-tokens 32 \
   --base models/Qwen3.8-27B-UD-Q4_K_M.gguf;
 
 # Corpus perplexity over a text file, scored in windows of N tokens.
-./build/qwen-trainer evaluate --perplexity corpus.txt --window 512;
+./build/qwen-trainer evaluate --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --perplexity corpus.txt --window 512;
 
 # Multiple-choice accuracy over JSONL {context, choices, answer} records.
-./build/qwen-trainer evaluate --tasks tasks.jsonl --tasks-verbose;
+./build/qwen-trainer evaluate --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --tasks tasks.jsonl --tasks-verbose;
 ```
 
 Perplexity uses non-overlapping windows (default 512 tokens, `--window 0` for

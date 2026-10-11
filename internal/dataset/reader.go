@@ -12,9 +12,10 @@ import (
 	"sort"
 )
 
-// Dataset is an opened extractor output root.
+// Dataset is one or more opened extractor output roots. Sessions are read and
+// de-duplicated across every root.
 type Dataset struct {
-	root     string
+	roots    []string
 	Manifest Manifest
 
 	includeSubagents bool
@@ -34,27 +35,61 @@ func WithSubagents(include bool) Option {
 
 // Open reads manifest.json from root and validates the output layout.
 func Open(root string, opts ...Option) (*Dataset, error) {
+	return OpenAll([]string{root}, opts...)
+}
+
+// OpenAll reads and validates manifest.json from every root. Sessions are
+// de-duplicated across all roots. The run-level tool registry is the union of
+// each root's manifest tools (by name); the remaining manifest fields come from
+// the first root.
+func OpenAll(roots []string, opts ...Option) (*Dataset, error) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
-	raw, err := os.ReadFile(filepath.Join(root, "manifest.json"))
-	if err != nil {
-		return nil, fmt.Errorf("dataset: read manifest: %w", err)
+	if len(roots) == 0 {
+		return nil, fmt.Errorf("dataset: no roots given")
 	}
-	var m Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, fmt.Errorf("dataset: parse manifest: %w", err)
+	var merged Manifest
+	tools := map[string]bool{}
+	for i, root := range roots {
+		raw, err := os.ReadFile(filepath.Join(root, "manifest.json"))
+		if err != nil {
+			return nil, fmt.Errorf("dataset: read manifest: %w", err)
+		}
+		var m Manifest
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("dataset: parse manifest: %w", err)
+		}
+		if m.Version == "" {
+			return nil, fmt.Errorf("dataset: manifest has no version")
+		}
+		if i == 0 {
+			merged = m
+			merged.Tools = nil
+		}
+		for _, t := range m.Tools {
+			if tools[t.Name] {
+				continue
+			}
+			tools[t.Name] = true
+			merged.Tools = append(merged.Tools, t)
+		}
 	}
-	if m.Version == "" {
-		return nil, fmt.Errorf("dataset: manifest has no version")
-	}
-	d := &Dataset{root: root, Manifest: m, includeSubagents: o.includeSubagents}
+	d := &Dataset{roots: roots, Manifest: merged, includeSubagents: o.includeSubagents}
 	return d, nil
 }
 
-// Root returns the extractor output root.
-func (d *Dataset) Root() string { return d.root }
+// Root returns the first extractor output root.
+func (d *Dataset) Root() string {
+	if len(d.roots) == 0 {
+		return ""
+	}
+	return d.roots[0]
+}
+
+// Roots returns all extractor output roots in the order they were opened.
+func (d *Dataset) Roots() []string { return d.roots }
 
 // Sessions returns the deduplicated session records. Sessions that the
 // extractor wrote into multiple topic files are read once.
@@ -75,48 +110,56 @@ func (d *Dataset) Sessions() ([]SessionRecord, error) {
 // (strict/openai output).
 func (d *Dataset) WalkSessions(fn func(*SessionRecord) error) error {
 	seen := map[string]bool{}
-	for _, tree := range d.trees() {
-		topics, err := d.topics(tree)
-		if err != nil {
-			return err
-		}
-		for _, topic := range topics {
-			path := filepath.Join(d.root, tree, topic, "sessions.jsonl")
-			err := walkJSONL(path, func(raw json.RawMessage) error {
-				var rec SessionRecord
-				if err := json.Unmarshal(raw, &rec); err != nil {
-					return fmt.Errorf("dataset: %s: %w", path, err)
-				}
-				rec.Tree = tree
-				key := rec.ID
-				if key == "" {
-					key = hashMessages(rec.Messages)
-				}
-				if seen[key] {
-					return nil
-				}
-				seen[key] = true
-				return fn(&rec)
-			})
+	for _, root := range d.roots {
+		for _, tree := range d.trees() {
+			topics, err := d.topics(root, tree)
 			if err != nil {
 				return err
+			}
+			for _, topic := range topics {
+				path := filepath.Join(root, tree, topic, "sessions.jsonl")
+				err := walkJSONL(path, func(raw json.RawMessage) error {
+					var rec SessionRecord
+					if err := json.Unmarshal(raw, &rec); err != nil {
+						return fmt.Errorf("dataset: %s: %w", path, err)
+					}
+					rec.Tree = tree
+					key := rec.ID
+					if key == "" {
+						key = hashMessages(rec.Messages)
+					}
+					if seen[key] {
+						return nil
+					}
+					seen[key] = true
+					return fn(&rec)
+				})
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
 	return nil
 }
 
-// WalkRL calls fn once per reward metadata entry in rl/metadata.jsonl. A
-// missing file is not an error.
+// WalkRL calls fn once per reward metadata entry in rl/metadata.jsonl across
+// every root. A missing file is not an error.
 func (d *Dataset) WalkRL(fn func(*RLEntry) error) error {
-	path := filepath.Join(d.root, "rl", "metadata.jsonl")
-	return walkJSONL(path, func(raw json.RawMessage) error {
-		var e RLEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
-			return fmt.Errorf("dataset: %s: %w", path, err)
+	for _, root := range d.roots {
+		path := filepath.Join(root, "rl", "metadata.jsonl")
+		err := walkJSONL(path, func(raw json.RawMessage) error {
+			var e RLEntry
+			if err := json.Unmarshal(raw, &e); err != nil {
+				return fmt.Errorf("dataset: %s: %w", path, err)
+			}
+			return fn(&e)
+		})
+		if err != nil {
+			return err
 		}
-		return fn(&e)
-	})
+	}
+	return nil
 }
 
 func (d *Dataset) trees() []string {
@@ -127,8 +170,8 @@ func (d *Dataset) trees() []string {
 }
 
 // topics lists the topic subdirectories of a tree, sorted for determinism.
-func (d *Dataset) topics(tree string) ([]string, error) {
-	dir := filepath.Join(d.root, tree)
+func (d *Dataset) topics(root, tree string) ([]string, error) {
+	dir := filepath.Join(root, tree)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {

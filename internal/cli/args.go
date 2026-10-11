@@ -2,8 +2,10 @@
 package cli
 
 import (
+	"flag"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/hf"
 )
@@ -31,6 +33,17 @@ type Config struct {
 	Args []string
 }
 
+// stringList is a flag.Value that accumulates repeated flag occurrences, so a
+// flag can be supplied more than once (e.g. --dataset a --dataset b).
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 // DefaultModelFile is the default downloaded artifact.
 const DefaultModelFile = hf.DefaultFile
 
@@ -39,9 +52,11 @@ func DefaultModelPath(cwd string) string {
 	return filepath.Join(cwd, "models", DefaultModelFile)
 }
 
-// ParseArgs parses global flags up to the first non-flag argument (the
-// command). The remaining arguments are returned untouched for the command's
-// own flag parser.
+// ParseArgs parses the command line. The command must be the first argument
+// (argv[1]); every flag, including --model, follows it and is parsed by the
+// command's own flag set. This keeps the syntax uniform:
+//
+//	qwen-trainer <command> --model <path> [command flags]
 func ParseArgs(args []string, cwd string) (*Config, error) {
 	cfg := &Config{
 		ModelsDir: filepath.Join(cwd, "models"),
@@ -50,96 +65,50 @@ func ParseArgs(args []string, cwd string) (*Config, error) {
 		Repo:      hf.DefaultRepo,
 		File:      hf.DefaultFile,
 	}
-	modelExplicit := false
 
-	i := 0
-	for i < len(args) {
-		a := args[i]
-		if a == "" || a[0] != '-' {
-			break
-		}
-		name, value, hasValue := splitFlag(a)
-		switch name {
-		case "--model", "-model", "-m":
-			v, err := flagValue(args, &i, value, hasValue, name)
-			if err != nil {
-				return nil, err
-			}
-			cfg.Model = v
-			modelExplicit = true
-		case "--models-dir":
-			v, err := flagValue(args, &i, value, hasValue, name)
-			if err != nil {
-				return nil, err
-			}
-			cfg.ModelsDir = v
-		case "--log-level":
-			v, err := flagValue(args, &i, value, hasValue, name)
-			if err != nil {
-				return nil, err
-			}
-			cfg.LogLevel = v
-		case "--repo":
-			v, err := flagValue(args, &i, value, hasValue, name)
-			if err != nil {
-				return nil, err
-			}
-			cfg.Repo = v
-		case "--file":
-			v, err := flagValue(args, &i, value, hasValue, name)
-			if err != nil {
-				return nil, err
-			}
-			cfg.File = v
-		case "--status-file":
-			v, err := flagValue(args, &i, value, hasValue, name)
-			if err != nil {
-				return nil, err
-			}
-			cfg.StatusFile = v
-		case "--no-download":
-			cfg.Download = false
-		case "--download":
-			cfg.Download = true
-		case "-h", "--help", "-help":
-			cfg.Command = "help"
-			i++
-			cfg.Args = args[i:]
-			return cfg, nil
-		default:
-			return nil, fmt.Errorf("unknown flag %q", name)
-		}
-		i++
+	if len(args) == 0 {
+		return cfg, nil
 	}
-
-	if i < len(args) {
-		cfg.Command = args[i]
-		cfg.Args = args[i+1:]
+	switch args[0] {
+	case "-h", "--help", "-help":
+		cfg.Command = "help"
+		return cfg, nil
 	}
-
-	if cfg.Model == "" {
-		cfg.Model = filepath.Join(cfg.ModelsDir, cfg.File)
+	if strings.HasPrefix(args[0], "-") {
+		return nil, fmt.Errorf("the command must be the first argument (got flag %q); usage: qwen-trainer <command> [flags]", args[0])
 	}
-	_ = modelExplicit
+	cfg.Command = args[0]
+	cfg.Args = args[1:]
 	return cfg, nil
 }
 
-func splitFlag(a string) (name, value string, hasValue bool) {
-	for j := 0; j < len(a); j++ {
-		if a[j] == '=' {
-			return a[:j], a[j+1:], true
-		}
-	}
-	return a, "", false
+// RegisterCommonFlags adds the flags shared by the commands that operate on a
+// model. --model is required by those commands; call RequireModel after parsing
+// to enforce it. It is registered with an empty default (not the historical
+// default path) so a missing --model is an explicit error rather than a silent
+// download. -m is accepted as an alias.
+func (cfg *Config) RegisterCommonFlags(fs *flag.FlagSet) {
+	fs.StringVar(&cfg.Model, "model", "", "model GGUF path (required)")
+	fs.StringVar(&cfg.Model, "m", "", "alias for --model")
+	fs.StringVar(&cfg.ModelsDir, "models-dir", cfg.ModelsDir, "directory for downloaded models")
+	fs.StringVar(&cfg.Repo, "repo", cfg.Repo, "Hugging Face repo for a missing model")
+	fs.StringVar(&cfg.File, "file", cfg.File, "Hugging Face file for a missing model")
+	fs.StringVar(&cfg.StatusFile, "status-file", cfg.StatusFile, "progress status file")
+	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "quiet|info|debug")
+	fs.BoolFunc("no-download", "do not auto-download a missing model", func(string) error {
+		cfg.Download = false
+		return nil
+	})
+	fs.BoolFunc("download", "auto-download a missing model (default)", func(string) error {
+		cfg.Download = true
+		return nil
+	})
 }
 
-func flagValue(args []string, i *int, value string, hasValue bool, name string) (string, error) {
-	if hasValue {
-		return value, nil
+// RequireModel returns an error unless --model was supplied.
+func (cfg *Config) RequireModel() error {
+	if cfg.Model == "" {
+		return fmt.Errorf("--model <path> is required")
 	}
-	if *i+1 >= len(args) {
-		return "", fmt.Errorf("flag %s requires a value", name)
-	}
-	*i++
-	return args[*i], nil
+	return nil
 }

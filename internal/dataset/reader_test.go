@@ -104,6 +104,55 @@ func TestOpenMissingManifest(t *testing.T) {
 	}
 }
 
+func TestOpenAllAcrossRoots(t *testing.T) {
+	extractor := filepath.Join("testdata", "extractor")
+	writer := filepath.Join("testdata", "extractor-writer")
+
+	// The same root twice must not duplicate sessions, and the merged tool
+	// registry must not repeat entries.
+	dup, err := OpenAll([]string{extractor, extractor})
+	if err != nil {
+		t.Fatalf("OpenAll: %v", err)
+	}
+	sessions, err := dup.Sessions()
+	if err != nil {
+		t.Fatalf("Sessions: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("got %d sessions across duplicate roots, want 2", len(sessions))
+	}
+	if len(dup.Manifest.Tools) != 1 || dup.Manifest.Tools[0].Name != "bash" {
+		t.Fatalf("merged tools = %+v", dup.Manifest.Tools)
+	}
+	if len(dup.Roots()) != 2 || dup.Root() != extractor {
+		t.Fatalf("roots = %v, root = %q", dup.Roots(), dup.Root())
+	}
+
+	// Two distinct roots combine their sessions and union their tools.
+	both, err := OpenAll([]string{extractor, writer})
+	if err != nil {
+		t.Fatalf("OpenAll: %v", err)
+	}
+	sessions, err = both.Sessions()
+	if err != nil {
+		t.Fatalf("Sessions: %v", err)
+	}
+	if len(sessions) != 3 {
+		t.Fatalf("got %d sessions across two roots, want 3", len(sessions))
+	}
+	if len(both.Manifest.Tools) != 2 {
+		t.Fatalf("merged tools = %+v, want bash + read", both.Manifest.Tools)
+	}
+
+	// A single bad root makes the whole open fail.
+	if _, err := OpenAll([]string{extractor, t.TempDir()}); err == nil {
+		t.Fatal("expected error for a root with no manifest")
+	}
+	if _, err := OpenAll(nil); err == nil {
+		t.Fatal("expected error for no roots")
+	}
+}
+
 func TestSubagentsOptIn(t *testing.T) {
 	d, err := Open(filepath.Join("testdata", "extractor"))
 	if err != nil {

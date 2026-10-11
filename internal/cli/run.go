@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -30,7 +31,14 @@ import (
 const usage = `qwen-trainer - Qwen3.8-27B reasoning trainer
 
 Usage:
-  qwen-trainer [global flags] <command> [command flags]
+  qwen-trainer <command> [flags]
+
+The command is always the first argument; every flag (including --model)
+follows it, so the syntax is uniform:
+
+  qwen-trainer abliterate --model <path> [flags]
+  qwen-trainer train      --model <path> [flags]
+  qwen-trainer evaluate   --model <path> [flags]
 
 Commands:
   download   Download the model GGUF from Hugging Face
@@ -45,8 +53,8 @@ Commands:
   status     Show the progress of a running (or last) train/abliterate/search job
   help       Show this help
 
-Global flags:
-  --model <path>       Model GGUF path (default <cwd>/models/` + DefaultModelFile + `)
+Common flags (accepted by the model commands; --model is required):
+  --model <path>       Model GGUF path (required, also -m)
   --models-dir <dir>   Directory for downloaded models (default <cwd>/models)
   --repo <repo>        Hugging Face repo (default ` + hf.DefaultRepo + `)
   --file <file>        Hugging Face file (default ` + DefaultModelFile + `)
@@ -115,6 +123,15 @@ func newHFClient(cfg *Config, stderr io.Writer) *hf.Client {
 }
 
 func cmdDownload(cfg *Config, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("download", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfg.RegisterCommonFlags(fs)
+	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if cfg.Model == "" {
+		cfg.Model = filepath.Join(cfg.ModelsDir, cfg.File)
+	}
 	c := newHFClient(cfg, stderr)
 	ctx := context.Background()
 
@@ -143,6 +160,7 @@ func cmdDownload(cfg *Config, stdout, stderr io.Writer) int {
 func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("abliterate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	cfg.RegisterCommonFlags(fs)
 	goodFile := fs.String("good", DefaultGoodPrompts, "file with desirable prompts (text or JSONL)")
 	badFile := fs.String("bad", DefaultBadPrompts, "file with undesirable prompts (text or JSONL)")
 	out := fs.String("out", "", "output GGUF path")
@@ -159,6 +177,10 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	winsorize := fs.Float64("winsorize", 0, "winsorization quantile in [0,1) (0 = off)")
 	promptCol := fs.String("prompt-col", "", "JSONL prompt column (default: text)")
 	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if err := cfg.RequireModel(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
 	if *out == "" {
@@ -291,6 +313,7 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	cfg.RegisterCommonFlags(fs)
 	goodFile := fs.String("good", DefaultGoodPrompts, "desirable (residual) prompts, text or JSONL")
 	badFile := fs.String("bad", DefaultBadPrompts, "undesirable (residual) prompts, text or JSONL")
 	evalGood := fs.String("eval-good", "", "KL evaluation prompts (default: bundled test set)")
@@ -310,6 +333,10 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 	maxTokens := fs.Int("max-tokens", 32, "tokens generated per refusal prompt")
 	winsorize := fs.Float64("winsorize", 0, "winsorization quantile in [0,1) (0 = off)")
 	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if err := cfg.RequireModel(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
 	setFlags := map[string]bool{}
@@ -566,11 +593,16 @@ func encodePrompts(vocab *tokenizer.Vocab, system string, lines []string) [][]in
 func cmdRun(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	cfg.RegisterCommonFlags(fs)
 	tokenList := fs.String("tokens", "", "comma-separated prompt token ids")
 	prompt := fs.String("prompt", "", "text prompt (encoded with the model tokenizer)")
 	system := fs.String("system", "", "optional system message for --prompt")
 	gen := fs.Int("generate", 8, "number of tokens to generate")
 	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if err := cfg.RequireModel(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
 
@@ -695,6 +727,7 @@ func argmax(logits *compute.Tensor) int32 {
 func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("evaluate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	cfg.RegisterCommonFlags(fs)
 	promptsFile := fs.String("prompts", "", "file with one refusal prompt per line")
 	baseFile := fs.String("base", "", "optional base GGUF to compute KL divergence against")
 	system := fs.String("system", "You are a helpful assistant.", "system prompt")
@@ -706,6 +739,10 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 	tasksNormalize := fs.Bool("tasks-normalize", true, "length-normalize each choice score")
 	tasksVerbose := fs.Bool("tasks-verbose", false, "print per-item task scores")
 	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if err := cfg.RequireModel(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
 	if *promptsFile == "" && *pplFile == "" && *tasksFile == "" {
@@ -841,7 +878,9 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dataset", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	input := fs.String("input", "", "extractor output directory")
+	cfg.RegisterCommonFlags(fs)
+	var datasets stringList
+	fs.Var(&datasets, "dataset", "extractor output directory (repeatable)")
 	seqLen := fs.Int("seq-len", 0, "truncate sequences to N tokens (0 = no limit)")
 	minTarget := fs.Int("min-target", 1, "drop examples with fewer trainable tokens")
 	valRatio := fs.Float64("val-ratio", 0.02, "validation split ratio")
@@ -851,8 +890,12 @@ func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
-	if *input == "" {
-		fmt.Fprintln(stderr, "error: --input is required")
+	if err := cfg.RequireModel(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
+	if len(datasets) == 0 {
+		fmt.Fprintln(stderr, "error: --dataset is required")
 		return 2
 	}
 	if *valRatio < 0 || *valRatio >= 1 {
@@ -877,7 +920,7 @@ func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	d, err := dataset.Open(*input, dataset.WithSubagents(*subagents))
+	d, err := dataset.OpenAll(datasets, dataset.WithSubagents(*subagents))
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
@@ -901,7 +944,7 @@ func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
 	}
 	train, val := dataset.Split(exs, *valRatio)
 
-	fmt.Fprintf(stdout, "input:          %s\n", d.Root())
+	fmt.Fprintf(stdout, "datasets:       %s\n", strings.Join(d.Roots(), ", "))
 	fmt.Fprintf(stdout, "manifest:       version=%s strict=%v\n", d.Manifest.Version, d.Manifest.Strict)
 	fmt.Fprintf(stdout, "tokenizer:      pre=%s tools=%d\n", vocab.Pre, len(d.Manifest.Tools))
 	fmt.Fprintf(stdout, "sessions:       %d\n", len(recs))
@@ -918,7 +961,8 @@ func cmdDataset(cfg *Config, stdout, stderr io.Writer) int {
 func cmdStatus(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	file := fs.String("file", "", "status file (overrides the global --status-file)")
+	file := fs.String("file", "", "status file (overrides --status-file)")
+	fs.StringVar(&cfg.StatusFile, "status-file", cfg.StatusFile, "progress status file")
 	asJSON := fs.Bool("json", false, "print the raw status JSON")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
@@ -956,7 +1000,9 @@ func cmdStatus(cfg *Config, stdout, stderr io.Writer) int {
 func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("train", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	input := fs.String("input", "", "extractor output directory")
+	cfg.RegisterCommonFlags(fs)
+	var datasets stringList
+	fs.Var(&datasets, "dataset", "extractor output directory (repeatable)")
 	steps := fs.Int("steps", 50, "optimizer steps")
 	seqLen := fs.Int("seq-len", 512, "max sequence length (front truncation)")
 	lr := fs.Float64("lr", 1e-4, "peak learning rate")
@@ -979,8 +1025,12 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
-	if *input == "" && *evalCkpt == "" {
-		fmt.Fprintln(stderr, "error: --input is required")
+	if err := cfg.RequireModel(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
+	if len(datasets) == 0 && *evalCkpt == "" {
+		fmt.Fprintln(stderr, "error: --dataset is required")
 		return 2
 	}
 	if *rank <= 0 || *alpha <= 0 {
@@ -1024,7 +1074,7 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 		return runEvalCheckpoint(g, w, loCfg, *evalCkpt, *out, stdout, stderr)
 	}
 
-	d, err := dataset.Open(*input, dataset.WithSubagents(*subagents))
+	d, err := dataset.OpenAll(datasets, dataset.WithSubagents(*subagents))
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
@@ -1382,6 +1432,12 @@ func ratio(n, d int) float64 {
 }
 
 func cmdGPUInfo(cfg *Config, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gpu-info", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "quiet|info|debug")
+	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
 	b, err := vulkan.New()
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
@@ -1408,6 +1464,16 @@ func cmdGPUInfo(cfg *Config, stdout, stderr io.Writer) int {
 }
 
 func cmdInspect(cfg *Config, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfg.RegisterCommonFlags(fs)
+	if err := fs.Parse(cfg.Args); err != nil {
+		return 2
+	}
+	if err := cfg.RequireModel(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
 	path, err := resolveModel(cfg, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
