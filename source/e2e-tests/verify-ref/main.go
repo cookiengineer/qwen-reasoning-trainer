@@ -2,10 +2,10 @@
 // NumPy implementation (ref_numpy.py) on a tiny model. It is an opt-in external
 // check, run as:
 //
-//	go run ./e2e-tests/verify-ref          # or: make verify-ref
+//	go -C source run ./e2e-tests/verify-ref     # or: make verify-ref
 //
 // It exits non-zero on any mismatch. The interpreter defaults to python3; set
-// QWEN38_REF_PYTHON (e.g. e2e-tests/.venv/bin/python) to use the project venv.
+// QWEN38_REF_PYTHON (e.g. source/e2e-tests/.venv/bin/python) to use the project venv.
 package main
 
 import (

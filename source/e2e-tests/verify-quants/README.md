@@ -28,7 +28,7 @@ decode math in the Vulkan shaders against llama.cpp.
 ```sh
 make verify-quants
 # or
-go run ./e2e-tests/verify-quants
+go -C source run ./e2e-tests/verify-quants
 ```
 
 Requirements: a C compiler (`cc`, or `CC=...`). `QWEN38_LLAMA_SRC=/path/to/ggml`

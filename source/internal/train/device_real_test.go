@@ -26,7 +26,7 @@ func TestRealWeightFusedAB(t *testing.T) {
 	if path == "" {
 		for _, cand := range []string{
 			"models/Qwen3.8-27B-UD-Q4_K_M.gguf",
-			"../../models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+			"../../../models/Qwen3.8-27B-UD-Q4_K_M.gguf",
 		} {
 			if _, err := os.Stat(cand); err == nil {
 				path = cand
@@ -127,7 +127,7 @@ func TestRealAllWeightsFusedAB(t *testing.T) {
 	if path == "" {
 		for _, cand := range []string{
 			"models/Qwen3.8-27B-UD-Q4_K_M.gguf",
-			"../../models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+			"../../../models/Qwen3.8-27B-UD-Q4_K_M.gguf",
 		} {
 			if _, err := os.Stat(cand); err == nil {
 				path = cand
@@ -210,7 +210,7 @@ func TestRealForwardFusedParity(t *testing.T) {
 	if path == "" {
 		for _, cand := range []string{
 			"models/Qwen3.8-27B-UD-Q4_K_M.gguf",
-			"../../models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+			"../../../models/Qwen3.8-27B-UD-Q4_K_M.gguf",
 		} {
 			if _, err := os.Stat(cand); err == nil {
 				path = cand
@@ -372,10 +372,10 @@ func TestRealDeviceStep(t *testing.T) {
 	path := os.Getenv("QWEN38_MODEL")
 	if path == "" {
 		// `go test` runs with CWD at the package directory, so look from the
-		// repo root (../../) as well as the conventional models/ dir.
+		// repo root (../../../) as well as the conventional models/ dir.
 		for _, cand := range []string{
 			"models/Qwen3.8-27B-UD-Q4_K_M.gguf",
-			"../../models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+			"../../../models/Qwen3.8-27B-UD-Q4_K_M.gguf",
 		} {
 			if _, err := os.Stat(cand); err == nil {
 				path = cand

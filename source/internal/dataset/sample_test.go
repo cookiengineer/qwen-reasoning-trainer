@@ -14,8 +14,8 @@ import (
 // findModelPath returns a local GGUF path or "" if none is present.
 func findModelPath() string {
 	candidates := []string{
-		filepath.Join("..", "..", "models", "Qwen3.8-27B-UD-Q4_K_M.gguf"),
-		filepath.Join("..", "..", "models", "abliterated.gguf"),
+		filepath.Join("..", "..", "..", "models", "Qwen3.8-27B-UD-Q4_K_M.gguf"),
+		filepath.Join("..", "..", "..", "models", "abliterated.gguf"),
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {

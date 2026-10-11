@@ -6,7 +6,7 @@
 //
 // It is an opt-in external check, run as:
 //
-//	go run ./e2e-tests/verify-data          # or: make verify-data
+//	go -C source run ./e2e-tests/verify-data   # or: make verify-data
 //
 // It needs the target GGUF (for tokenizer.chat_template) and the Python modules
 // jinja2 + regex; the interpreter defaults to python3 (set QWEN38_REF_PYTHON to
@@ -346,8 +346,8 @@ func findModelPath() (string, error) {
 	return "", fmt.Errorf("no model present (looked in %v); the template reference needs the GGUF", candidates)
 }
 
-// repoRoot returns the repository root (the source file is at e2e-tests/verify-data).
+// repoRoot returns the repository root (the source file is at source/e2e-tests/verify-data).
 func repoRoot() string {
 	_, thisFile, _, _ := runtime.Caller(0)
-	return filepath.Join(filepath.Dir(thisFile), "..", "..")
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
 }

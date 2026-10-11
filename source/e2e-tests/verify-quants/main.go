@@ -8,7 +8,7 @@
 //
 // It is an opt-in external check, run as:
 //
-//	go run ./e2e-tests/verify-quants      # or: make verify-quants
+//	go -C source run ./e2e-tests/verify-quants  # or: make verify-quants
 //
 // It needs a C compiler (CC overrides the default cc). It is self-contained (no
 // references/ checkout); set QWEN38_LLAMA_SRC to compare against an external

@@ -10,7 +10,7 @@
 /references/
 
 # Local Python venv for the e2e references
-/e2e-tests/.venv/
+/source/e2e-tests/.venv/
 
 # Local scratch
 *.part

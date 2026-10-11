@@ -1,5 +1,7 @@
 # Qwen3.8-27B Reasoning Trainer
 #
+# The Go module lives under source/; all Go tooling runs there.
+#
 # Common targets:
 #   make            build the CLI (compiles shaders first)
 #   make shaders    compile GLSL compute shaders to embedded SPIR-V
@@ -7,7 +9,7 @@
 #   make check      fmt-check + vet + test
 #   make verify-ref run the NumPy forward-pass reference check
 #   make verify-data run the template + pre-tokenizer reference checks
-#   make e2e-venv   create e2e-tests/.venv with the reference dependencies
+#   make e2e-venv   create source/e2e-tests/.venv with the reference dependencies
 #   make clean      remove build artifacts and compiled shaders
 
 GO        ?= go
@@ -16,12 +18,15 @@ SPIRV_VAL ?= spirv-val
 # Interpreter used to create the e2e venv (override for a specific python3.x).
 SYSTEM_PYTHON ?= python3
 
+# Go module root. `go -C $(SRC)` runs the toolchain there.
+SRC     := source
 BIN_DIR := build
 BIN     := $(BIN_DIR)/qwen-trainer
-CMD     := ./cmd/qwen-trainer
+# Command path relative to $(SRC).
+CMD     := ./cmds/qwen-trainer
 
-SHADER_DIR := shaders
-SPIRV_DIR  := internal/compute/vulkan/spirv
+SHADER_DIR := $(SRC)/shaders
+SPIRV_DIR  := $(SRC)/internal/compute/vulkan/spirv
 SHADER_SRC := $(wildcard $(SHADER_DIR)/*.comp)
 SHADER_SPV := $(patsubst $(SHADER_DIR)/%.comp,$(SPIRV_DIR)/%.spv,$(SHADER_SRC))
 # Shared GLSL includes (decode helpers, GEMM bodies); any change rebuilds all.
@@ -31,9 +36,9 @@ GLSL_FLAGS  := --target-env=vulkan1.1 -O -I $(SHADER_DIR)
 SPIRV_FLAGS := --target-env vulkan1.1
 
 # Local Python environment for the opt-in external references. Each check keeps
-# its own requirements.txt under e2e-tests/<name>/; both are installed into one
-# shared venv (redundancy is fine).
-E2E_DIR       := e2e-tests
+# its own requirements.txt under source/e2e-tests/<name>/; both are installed
+# into one shared venv (redundancy is fine).
+E2E_DIR       := $(SRC)/e2e-tests
 E2E_REF_REQS  := $(E2E_DIR)/verify-ref/requirements.txt
 E2E_DATA_REQS := $(E2E_DIR)/verify-data/requirements.txt
 E2E_VENV      := $(E2E_DIR)/.venv
@@ -49,7 +54,7 @@ all: build
 # Build the CLI. The .spv files are embedded via go:embed, so shaders must be
 # present before compiling.
 build: shaders
-	$(GO) build -o $(BIN) $(CMD)
+	$(GO) -C $(SRC) build -o $(CURDIR)/$(BIN) $(CMD)
 
 # Compile and validate each GLSL shader to SPIR-V.
 $(SPIRV_DIR)/%.spv: $(SHADER_DIR)/%.comp $(SHADER_INC)
@@ -61,26 +66,26 @@ $(SPIRV_DIR)/%.spv: $(SHADER_DIR)/%.comp $(SHADER_INC)
 shaders: $(SHADER_SPV)
 
 test: shaders
-	$(GO) test ./...
+	$(GO) -C $(SRC) test ./...
 
 vet:
-	$(GO) vet ./...
+	$(GO) -C $(SRC) vet ./...
 
 fmt:
-	gofmt -w cmd internal e2e-tests
+	gofmt -w $(SRC)
 
 fmt-check:
-	@out="$$(gofmt -l cmd internal e2e-tests)"; \
+	@out="$$(gofmt -l $(SRC) | grep -v '^$(SRC)/e2e-tests/\.venv/')"; \
 	if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 
 tidy:
-	$(GO) mod tidy
+	$(GO) -C $(SRC) mod tidy
 
 check: fmt-check vet test
 
-# External cross-checks live in ./e2e-tests/<name> as standalone Go programs, one
-# per check, run with `go run`. They use a project-local venv (E2E_VENV) with
-# pinned deps, created on demand. Override the interpreter with
+# External cross-checks live in ./source/e2e-tests/<name> as standalone Go
+# programs, one per check, run with `go run`. They use a project-local venv
+# (E2E_VENV) with pinned deps, created on demand. Override the interpreter with
 # `make verify-data E2E_PYTHON=...` (then create it yourself: e.g. a venv with
 # numpy+jinja2+regex).
 e2e-venv: $(E2E_STAMP)
@@ -93,15 +98,15 @@ $(E2E_STAMP): $(E2E_REF_REQS) $(E2E_DATA_REQS)
 	@touch $(E2E_STAMP)
 
 verify-ref: $(E2E_STAMP)
-	QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) run ./e2e-tests/verify-ref
+	QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) -C $(SRC) run ./e2e-tests/verify-ref
 
 verify-data: $(E2E_STAMP)
-	QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) run ./e2e-tests/verify-data
+	QWEN38_REF_PYTHON=$(E2E_PYTHON) $(GO) -C $(SRC) run ./e2e-tests/verify-data
 
 # Diff our block decoders and encoders against a vendored copy of llama.cpp's
 # ggml-quants.c (needs a C compiler; self-contained).
 verify-quants:
-	$(GO) run ./e2e-tests/verify-quants
+	$(GO) -C $(SRC) run ./e2e-tests/verify-quants
 
 inspect: build
 	$(BIN) inspect

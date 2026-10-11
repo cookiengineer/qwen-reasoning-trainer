@@ -87,17 +87,18 @@ MPOA), then optionally optimize the ablation hyperparameters.
 
 # 3. Score the result: refusal-keyword rate and KL divergence from the base.
 ./build/qwen-trainer evaluate --model models/abliterated.gguf \
-  --prompts prompts/harmful_behaviors_test.jsonl \
+  --prompts source/prompts/harmful_behaviors_test.jsonl \
   --max-tokens 32;
 ```
 
 ### Prompt sets and limits
 
-`prompts/` bundles the same datasets Heretic uses, pre-converted to JSON Lines
-(one `{"text": "..."}` object per line), so no download is needed. `abliterate`
-and `search` use them by default; override with `--good`/`--bad`
-(`--eval-good`/`--eval-bad` for `search`). Files may be plain text (one prompt
-per line) or JSONL (`--prompt-col` selects the column, default `text`).
+`source/prompts/` bundles the same datasets Heretic uses, pre-converted to JSON
+Lines (one `{"text": "..."}` object per line). They are compiled into the binary
+with `go:embed`, so `abliterate` and `search` use them by default with no path
+needed; override with `--good`/`--bad` (`--eval-good`/`--eval-bad` for `search`).
+Files may be plain text (one prompt per line) or JSONL (`--prompt-col` selects
+the column, default `text`).
 
 | File | Rows | Role (default) |
 | --- | --- | --- |
@@ -137,7 +138,7 @@ required.
 ```sh
 # Refusal keyword rate (and KL divergence from a base with --base).
 ./build/qwen-trainer evaluate --model models/abliterated.gguf \
-  --prompts prompts/harmful_behaviors_test.jsonl --max-tokens 32 \
+  --prompts source/prompts/harmful_behaviors_test.jsonl --max-tokens 32 \
   --base models/Qwen3.8-27B-UD-Q4_K_M.gguf;
 
 # Corpus perplexity over a text file, scored in windows of N tokens.
@@ -172,9 +173,9 @@ works on any machine:
 
 ### External verification checks
 
-Independent cross-checks live under [e2e-tests/](e2e-tests/), one isolated `main`
-program per check. They shell out to reference implementations and are never run
-by `make check`:
+Independent cross-checks live under [source/e2e-tests/](source/e2e-tests/), one
+isolated `main` program per check. They shell out to reference implementations
+and are never run by `make check`:
 
 ```sh
 make verify-ref;    # NumPy forward pass vs the Go tiny model (~3e-8 match)
@@ -184,12 +185,13 @@ make verify-quants; # our block decoders + encoders vs llama.cpp's ggml-quants.c
                     # (needs a C compiler)
 ```
 
-Each is also runnable directly, e.g. `go run ./e2e-tests/verify-ref`.
+Each is also runnable directly, e.g. `go -C source run ./e2e-tests/verify-ref`.
 
-The Python references use a project-local virtualenv at `e2e-tests/.venv`,
+The Python references use a project-local virtualenv at `source/e2e-tests/.venv`,
 created and populated on demand from each check's own `requirements.txt`
-(`e2e-tests/verify-ref/requirements.txt`, `e2e-tests/verify-data/requirements.txt`
-— `numpy`, `jinja2`, `regex`). The venv is gitignored.
+(`source/e2e-tests/verify-ref/requirements.txt`,
+`source/e2e-tests/verify-data/requirements.txt` — `numpy`, `jinja2`, `regex`).
+The venv is gitignored.
 
 - `make e2e-venv` creates/populates the venv explicitly.
 - `SYSTEM_PYTHON=python3.x` selects the base interpreter used to build it.
@@ -198,14 +200,14 @@ created and populated on demand from each check's own `requirements.txt`
 The programs can also be driven directly with `QWEN38_REF_PYTHON`:
 
 ```sh
-QWEN38_REF_PYTHON=/path/to/python go run ./e2e-tests/verify-ref
-QWEN38_REF_PYTHON=/path/to/python go run ./e2e-tests/verify-data
-go run ./e2e-tests/verify-quants     # CC=... to pick a compiler
+QWEN38_REF_PYTHON=/path/to/python go -C source run ./e2e-tests/verify-ref
+QWEN38_REF_PYTHON=/path/to/python go -C source run ./e2e-tests/verify-data
+go -C source run ./e2e-tests/verify-quants     # CC=... to pick a compiler
 ```
 
 The dataset reader is additionally checked against a fixture emitted by the
 `opencode-reasoning-extractor`'s own writer
-(`internal/dataset/testdata/extractor-writer/`).
+(`source/internal/dataset/testdata/extractor-writer/`).
 
 ## License
 

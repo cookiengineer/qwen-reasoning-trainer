@@ -13,8 +13,8 @@ import (
 // model-free.
 func TestFromGGUFRealModel(t *testing.T) {
 	candidates := []string{
-		filepath.Join("..", "..", "models", "Qwen3.8-27B-UD-Q4_K_M.gguf"),
-		filepath.Join("..", "..", "models", "abliterated.gguf"),
+		filepath.Join("..", "..", "..", "models", "Qwen3.8-27B-UD-Q4_K_M.gguf"),
+		filepath.Join("..", "..", "..", "models", "abliterated.gguf"),
 	}
 	var path string
 	for _, c := range candidates {

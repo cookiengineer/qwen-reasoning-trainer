@@ -109,16 +109,28 @@ func TestBundledHereticPrompts(t *testing.T) {
 }
 
 func TestLoadPrompts(t *testing.T) {
-	if _, err := loadPrompts(filepath.Join(t.TempDir(), "missing.jsonl"), "", 0); err == nil {
+	if _, err := loadPrompts(filepath.Join(t.TempDir(), "missing.jsonl"), BundledGoodPrompts, "", 0); err == nil {
 		t.Fatal("expected error for missing file")
 	}
 	ok := writeTemp(t, "p.txt", "a\nb\n")
-	rows, err := loadPrompts(ok, "", 0)
+	rows, err := loadPrompts(ok, BundledGoodPrompts, "", 0)
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("loadPrompts = %v, %v", rows, err)
 	}
 	empty := writeTemp(t, "e.txt", "\n# comment\n")
-	if _, err := loadPrompts(empty, "", 0); err == nil {
+	if _, err := loadPrompts(empty, BundledGoodPrompts, "", 0); err == nil {
 		t.Fatal("expected error for empty file")
+	}
+}
+
+// TestLoadBundledPrompts checks that the embedded prompt sets load without a
+// working directory or any files on disk.
+func TestLoadBundledPrompts(t *testing.T) {
+	rows, err := loadPrompts("", BundledBadPrompts, "", 0)
+	if err != nil {
+		t.Fatalf("loadPrompts(bundled) = %v", err)
+	}
+	if len(rows) != 416 {
+		t.Fatalf("loadPrompts(bundled) = %d rows, want 416", len(rows))
 	}
 }
