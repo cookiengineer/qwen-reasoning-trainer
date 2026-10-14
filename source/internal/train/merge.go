@@ -1,27 +1,32 @@
 package train
 
 import (
+	"fmt"
+
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/gguf"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
 
-// mergeItem is one adapter together with the frozen base weight it updates.
+// mergeItem is one adapter together with the name of the frozen base weight it
+// updates.
 type mergeItem struct {
 	name string
 	l    *LoRA
-	w    *qwen38.Weight
 }
 
 // mergeSource implements qwen38.OverrideSource. It merges each adapter into its
-// base weight lazily, so a full-model rewrite only holds one merged tensor in
-// memory at a time (rather than all of them).
+// base weight lazily, reading the frozen base bytes from the source GGUF on
+// demand, so a full-model rewrite only holds one base tensor and one merged
+// tensor in memory at a time (rather than all of them, or a full host copy of
+// the model).
 type mergeSource struct {
+	base  *gguf.File
 	items map[string]mergeItem
 }
 
-func newMergeSource(items []mergeItem) *mergeSource {
-	m := &mergeSource{items: make(map[string]mergeItem, len(items))}
+func newMergeSource(base *gguf.File, items []mergeItem) *mergeSource {
+	m := &mergeSource{base: base, items: make(map[string]mergeItem, len(items))}
 	for _, it := range items {
 		m.items[it.name] = it
 	}
@@ -49,10 +54,24 @@ func (s *mergeSource) OverrideMeta(name string, dims []uint64, baseType quant.Ty
 	return typ, size, true
 }
 
-// OverrideBytes materializes the merged, requantized tensor.
+// OverrideBytes materializes the merged, requantized tensor. The frozen base
+// bytes are read from the source GGUF file so the caller need not keep a host
+// copy of every base weight resident.
 func (s *mergeSource) OverrideBytes(name string) ([]byte, error) {
 	it := s.items[name]
-	_, raw, err := it.l.MergeToQuant(it.w.Typ, it.w.Raw, it.w.Dims)
+	ti, ok := s.base.Tensor(name)
+	if !ok {
+		return nil, fmt.Errorf("train: base tensor %q not found in source GGUF", name)
+	}
+	baseRaw, err := s.base.ReadTensor(ti)
+	if err != nil {
+		return nil, err
+	}
+	dims := make([]int, len(ti.Dims))
+	for i, d := range ti.Dims {
+		dims[i] = int(d)
+	}
+	_, raw, err := it.l.MergeToQuant(ti.Type, baseRaw, dims)
 	return raw, err
 }
 
@@ -76,9 +95,15 @@ func (m *QwenModel) Overrides() (map[string]qwen38.Override, error) {
 // WriteMerged streams a copy of the base GGUF to outPath with all adapters
 // merged and requantized, materializing one tensor at a time.
 func (m *QwenModel) WriteMerged(base *gguf.File, outPath string) error {
+	return m.WriteMergedProgress(base, outPath, nil)
+}
+
+// WriteMergedProgress is WriteMerged with an optional per-tensor progress
+// callback.
+func (m *QwenModel) WriteMergedProgress(base *gguf.File, outPath string, progress func(done, total int)) error {
 	items := make([]mergeItem, 0, len(m.entries))
 	for _, e := range m.entries {
-		items = append(items, mergeItem{name: e.name, l: e.l, w: e.w})
+		items = append(items, mergeItem{name: e.name, l: e.l})
 	}
-	return qwen38.RewriteGGUFStream(base, newMergeSource(items), outPath)
+	return qwen38.RewriteGGUFStreamProgress(base, newMergeSource(base, items), outPath, progress)
 }

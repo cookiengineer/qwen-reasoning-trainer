@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"os"
 
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/fsutil"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
 
@@ -20,19 +20,29 @@ type WriteTensor struct {
 
 // WriteFile serializes a GGUF v3 file to path. The metadata order is preserved.
 // Tensor offsets are assigned automatically with the file alignment.
+//
+// WriteFile materializes the entire file in memory (via Encode) and is intended
+// for tests and small models only. Large models must use WriteStreamToFile,
+// which streams tensor data from disk. The write itself is atomic: it goes to a
+// temp file, is fsynced, and is renamed into place.
 func WriteFile(path string, kvs []KV, tensors []WriteTensor) error {
 	buf, err := Encode(kvs, tensors)
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
+	aw, err := fsutil.Create(path)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if _, err := aw.Write(buf); err != nil {
+		aw.Abort()
+		return err
+	}
+	return aw.Commit()
 }
 
-// Encode serializes a GGUF v3 file into memory.
+// Encode serializes a GGUF v3 file into memory. Large models must not use this;
+// see WriteFile and WriteStreamToFile. It remains for tests and in-memory tools.
 func Encode(kvs []KV, tensors []WriteTensor) ([]byte, error) {
 	alignment := DefaultAlignment
 	for _, kv := range kvs {

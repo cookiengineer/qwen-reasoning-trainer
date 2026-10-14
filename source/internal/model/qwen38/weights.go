@@ -175,6 +175,33 @@ func LoadFromGGUF(g *gguf.File, mc *modelcfg.Config) (*Weights, error) {
 	return w, nil
 }
 
+// FreeRaw releases the on-disk byte slices held by every large matrix weight.
+// It is used by the device training path once the weights have been uploaded to
+// the compute device and the host copy is no longer needed: the final merge
+// reads the frozen base bytes back from the GGUF file. Weight headers
+// (Typ/Dims) remain valid; Raw becomes nil and must not be used afterwards.
+//
+// Norms, biases and the SSM conv vector are small host values that stay put.
+func (w *Weights) FreeRaw() {
+	free := func(p **Weight) {
+		if p != nil && *p != nil {
+			(*p).Raw = nil
+		}
+	}
+	free(&w.TokenEmbd)
+	free(&w.Output)
+	for i := range w.Layers {
+		lw := &w.Layers[i]
+		for _, p := range []**Weight{
+			&lw.AttnQ, &lw.AttnK, &lw.AttnV, &lw.AttnOutput,
+			&lw.AttnQKV, &lw.AttnGate, &lw.SSMOut, &lw.SSMAlpha, &lw.SSMBeta,
+			&lw.FfnGate, &lw.FfnUp, &lw.FfnDown,
+		} {
+			free(p)
+		}
+	}
+}
+
 // NewRandom builds a small randomly-initialized model for tests and
 // validation. Weights are normal with standard deviation 0.02.
 func NewRandom(cfg *Config, seed int64) *Weights {

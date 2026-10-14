@@ -362,17 +362,24 @@ func (m *DeviceModel) Overrides() (map[string]qwen38.Override, error) {
 }
 
 // WriteMerged streams a copy of the base GGUF to outPath with all adapters
-// merged and requantized, materializing one tensor at a time.
+// merged and requantized. The frozen base bytes are read from base on demand,
+// so the host copy of the model need not stay resident during the merge.
 func (m *DeviceModel) WriteMerged(base *gguf.File, outPath string) error {
+	return m.WriteMergedProgress(base, outPath, nil)
+}
+
+// WriteMergedProgress is WriteMerged with an optional per-tensor progress
+// callback.
+func (m *DeviceModel) WriteMergedProgress(base *gguf.File, outPath string, progress func(done, total int)) error {
 	if err := m.SyncAdapters(); err != nil {
 		return err
 	}
 	lins := m.AdapterLins()
 	items := make([]mergeItem, 0, len(lins))
 	for _, l := range lins {
-		items = append(items, mergeItem{name: l.name, l: l.lora, w: l.w})
+		items = append(items, mergeItem{name: l.name, l: l.lora})
 	}
-	return qwen38.RewriteGGUFStream(base, newMergeSource(items), outPath)
+	return qwen38.RewriteGGUFStreamProgress(base, newMergeSource(base, items), outPath, progress)
 }
 
 // release frees the activation buffers retained by a checkpointed forward.

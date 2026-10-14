@@ -33,6 +33,33 @@ MODELS_BASE="$MODELS/Qwen3.8-27B-UD-Q4_K_M.gguf"
 MODELS_ABLATED="$MODELS/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf"
 MODELS_TRAINED="$MODELS/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf"
 
+# --- helpers ----------------------------------------------------------------
+# require_file fails fast when an expected artifact is missing. This matters
+# because `qwen-trainer inspect` auto-downloads a missing model, which would
+# silently fetch the base GGUF under the trained model's name.
+require_file() {
+	local path="$1" what="$2"
+	if [[ ! -s "$path" ]]; then
+		echo "error: $what not found: $path" >&2
+		echo "       (did the previous pipeline step fail?)" >&2
+		exit 1
+	fi
+}
+
+# clean_stale removes temp/partial files left by an interrupted run. The
+# trainer now writes to .tmp and renames atomically, so any surviving .tmp is
+# from an older run and is safe to drop.
+clean_stale() {
+	local dir="$1"
+	shopt -s nullglob
+	local leftovers=("$dir"/*.tmp)
+	shopt -u nullglob
+	if (( ${#leftovers[@]} > 0 )); then
+		echo "removing ${#leftovers[@]} stale .tmp file(s) in $dir" >&2
+		rm -f -- "${leftovers[@]}"
+	fi
+}
+
 # --- 0. build the trainer ---------------------------------------------------
 # Compiles the shaders and builds build/qwen-trainer (needs glslc/spirv-val).
 make -C "$REPO_ROOT";
@@ -61,6 +88,8 @@ mkdir -p "$(dirname "$EXTRACTOR")";
 # QLoRA (r=16/alpha=32) on the frozen quantized base, fully device-resident on
 # the Vulkan GPU. The run is resumable: re-running resumes from --resume, and
 # the merged GGUF is only written after the final step.
+clean_stale "$MODELS"
+
 "$TRAINER" train \
 	--model "$MODELS_ABLATED" \
 	--device \
@@ -80,9 +109,14 @@ mkdir -p "$(dirname "$EXTRACTOR")";
 
 # --- 5. verify the tensor type histogram is unchanged -----------------------
 # `inspect` prints the per-type tensor histogram; a type-preserving merge must
-# leave it identical to the downloaded base.
-"$TRAINER" inspect --model "$MODELS_BASE"    | sed -n '/^Tensors/,$p' > /tmp/qwen-histogram-base.txt
-"$TRAINER" inspect --model "$MODELS_TRAINED" | sed -n '/^Tensors/,$p' > /tmp/qwen-histogram-trained.txt
+# leave it identical to the downloaded base. --no-download is mandatory here:
+# without it, inspect would auto-download the base GGUF under the trained
+# model's name when the merge is missing, masking the failure.
+require_file "$MODELS_BASE" "base model"
+require_file "$MODELS_TRAINED" "trained model"
+
+"$TRAINER" inspect --no-download --model "$MODELS_BASE"    | sed -n '/^Tensors/,$p' > /tmp/qwen-histogram-base.txt
+"$TRAINER" inspect --no-download --model "$MODELS_TRAINED" | sed -n '/^Tensors/,$p' > /tmp/qwen-histogram-trained.txt
 
 if diff -u /tmp/qwen-histogram-base.txt /tmp/qwen-histogram-trained.txt; then
   echo "OK: tensor type histogram is unchanged. Training successful!"

@@ -75,6 +75,12 @@ type OverrideSource interface {
 // and streaming everything else unchanged. Unlike RewriteGGUF it materializes
 // each replacement on demand rather than holding them all in memory.
 func RewriteGGUFStream(base *gguf.File, src OverrideSource, outPath string) error {
+	return RewriteGGUFStreamProgress(base, src, outPath, nil)
+}
+
+// RewriteGGUFStreamProgress is RewriteGGUFStream with an optional per-tensor
+// progress callback (done goes from 1 to the number of tensors).
+func RewriteGGUFStreamProgress(base *gguf.File, src OverrideSource, outPath string, progress func(done, total int)) error {
 	tensors := make([]gguf.StreamTensor, 0, len(base.Tensors))
 	for _, ti := range base.Tensors {
 		ti := ti
@@ -105,7 +111,7 @@ func RewriteGGUFStream(base *gguf.File, src OverrideSource, outPath string) erro
 			Write: func(w io.Writer) error { return base.CopyTensor(ti, w) },
 		})
 	}
-	return gguf.WriteStreamToFile(outPath, base.KVs, tensors)
+	return gguf.WriteStreamToFileProgress(outPath, base.KVs, tensors, progress)
 }
 
 // RewriteGGUF writes a copy of base to outPath, replacing the tensors listed in

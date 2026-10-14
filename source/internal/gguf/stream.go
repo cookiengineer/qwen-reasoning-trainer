@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
 
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/fsutil"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
 
@@ -20,26 +20,34 @@ type StreamTensor struct {
 }
 
 // WriteStream writes a GGUF v3 file to path without buffering all tensor data.
+// The data is written to a temp file, fsynced, and atomically renamed into
+// place, so an interrupted or OOM-killed run never leaves a half-written file
+// at path.
 func WriteStreamToFile(path string, kvs []KV, tensors []StreamTensor) error {
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	return WriteStreamToFileProgress(path, kvs, tensors, nil)
+}
+
+// WriteStreamToFileProgress is WriteStreamToFile with an optional progress
+// callback invoked after each tensor is written (done goes from 1 to total).
+func WriteStreamToFileProgress(path string, kvs []KV, tensors []StreamTensor, progress func(done, total int)) error {
+	aw, err := fsutil.Create(path)
 	if err != nil {
 		return err
 	}
-	if err := WriteStream(f, kvs, tensors); err != nil {
-		f.Close()
-		os.Remove(tmp)
+	if err := writeStream(aw, kvs, tensors, progress); err != nil {
+		aw.Abort()
 		return err
 	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return aw.Commit()
 }
 
 // WriteStream serializes a GGUF v3 file to w, calling each tensor's Write
 // callback to emit its data.
 func WriteStream(w io.Writer, kvs []KV, tensors []StreamTensor) error {
+	return writeStream(w, kvs, tensors, nil)
+}
+
+func writeStream(w io.Writer, kvs []KV, tensors []StreamTensor, progress func(done, total int)) error {
 	alignment := DefaultAlignment
 	for _, kv := range kvs {
 		if kv.Key == "general.alignment" {
@@ -110,6 +118,9 @@ func WriteStream(w io.Writer, kvs []KV, tensors []StreamTensor) error {
 			return fmt.Errorf("gguf: tensor %q wrote %d bytes, expected %d", t.Name, cw.n, t.Size)
 		}
 		written += uint64(cw.n)
+		if progress != nil {
+			progress(i+1, len(tensors))
+		}
 	}
 	return nil
 }

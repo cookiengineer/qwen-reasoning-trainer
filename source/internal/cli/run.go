@@ -9,6 +9,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -1030,6 +1032,9 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error: --rank and --alpha must be positive")
 		return 2
 	}
+	if lim := applyMemoryLimit(); lim > 0 && cfg.LogLevel != "quiet" {
+		fmt.Fprintf(stderr, "go memory limit: %s (override with GOMEMLIMIT)\n", humanBytes(lim))
+	}
 
 	path, err := resolveModel(cfg, stderr)
 	if err != nil {
@@ -1231,6 +1236,16 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
+	// The device model owns device copies of every frozen weight; the host
+	// copies are only needed for the final merge, which re-reads them from the
+	// GGUF. Release them now so the long run does not carry the whole model in
+	// host RAM on top of the device buffers and optimizer state.
+	w.FreeRaw()
+	runtime.GC()
+	debug.FreeOSMemory()
+	if cfg.LogLevel != "quiet" {
+		logMemory(stderr, "device model resident")
+	}
 	dm.Checkpoint = o.checkpoint
 	opt, err := train.NewDeviceAdamW(be, train.DefaultAdamW(float32(o.lr)), dm.AdapterLins())
 	if err != nil {
@@ -1308,6 +1323,7 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 				st.CheckpointDone++
 				if cfg.LogLevel != "quiet" {
 					fmt.Fprintf(stderr, "checkpoint saved at step %d\n", step+1)
+					logMemory(stderr, fmt.Sprintf("checkpoint step %d", step+1))
 				}
 			}
 		}
@@ -1365,11 +1381,16 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 		}
 	}
 	if o.resume != "" {
+		// Reclaim the Go heap before the final streaming writes so their peak
+		// does not stack on top of a heap the 1000-step run already grew.
+		runtime.GC()
+		debug.FreeOSMemory()
 		if err := dm.SaveDeviceState(o.resume, opt); err != nil {
 			fmt.Fprintln(stderr, "error: final checkpoint save:", err)
 			return 1
 		}
 		fmt.Fprintf(stdout, "checkpoint: %s\n", o.resume)
+		logMemory(stderr, "after final checkpoint")
 	}
 	if o.adapterOut != "" {
 		if err := dm.SyncAdapters(); err != nil {
@@ -1384,11 +1405,32 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 	}
 	if o.out != "" {
 		fmt.Fprintf(stderr, "merging %d adapters into %s...\n", len(dm.AdapterLins()), o.out)
+		runtime.GC()
+		debug.FreeOSMemory()
+		logMemory(stderr, "before merge")
 		t0 := time.Now()
-		if err := dm.WriteMerged(g, o.out); err != nil {
+		total := len(g.Tensors)
+		st.Phase = "merging"
+		st.Unit = "tensor"
+		st.Done = 0
+		st.Total = total
+		st.Message = "writing merged GGUF"
+		sw.Save()
+		progress := func(done, total int) {
+			if done%10 == 0 || done == total {
+				st.Done = done
+				st.Message = fmt.Sprintf("merging tensors %d/%d", done, total)
+				sw.Save()
+			}
+			if cfg.LogLevel != "quiet" && (done%100 == 0 || done == total) {
+				fmt.Fprintf(stderr, "merging tensors %d/%d\n", done, total)
+			}
+		}
+		if err := dm.WriteMergedProgress(g, o.out, progress); err != nil {
 			fmt.Fprintln(stderr, "error:", err)
 			return 1
 		}
+		logMemory(stderr, "after merge")
 		fmt.Fprintf(stdout, "wrote merged model: %s (%s)\n", o.out, time.Since(t0).Round(time.Second))
 	}
 	sw.Finish("done")

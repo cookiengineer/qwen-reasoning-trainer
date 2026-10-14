@@ -100,6 +100,30 @@ func (o *DeviceAdamW) Snapshot() ([]*compute.Tensor, error) {
 	return out, nil
 }
 
+// ForEachMoment downloads each adapter's AdamW moments in AdapterLins order as
+// [mA, vA, mB, vB] per adapter, passing each to fn and releasing it before the
+// next download. The streaming counterpart to Snapshot keeps peak host memory
+// bounded by the largest single moment rather than the whole optimizer state.
+func (o *DeviceAdamW) ForEachMoment(fn func(*compute.Tensor) error) error {
+	for _, l := range o.order {
+		mom := o.m[l]
+		if mom == nil {
+			return fmt.Errorf("train: missing optimizer moments for adapter")
+		}
+		for _, buf := range []compute.Buffer{mom.mA, mom.vA, mom.mB, mom.vB} {
+			t, err := o.be.Download(buf)
+			if err != nil {
+				return err
+			}
+			if err := fn(t); err != nil {
+				return err
+			}
+			t.F32 = nil
+		}
+	}
+	return nil
+}
+
 // Restore loads AdamW moments and the step counter from a checkpoint, copying
 // in place so the existing moment buffers are reused.
 func (o *DeviceAdamW) Restore(step int, moments []*compute.Tensor) error {
