@@ -78,6 +78,15 @@ func (m *Model) forwardDevice(tokens []int32, opts ForwardOptions) (*ForwardResu
 		if oldX != nil {
 			be.Free(oldX)
 		}
+		// Long prefill layers can keep the GPU busy long enough for the
+		// driver's watchdog to soft-recover the context. Submit each layer
+		// separately; decode (T == 1) stays fully batched.
+		if T > 1 {
+			if err := be.Sync(); err != nil {
+				be.Free(x)
+				return nil, fmt.Errorf("qwen38: layer %d sync: %w", il, err)
+			}
+		}
 	}
 
 	be.BeginScope()

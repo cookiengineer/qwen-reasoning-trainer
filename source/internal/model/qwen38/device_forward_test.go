@@ -134,6 +134,64 @@ func TestDeviceForwardChunkedPrefillMatchesHost(t *testing.T) {
 	}
 }
 
+// TestDeviceForwardChunkedPrefillLastTokenOnly checks the server's prefill
+// shortcut: intermediate chunks compute only the last token's logits while
+// still appending every token to the KV/state.
+func TestDeviceForwardChunkedPrefillLastTokenOnly(t *testing.T) {
+	be, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer be.Close()
+
+	cfg := deviceForwardConfig()
+	w := NewRandom(cfg, 890)
+	host := NewModel(w)
+	device := NewModel(w)
+	device.Backend = be
+	if err := device.EnableDeviceForward(); err != nil {
+		t.Fatal(err)
+	}
+	defer device.FreeDevice()
+
+	tokens := []int32{3, 1, 4, 1, 5, 9}
+	want, err := host.Forward(tokens, ForwardOptions{State: NewState(cfg), LastTokenOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	devState, err := NewStateWithOptions(cfg, StateOptions{
+		Backend: be, KVType: quant.TypeQ8_0, Capacity: len(tokens), DeviceForward: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devState.Free()
+
+	var got *ForwardResult
+	for start := 0; start < len(tokens); start += 2 {
+		end := start + 2
+		if end > len(tokens) {
+			end = len(tokens)
+		}
+		pos := make([]int32, end-start)
+		for i := range pos {
+			pos[i] = int32(start + i)
+		}
+		got, err = device.Forward(tokens[start:end], ForwardOptions{
+			State: devState, Positions: pos, LastTokenOnly: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for j := range want.Logits.F32 {
+		tol := float32(3e-1 + 3e-1*math.Abs(float64(want.Logits.F32[j])))
+		if d := float32(math.Abs(float64(got.Logits.F32[j] - want.Logits.F32[j]))); d > tol {
+			t.Fatalf("logit %d: device %v host %v (diff %v)", j, got.Logits.F32[j], want.Logits.F32[j], d)
+		}
+	}
+}
+
 func TestDeviceForwardChunkedPrefillAttentionOnly(t *testing.T) {
 	be, err := vulkan.New()
 	if err != nil {
