@@ -281,9 +281,10 @@ No cgo. `vulkan.go` loads `libvulkan.so.1` with `purego.Dlopen`, resolves
 - Attention: `attention` (one workgroup per (head, query), 64 lanes,
   online-softmax over 1024-key tiles), `attention_naive` (fallback for
   `headDim > 256`; non-square `nQ != nKV` falls back to the host oracle),
-  packed Q4_K/Q8_0 cached-attention kernels, `attention_flash_q4k`
-  (half2 tiles, register accumulators, vector Q4_K word unpack),
-  `attention_decode_gqa_q4k` (six query heads per KV-head split),
+  packed Q4_K/Q8_0 cached-attention kernels,
+  `attention_flash_{q4k,q8_0}` (half2 tiles, register accumulators, vector
+  quantized word unpack), `attention_decode_gqa_{q4k,q8_0}` (six query heads
+  per KV-head split),
   `attention_cached_{q4k,q8_0}_split`/`attention_cached_reduce`,
   `attn_back_dq_tile`/`attn_back_dkv_tile` (+ `attn_back_dq`/`attn_back_dkv`).
 - Recurrent: `ssm_conv(_back_sx/_back_c)`, `gated_delta_net`, `gdn_back`
