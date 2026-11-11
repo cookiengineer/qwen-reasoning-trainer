@@ -588,6 +588,12 @@ type Backend struct {
 	noFusedFwd bool
 	noFusedT   bool
 
+	// flashAttention selects the tiled shared-memory cached-attention kernel
+	// for prefill instead of the blocked per-key kernel. It is enabled by
+	// default for headDim 256; SetFlashAttention(false) selects the block
+	// fallback.
+	flashAttention bool
+
 	// noPool disables buffer recycling (every Free destroys the buffer). Tests
 	// only.
 	noPool bool
@@ -716,7 +722,7 @@ func New() (*Backend, error) {
 	}
 	v.loadAll(instance)
 
-	b := &Backend{vk: v, lib: lib, instance: instance, pipelines: map[string]uintptr{}}
+	b := &Backend{vk: v, lib: lib, instance: instance, pipelines: map[string]uintptr{}, flashAttention: true}
 
 	var devCount uint32
 	if res := vkCall(v.EnumeratePhysicalDevices, instance, uintptr(unsafe.Pointer(&devCount)), 0); res != vkSuccess {

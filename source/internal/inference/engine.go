@@ -6,6 +6,7 @@ package inference
 import (
 	"fmt"
 	"io"
+	"os"
 	"sync"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
@@ -104,6 +105,11 @@ func Load(opt LoadOptions) (*Engine, error) {
 	}
 	m := qwen38.NewModel(w)
 	m.Backend = be
+	if os.Getenv("QWEN38_BLOCK_ATTENTION") == "1" {
+		if vb, ok := be.(*vulkan.Backend); ok {
+			vb.SetFlashAttention(false)
+		}
+	}
 
 	mb := modelBytes(g)
 	ctx := mc.ContextLength

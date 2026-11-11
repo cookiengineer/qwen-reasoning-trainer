@@ -72,6 +72,11 @@ func (b *Backend) Run(fn func() error) error {
 	return fn()
 }
 
+// SetFlashAttention selects the experimental tiled FlashAttention prefill
+// kernel. It is disabled by default because the blocked kernel is faster on the
+// current target GPU.
+func (b *Backend) SetFlashAttention(enabled bool) { b.flashAttention = enabled }
+
 func (b *Backend) newF32Buffer(dims ...int) (*buffer, error) {
 	n := 1
 	for _, d := range dims {
@@ -1401,18 +1406,20 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 	if hd > 256 {
 		return nil, fmt.Errorf("vulkan: cached attention headDim %d > 256", hd)
 	}
-	var shader string
+	var shader, flashShader string
 	switch kb.typ {
 	case quant.TypeQ4_K:
 		if hd%256 != 0 {
 			return nil, fmt.Errorf("vulkan: q4_K cached attention requires headDim %% 256, got %d", hd)
 		}
 		shader = "attention_cached_q4k"
+		flashShader = "attention_flash_q4k"
 	case quant.TypeQ8_0:
 		if hd%32 != 0 {
 			return nil, fmt.Errorf("vulkan: q8_0 cached attention requires headDim %% 32, got %d", hd)
 		}
 		shader = "attention_cached_q8_0"
+		flashShader = "attention_flash_q8_0"
 	default:
 		return nil, fmt.Errorf("vulkan: no cached attention shader for %s", kb.typ)
 	}
@@ -1424,19 +1431,24 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 	const maxPerDispatch = 65535
 	total := nHead * nQ
 
-	// Prefill uses the blocked shader: one workgroup handles several queries
-	// per head and dequantizes each K/V element once for the whole block.
-	const blockQueries = 16
+	// Prefill uses tiled FlashAttention: one workgroup handles a block of
+	// queries, stages K/V tiles in shared memory, and keeps the online softmax
+	// state in shared registers.
+	const flashQueries = 16
 	if nQ > 4 {
-		blocks := (nQ + blockQueries - 1) / blockQueries
+		blocks := (nQ + flashQueries - 1) / flashQueries
 		if blocks <= maxPerDispatch && nHead <= maxPerDispatch {
+			selected := shader + "_block"
+			if b.flashAttention && hd == 256 {
+				selected = flashShader
+			}
 			out, err := b.newF32Buffer(qb.dims...)
 			if err != nil {
 				return nil, err
 			}
 			p := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
 				uint32(nKV), uint32(capacity), qStart, scale)
-			if err := b.dispatch(shader+"_block", []*buffer{qb, kb, vb, out}, p,
+			if err := b.dispatch(selected, []*buffer{qb, kb, vb, out}, p,
 				[3]uint32{uint32(blocks), uint32(nHead), 1}); err != nil {
 				b.Free(out)
 				return nil, err

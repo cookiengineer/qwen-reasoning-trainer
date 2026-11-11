@@ -1,6 +1,7 @@
 package qwen38
 
 import (
+	"fmt"
 	"math"
 	"testing"
 
@@ -221,42 +222,46 @@ func TestDeviceForwardBlockAttentionMatchesHost(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, typ := range []quant.Type{quant.TypeQ4_K, quant.TypeQ8_0} {
-		typ := typ
-		t.Run(typ.String(), func(t *testing.T) {
-			devState, err := NewStateWithOptions(cfg, StateOptions{
-				Backend: be, KVType: typ, Capacity: len(tokens), DeviceForward: true,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer devState.Free()
-
-			const chunk = 16
-			var got *ForwardResult
-			for start := 0; start < len(tokens); start += chunk {
-				end := start + chunk
-				if end > len(tokens) {
-					end = len(tokens)
-				}
-				pos := make([]int32, end-start)
-				for i := range pos {
-					pos[i] = int32(start + i)
-				}
-				got, err = device.Forward(tokens[start:end], ForwardOptions{
-					State: devState, Positions: pos, LastTokenOnly: true,
+	for _, flash := range []bool{false, true} {
+		flash := flash
+		be.SetFlashAttention(flash)
+		for _, typ := range []quant.Type{quant.TypeQ4_K, quant.TypeQ8_0} {
+			typ := typ
+			t.Run(fmt.Sprintf("flash=%v/%s", flash, typ), func(t *testing.T) {
+				devState, err := NewStateWithOptions(cfg, StateOptions{
+					Backend: be, KVType: typ, Capacity: len(tokens), DeviceForward: true,
 				})
 				if err != nil {
 					t.Fatal(err)
 				}
-			}
-			for j := range want.Logits.F32 {
-				tol := float32(3e-1 + 3e-1*math.Abs(float64(want.Logits.F32[j])))
-				if d := float32(math.Abs(float64(got.Logits.F32[j] - want.Logits.F32[j]))); d > tol {
-					t.Fatalf("logit %d: device %v host %v (diff %v)", j, got.Logits.F32[j], want.Logits.F32[j], d)
+				defer devState.Free()
+
+				const chunk = 16
+				var got *ForwardResult
+				for start := 0; start < len(tokens); start += chunk {
+					end := start + chunk
+					if end > len(tokens) {
+						end = len(tokens)
+					}
+					pos := make([]int32, end-start)
+					for i := range pos {
+						pos[i] = int32(start + i)
+					}
+					got, err = device.Forward(tokens[start:end], ForwardOptions{
+						State: devState, Positions: pos, LastTokenOnly: true,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
 				}
-			}
-		})
+				for j := range want.Logits.F32 {
+					tol := float32(3e-1 + 3e-1*math.Abs(float64(want.Logits.F32[j])))
+					if d := float32(math.Abs(float64(got.Logits.F32[j] - want.Logits.F32[j]))); d > tol {
+						t.Fatalf("logit %d: device %v host %v (diff %v)", j, got.Logits.F32[j], want.Logits.F32[j], d)
+					}
+				}
+			})
+		}
 	}
 }
 
