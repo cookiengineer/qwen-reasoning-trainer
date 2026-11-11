@@ -261,7 +261,12 @@ No cgo. `vulkan.go` loads `libvulkan.so.1` with `purego.Dlopen`, resolves
   lazily and cached.
 - **Batching**: `dispatch`/`copyRows` **record** into a single command buffer;
   `flush` (from `Download`/`Sync`) submits and waits once. Buffers freed while
-  recording are deferred and destroyed after the flush.
+  recording are deferred and destroyed after the flush. The free-buffer pool
+  scales with device memory (1-4 GiB); after warmup, steady-state decode does
+  no `vkCreateBuffer`/`vkAllocateMemory` calls.
+- **Profiling**: `QWEN38_PROFILE=1` writes a timestamp before/after every
+  dispatch and accumulates per-shader GPU time (`Stats.ShaderTicks`), plus
+  per-shader dispatch counts. `gpu-info` reports the timestamp tick period.
 - **Weights**: `UploadWeight` stores raw quantized bytes (padded to 4 bytes).
   `MatMulWeight` single-token decode (`m == 1`) uses a **fused
   dequantize+GEMV** shader; otherwise the fused quantized weight GEMMs
@@ -275,7 +280,8 @@ No cgo. `vulkan.go` loads `libvulkan.so.1` with `purego.Dlopen`, resolves
   `conv_input(_back)`, `gather_heads(_back)`, `repeat_heads(_back)`.
 - Linear algebra: `matmul` (64x64 tile, 4x4 register micro-tile), `matmul_t`
   (`dX = W^T dY`), `matmul_wg` (`dW = x dOut^T`), fused quantized
-  `matmul_wq_<type>`/`matmul_t_wq_<type>`, `rms_norm(_back)`, `silu_back`,
+  `matmul_wq_<type>`/`matmul_t_wq_<type>`, `rms_norm` (row-parallel),
+  `rms_norm_add` (residual+norm), `rms_norm_back`, `silu_back`,
   `softmax`/`soft_max_back`, `cross_entropy`, `l2_norm(_back)`, `rope`,
   `get_rows`, `sum_squares`.
 - Attention: `attention` (one workgroup per (head, query), 64 lanes,
@@ -288,7 +294,8 @@ No cgo. `vulkan.go` loads `libvulkan.so.1` with `purego.Dlopen`, resolves
   `attention_cached_{q4k,q8_0}_split`/`attention_cached_reduce` (adaptive split
   count targeting ~256 workgroups),
   `attn_back_dq_tile`/`attn_back_dkv_tile` (+ `attn_back_dq`/`attn_back_dkv`).
-- Recurrent: `ssm_conv(_back_sx/_back_c)`, `gated_delta_net`, `gdn_back`
+- Recurrent: `ssm_conv(_back_sx/_back_c)`, `gated_delta_net` (supports GQA q/k
+  broadcast through the extra `qkh` push constant), `gdn_back`
   (atomic fallback, needs `VK_EXT_shader_atomic_float`), and the chunked
   `gdn_chunk_{cumsum,ab,fwd,bwd,bwd_local}`.
 - Dequantize/GEMV: `dequant_<type>`, `gemv_<type>` for all nine model types.

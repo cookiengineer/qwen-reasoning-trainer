@@ -28,6 +28,7 @@ layout(push_constant) uniform P {
     uint  gstride;
     float scale;
     uint  kda;
+    uint  qkh;
 } p;
 
 float row[MAX_SV];
@@ -44,6 +45,8 @@ void main() {
         row[i] = state[rbase + i];
     }
     for (uint t = 0u; t < p.nTok; t++) {
+        uint qh = hh % p.qkh;
+        uint qbase = (t * p.qkh + qh) * p.sv;
         uint base = (t * p.h + hh) * p.sv;
         uint gOff = (t * p.h + hh) * p.gstride;
         float b = beta[t * p.h + hh];
@@ -59,17 +62,17 @@ void main() {
         }
         float kv = 0.0;
         for (uint i = 0u; i < p.sv; i++) {
-            kv += row[i] * k[base + i];
+            kv += row[i] * k[qbase + i];
         }
         float delta = (v[base + j] - kv) * b;
         for (uint i = 0u; i < p.sv; i++) {
-            row[i] += k[base + i] * delta;
+            row[i] += k[qbase + i] * delta;
         }
         float acc = 0.0;
         for (uint i = 0u; i < p.sv; i++) {
-            acc += row[i] * q[base + i];
+            acc += row[i] * q[qbase + i];
         }
-        outv[(t * p.h + hh) * p.sv + j] = acc * p.scale;
+        outv[base + j] = acc * p.scale;
     }
     for (uint i = 0u; i < p.sv; i++) {
         nstate[rbase + i] = row[i];

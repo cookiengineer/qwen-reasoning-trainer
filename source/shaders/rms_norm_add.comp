@@ -1,0 +1,54 @@
+#version 450
+
+// Fused residual add + RMSNorm. One 128-lane workgroup handles one row. Writes
+// both the residual sum (for the next layer) and the normalized value.
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly  buffer A { float a[]; };
+layout(binding = 1) readonly  buffer R { float r[]; };
+layout(binding = 2) readonly  buffer W { float w[]; };
+layout(binding = 3) writeonly buffer S { float s[]; };
+layout(binding = 4) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint  rowLen;
+    uint  rows;
+    float eps;
+    uint  hasW;
+} p;
+
+#define LS 128
+shared float red[LS];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= p.rows) {
+        return;
+    }
+    uint lane = gl_LocalInvocationID.x;
+    uint base = row * p.rowLen;
+    float ss = 0.0;
+    for (uint i = lane; i < p.rowLen; i += LS) {
+        float v = a[base + i] + r[base + i];
+        ss += v * v;
+    }
+    red[lane] = ss;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] += red[lane + s];
+        }
+        barrier();
+    }
+    float inv = 1.0 / sqrt(red[0] / float(p.rowLen) + p.eps);
+    for (uint i = lane; i < p.rowLen; i += LS) {
+        float sum = a[base + i] + r[base + i];
+        s[base + i] = sum;
+        float v = sum * inv;
+        if (p.hasW == 1u) {
+            v *= w[i];
+        }
+        y[base + i] = v;
+    }
+}

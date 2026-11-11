@@ -132,10 +132,17 @@ func TestRealDecodeBench(t *testing.T) {
 		"submits":               stats.Submits,
 		"bytes_uploaded":        stats.BytesUploaded,
 		"bytes_downloaded":      stats.BytesDownloaded,
+		"allocs":                stats.Allocs,
+		"pool_hits":             stats.PoolHits,
+		"pooled_bytes":          stats.PooledBytes,
 		"device_bytes":          stats.DeviceBytes,
 		"peak_device_bytes":     stats.PeakDeviceBytes,
 		"host_rss_high_water":   rssHighWaterBytes(t),
 		"kv_type":               kvTypeName(engine.KVCacheType()),
+		"top_dispatches":        topCounts(stats.ShaderDispatches, 12),
+		"top_shader_ns":         topCounts(stats.ShaderTicks, 12),
+		"cpu_record_ns":         stats.CPURecordNs,
+		"total_shader_ns":       totalCounts(stats.ShaderTicks),
 	}
 	logReal(t, "decode_bench", fields)
 	t.Logf("context=%d prefill=%d decode=%.2f tok/s step=%.1fms (%.1f..%.1f) dispatches=%d submits=%d",

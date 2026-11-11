@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -72,6 +73,9 @@ const (
 	vkStructureCommandBufferAi        = 40
 	vkStructureCommandBufferBeginInfo = 42
 	vkStructureMemoryBarrier          = 46
+	vkStructureQueryPoolCreateInfo    = 11
+
+	vkQueryTypeTimestamp = 2
 
 	// Vulkan 1.1 / extension struct type tags.
 	vkStructurePhysicalDeviceFeatures2                    = 1000059000
@@ -399,6 +403,15 @@ type fenceCreateInfo struct {
 	flags uint32
 }
 
+type queryPoolCreateInfo struct {
+	sType              uint32
+	pNext              uintptr
+	flags              uint32
+	queryType          uint32
+	queryCount         uint32
+	pipelineStatistics uint32
+}
+
 // vk holds resolved Vulkan entry points.
 type vk struct {
 	getInstanceProcAddr uintptr
@@ -438,6 +451,11 @@ type vk struct {
 	CmdDispatch                        uintptr
 	CmdPipelineBarrier                 uintptr
 	CmdCopyBuffer                      uintptr
+	CmdResetQueryPool                  uintptr
+	CmdWriteTimestamp                  uintptr
+	CreateQueryPool                    uintptr
+	DestroyQueryPool                   uintptr
+	GetQueryPoolResults                uintptr
 	EndCommandBuffer                   uintptr
 	QueueSubmit                        uintptr
 	QueueWaitIdle                      uintptr
@@ -498,6 +516,11 @@ func (v *vk) loadAll(instance uintptr) {
 		&v.CmdDispatch:                        "vkCmdDispatch",
 		&v.CmdPipelineBarrier:                 "vkCmdPipelineBarrier",
 		&v.CmdCopyBuffer:                      "vkCmdCopyBuffer",
+		&v.CmdResetQueryPool:                  "vkCmdResetQueryPool",
+		&v.CmdWriteTimestamp:                  "vkCmdWriteTimestamp",
+		&v.CreateQueryPool:                    "vkCreateQueryPool",
+		&v.DestroyQueryPool:                   "vkDestroyQueryPool",
+		&v.GetQueryPoolResults:                "vkGetQueryPoolResults",
 		&v.EndCommandBuffer:                   "vkEndCommandBuffer",
 		&v.QueueSubmit:                        "vkQueueSubmit",
 		&v.QueueWaitIdle:                      "vkQueueWaitIdle",
@@ -611,10 +634,11 @@ type Backend struct {
 	// pool recycles device buffers by (size, usage, hostOnly) so a resident
 	// graph does not pay vkCreateBuffer/vkAllocateMemory per op. poolBytes is
 	// bounded by poolCap.
-	pool        map[poolKey][]*buffer
-	poolBytes   uint64
-	deviceBytes uint64
-	peakBytes   uint64
+	pool         map[poolKey][]*buffer
+	poolBytes    uint64
+	poolCapBytes uint64
+	deviceBytes  uint64
+	peakBytes    uint64
 
 	// scope bounds the lifetime of temporary buffers. Buffers allocated while
 	// a scope is active are logged; EndScope frees the log tail except the
@@ -622,6 +646,14 @@ type Backend struct {
 	scopeActive int
 	scopeMarks  []int
 	scopeLog    []*buffer
+
+	// Optional per-dispatch GPU timing. QWEN38_PROFILE=1 enables a timestamp
+	// query around every dispatch; results are accumulated per shader name at
+	// flush. RADV reports a timestamp period of 1 ns on the target GPU.
+	profile    bool
+	queryPool  uintptr
+	queryCount uint32
+	queryNames []string
 
 	stats Stats
 }
@@ -638,6 +670,24 @@ type Stats struct {
 	PooledBytes     uint64
 	DeviceBytes     uint64
 	PeakDeviceBytes uint64
+	// Per-shader dispatch counts and optional GPU timestamp totals (ns).
+	ShaderDispatches map[string]uint64
+	ShaderTicks      map[string]uint64
+	// CPURecordNs is the host time spent recording dispatches when profiling.
+	CPURecordNs uint64
+}
+
+const profileQueryCapacity = 16384
+
+func cloneCounts(src map[string]uint64) map[string]uint64 {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]uint64, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 type poolKey struct {
@@ -646,8 +696,9 @@ type poolKey struct {
 	staging bool
 }
 
-// poolCap bounds the bytes retained by the buffer pool.
-const poolCap = 1 << 30
+// defaultPoolCap bounds the bytes retained by the buffer pool when the device
+// size is unknown; New scales it with device memory.
+const defaultPoolCap = 1 << 30
 
 type buffer struct {
 	b      *Backend
@@ -722,7 +773,11 @@ func New() (*Backend, error) {
 	}
 	v.loadAll(instance)
 
-	b := &Backend{vk: v, lib: lib, instance: instance, pipelines: map[string]uintptr{}, flashAttention: true}
+	b := &Backend{
+		vk: v, lib: lib, instance: instance, pipelines: map[string]uintptr{},
+		flashAttention: true, profile: os.Getenv("QWEN38_PROFILE") == "1",
+		stats: Stats{ShaderDispatches: map[string]uint64{}, ShaderTicks: map[string]uint64{}},
+	}
 
 	var devCount uint32
 	if res := vkCall(v.EnumeratePhysicalDevices, instance, uintptr(unsafe.Pointer(&devCount)), 0); res != vkSuccess {
@@ -838,16 +893,45 @@ func New() (*Backend, error) {
 		return nil, fmt.Errorf("vulkan: create fence failed")
 	}
 
+	if b.profile {
+		qpci := queryPoolCreateInfo{
+			sType:      vkStructureQueryPoolCreateInfo,
+			queryType:  vkQueryTypeTimestamp,
+			queryCount: profileQueryCapacity,
+		}
+		if res := vkCall(v.CreateQueryPool, device, uintptr(unsafe.Pointer(&qpci)), 0, uintptr(unsafe.Pointer(&b.queryPool))); res != vkSuccess {
+			b.profile = false
+			b.queryPool = 0
+		}
+	}
+
 	if err := b.setupDescriptors(); err != nil {
 		b.Close()
 		return nil, err
 	}
 
+	var chosenProps physicalDeviceProperties
+	vkCall(v.GetPhysicalDeviceProperties, b.physicalDevice, uintptr(unsafe.Pointer(&chosenProps)))
+	// timestampPeriod lives in VkPhysicalDeviceLimits, 428 bytes into the
+	// limits area that follows pipelineCacheUUID on 64-bit builds.
+	var timestampPeriod float32 = 1
+	if len(chosenProps.rest) >= 432 {
+		timestampPeriod = math.Float32frombits(binary.LittleEndian.Uint32(chosenProps.rest[428:432]))
+	}
+	memBytes := b.deviceMemorySize()
+	b.poolCapBytes = memBytes / 8
+	if b.poolCapBytes < defaultPoolCap {
+		b.poolCapBytes = defaultPoolCap
+	}
+	if b.poolCapBytes > 4<<30 {
+		b.poolCapBytes = 4 << 30
+	}
 	b.caps = compute.Capabilities{
-		Name:           "vulkan(" + name + ")",
-		Float32Atomics: enableAtomics,
-		MaxBufferSize:  math.MaxUint32,
-		MemoryBytes:    b.deviceMemorySize(),
+		Name:            "vulkan(" + name + ")",
+		Float32Atomics:  enableAtomics,
+		MaxBufferSize:   math.MaxUint32,
+		MemoryBytes:     memBytes,
+		TimestampPeriod: timestampPeriod,
 	}
 
 	d, err := b.allocBuffer(16, vkBufferUsageStorage|vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
@@ -1206,7 +1290,7 @@ func (b *Backend) poolPut(buf *buffer) bool {
 	if b.noPool {
 		return false
 	}
-	if b.poolBytes+buf.size > poolCap {
+	if b.poolBytes+buf.size > b.poolCapBytes {
 		return false
 	}
 	if b.pool == nil {
@@ -1226,6 +1310,8 @@ func (b *Backend) Stats() Stats {
 	s.PooledBytes = b.poolBytes
 	s.DeviceBytes = b.deviceBytes
 	s.PeakDeviceBytes = b.peakBytes
+	s.ShaderDispatches = cloneCounts(b.stats.ShaderDispatches)
+	s.ShaderTicks = cloneCounts(b.stats.ShaderTicks)
 	return s
 }
 
@@ -1234,8 +1320,13 @@ func (b *Backend) Stats() Stats {
 func (b *Backend) ResetStats() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.stats = Stats{}
+	b.stats = Stats{
+		ShaderDispatches: map[string]uint64{},
+		ShaderTicks:      map[string]uint64{},
+	}
 	b.peakBytes = b.deviceBytes
+	b.queryNames = b.queryNames[:0]
+	b.queryCount = 0
 }
 
 func (b *Backend) memoryType(bits, flags uint32) (uint32, bool) {
@@ -1358,6 +1449,7 @@ func (b *Backend) flush() error {
 			}
 		}
 	}
+	b.collectProfile()
 	for _, x := range b.pending {
 		b.destroyBuffer(x)
 	}
@@ -1365,9 +1457,48 @@ func (b *Backend) flush() error {
 	return ferr
 }
 
+// collectProfile reads the timestamps recorded for the last batch and folds
+// them into per-shader totals. Timestamp ticks are nanoseconds on RADV.
+func (b *Backend) collectProfile() {
+	if !b.profile || b.queryPool == 0 || b.queryCount == 0 {
+		b.queryNames = b.queryNames[:0]
+		b.queryCount = 0
+		return
+	}
+	data := make([]uint64, b.queryCount)
+	res := vkCall(b.vk.GetQueryPoolResults, b.device, b.queryPool, 0,
+		uintptr(b.queryCount), uintptr(len(data)*8), uintptr(unsafe.Pointer(&data[0])), 8, 0)
+	if res == vkSuccess {
+		if b.stats.ShaderTicks == nil {
+			b.stats.ShaderTicks = map[string]uint64{}
+		}
+		period := float64(b.caps.TimestampPeriod)
+		if period <= 0 {
+			period = 1
+		}
+		for i, name := range b.queryNames {
+			start := data[i*2]
+			end := data[i*2+1]
+			if end > start {
+				b.stats.ShaderTicks[name] += uint64(float64(end-start) * period)
+			}
+		}
+	}
+	b.queryNames = b.queryNames[:0]
+	b.queryCount = 0
+}
+
 // dispatch records a compute dispatch into the current batch.
 func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups [3]uint32) error {
+	if b.profile {
+		start := time.Now()
+		defer func() { b.stats.CPURecordNs += uint64(time.Since(start)) }()
+	}
 	b.stats.Dispatches++
+	if b.stats.ShaderDispatches == nil {
+		b.stats.ShaderDispatches = map[string]uint64{}
+	}
+	b.stats.ShaderDispatches[name]++
 	pipe, err := b.pipeline(name)
 	if err != nil {
 		return err
@@ -1387,16 +1518,21 @@ func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups 
 		return fmt.Errorf("vulkan: allocate descriptor set failed")
 	}
 
+	// Only write the bindings this shader actually uses. The pipeline layout
+	// still has maxBindings slots, but unused descriptors may stay undefined
+	// because the shader interface never reads them.
+	if len(bindings) > maxBindings {
+		return fmt.Errorf("vulkan: %s uses %d bindings (max %d)", name, len(bindings), maxBindings)
+	}
 	var infos [maxBindings]descriptorBufferInfo
-	for i := 0; i < maxBindings; i++ {
+	var writes [maxBindings]writeDescriptorSet
+	n := len(bindings)
+	for i := 0; i < n; i++ {
 		buf := b.dummy
-		if i < len(bindings) && bindings[i] != nil {
+		if bindings[i] != nil {
 			buf = bindings[i]
 		}
 		infos[i] = descriptorBufferInfo{buffer: buf.buf, offset: 0, rng: buf.size}
-	}
-	writes := make([]writeDescriptorSet, maxBindings)
-	for i := 0; i < maxBindings; i++ {
 		writes[i] = writeDescriptorSet{
 			sType:           vkStructureWriteDescriptorSet,
 			dstSet:          set,
@@ -1406,14 +1542,25 @@ func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups 
 			pBufferInfo:     uintptr(unsafe.Pointer(&infos[i])),
 		}
 	}
-	vkCall(b.vk.UpdateDescriptorSets, b.device, uintptr(len(writes)), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
+	if n > 0 {
+		vkCall(b.vk.UpdateDescriptorSets, b.device, uintptr(n), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
+	}
 
 	vkCall(b.vk.CmdBindPipeline, b.cmdBuffer, vkPipelineBindPointCompute, pipe)
 	vkCall(b.vk.CmdBindDescriptorSets, b.cmdBuffer, vkPipelineBindPointCompute, b.pipeLayout, 0, 1, uintptr(unsafe.Pointer(&set)), 0, 0)
 	if len(push) > 0 {
 		vkCall(b.vk.CmdPushConstants, b.cmdBuffer, b.pipeLayout, vkShaderStageComputeBit, 0, uintptr(len(push)), uintptr(unsafe.Pointer(&push[0])))
 	}
+	profiled := b.profile && b.queryPool != 0 && b.queryCount+2 <= profileQueryCapacity
+	if profiled {
+		vkCall(b.vk.CmdWriteTimestamp, b.cmdBuffer, vkPipelineStageCompute, b.queryPool, uintptr(b.queryCount))
+	}
 	vkCall(b.vk.CmdDispatch, b.cmdBuffer, uintptr(groups[0]), uintptr(groups[1]), uintptr(groups[2]))
+	if profiled {
+		vkCall(b.vk.CmdWriteTimestamp, b.cmdBuffer, vkPipelineStageCompute, b.queryPool, uintptr(b.queryCount+1))
+		b.queryCount += 2
+		b.queryNames = append(b.queryNames, name)
+	}
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
 		srcAccessMask: vkAccessShaderRead | vkAccessShaderWrite,

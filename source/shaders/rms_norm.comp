@@ -1,6 +1,9 @@
 #version 450
 
-layout(local_size_x = 1) in;
+// Row-parallel RMSNorm. One 128-lane workgroup normalizes one row so decode
+// (rows == 1) does not serialize a 5120-element reduction on a single lane.
+
+layout(local_size_x = 128) in;
 
 layout(binding = 0) readonly  buffer X { float x[]; };
 layout(binding = 1) readonly  buffer W { float w[]; };
@@ -13,19 +16,31 @@ layout(push_constant) uniform P {
     uint  hasW;
 } p;
 
+#define LS 128
+shared float red[LS];
+
 void main() {
-    uint r = gl_GlobalInvocationID.x;
+    uint r = gl_WorkGroupID.x;
     if (r >= p.rows) {
         return;
     }
+    uint lane = gl_LocalInvocationID.x;
     uint base = r * p.rowLen;
     float ss = 0.0;
-    for (uint i = 0; i < p.rowLen; i++) {
+    for (uint i = lane; i < p.rowLen; i += LS) {
         float v = x[base + i];
         ss += v * v;
     }
-    float inv = 1.0 / sqrt(ss / float(p.rowLen) + p.eps);
-    for (uint i = 0; i < p.rowLen; i++) {
+    red[lane] = ss;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] += red[lane + s];
+        }
+        barrier();
+    }
+    float inv = 1.0 / sqrt(red[0] / float(p.rowLen) + p.eps);
+    for (uint i = lane; i < p.rowLen; i += LS) {
         float v = x[base + i] * inv;
         if (p.hasW == 1u) {
             v *= w[i];

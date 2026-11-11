@@ -399,3 +399,39 @@ func memString(bytes uint64) string {
 }
 
 func runtimeVersion() string { return runtime.Version() }
+
+func totalCounts(m map[string]uint64) uint64 {
+	var total uint64
+	for _, v := range m {
+		total += v
+	}
+	return total
+}
+
+// topCounts formats the largest map entries as "name=value,...".
+func topCounts(m map[string]uint64, n int) string {
+	if len(m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if m[keys[i]] != m[keys[j]] {
+			return m[keys[i]] > m[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
+	if n > len(keys) {
+		n = len(keys)
+	}
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%s=%d", keys[i], m[keys[i]])
+	}
+	return b.String()
+}

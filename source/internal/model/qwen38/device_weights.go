@@ -16,6 +16,8 @@ type DeviceForwardBackend interface {
 	SplitQGSigmoid(qg compute.Buffer, hd, nHead, T int) (q, gate compute.Buffer, err error)
 	GatedSilu(gate, up compute.Buffer) (compute.Buffer, error)
 	GDNGate(alpha, dt, a compute.Buffer, nV, T int) (compute.Buffer, error)
+	RMSNormAdd(a, add, w compute.Buffer, eps float32) (sum, norm compute.Buffer, err error)
+	GatedDeltaNetQK(q, k, v, g, beta, state compute.Buffer, nK int) (out, newState compute.Buffer, err error)
 	SSMConvSilu(sx, c compute.Buffer) (compute.Buffer, error)
 	GatherHeads3(convOut compute.Buffer, headK, nK, headV, nV, T, convDim int) (q, k, v compute.Buffer, err error)
 	L2Norm2(a, b compute.Buffer, eps float32) (compute.Buffer, compute.Buffer, error)

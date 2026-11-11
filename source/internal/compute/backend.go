@@ -16,6 +16,8 @@ type Capabilities struct {
 	MemoryBytes uint64
 	// HostFallback reports whether unsupported ops are executed on the CPU.
 	HostFallback bool
+	// TimestampPeriod is the GPU timestamp tick period in nanoseconds.
+	TimestampPeriod float32
 }
 
 // UnaryOp enumerates elementwise unary operations.

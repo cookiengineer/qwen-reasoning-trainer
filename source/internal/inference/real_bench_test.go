@@ -143,6 +143,9 @@ func TestRealLongContextBench(t *testing.T) {
 		"rope_factor":            engine.Model.Cfg.RopeScaleFactor,
 		"attention_scale":        engine.Model.Cfg.AttnScale,
 		"backend":                "vulkan",
+		"top_dispatches":         topCounts(stats.ShaderDispatches, 12),
+		"top_shader_ns":          topCounts(stats.ShaderTicks, 12),
+		"cpu_record_ns":          stats.CPURecordNs,
 	}
 	logReal(t, "long_context_bench", fields)
 	t.Logf("context=%s prompt=%d chunk=%d prefill=%.2f tok/s decode=%.2f tok/s peak=%s rss=%s",

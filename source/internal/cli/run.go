@@ -1487,6 +1487,7 @@ func cmdGPUInfo(cfg *Config, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "host fallback:  %v\n", caps.HostFallback)
 	fmt.Fprintf(stdout, "max buffer:     %d\n", caps.MaxBufferSize)
 	fmt.Fprintf(stdout, "memory:         %s (%d bytes)\n", humanBytes(int64(caps.MemoryBytes)), caps.MemoryBytes)
+	fmt.Fprintf(stdout, "timestamp tick: %.4g ns\n", caps.TimestampPeriod)
 	fmt.Fprintf(stdout, "\ndevices (QWEN38_VK_DEVICE selects one by index or name):\n")
 	for _, d := range b.DeviceList() {
 		mark := " "

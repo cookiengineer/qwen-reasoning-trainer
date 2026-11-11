@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"unsafe"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
@@ -41,6 +42,21 @@ var gemvRowShaders = map[quant.Type]string{
 
 // legacyGEMV disables the row-cooperative GEMV paths for A/B benchmarking.
 var legacyGEMV = os.Getenv("QWEN38_LEGACY_GEMV") == "1"
+
+func envInt(key string, def int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// Split-plan tuning knobs, overridable for benchmarks.
+var (
+	splitTargetWorkGroups = envInt("QWEN38_SPLIT_TARGET", 256)
+	splitMinKeysPerSplit  = envInt("QWEN38_SPLIT_MIN_KEYS", 256)
+)
 
 // matmulWShaders maps a quantized type to its fused dequantize+GEMM shader
 // (C = W x). It removes the float32 scratch of MatMulWeight for m > 1.
@@ -215,6 +231,10 @@ func (b *Backend) Close() error {
 	}
 	if b.device != 0 {
 		vkCall(b.vk.DeviceWaitIdle, b.device)
+		if b.queryPool != 0 {
+			vkCall(b.vk.DestroyQueryPool, b.device, b.queryPool, 0)
+			b.queryPool = 0
+		}
 		vkCall(b.vk.DestroyDevice, b.device, 0)
 	}
 	if b.instance != 0 {
@@ -410,6 +430,55 @@ func (b *Backend) RMSNorm(a, w compute.Buffer, eps float32) (compute.Buffer, err
 		return nil, err
 	}
 	return out, nil
+}
+
+// RMSNormAdd computes sum = a+b and norm = RMSNorm(sum, w) in one dispatch.
+func (b *Backend) RMSNormAdd(a, add, w compute.Buffer, eps float32) (compute.Buffer, compute.Buffer, error) {
+	x, err := asBuffer(a)
+	if err != nil {
+		return nil, nil, err
+	}
+	r, err := asBuffer(add)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(x.dims) != len(r.dims) {
+		return nil, nil, compute.ErrShape
+	}
+	for i := range x.dims {
+		if x.dims[i] != r.dims[i] {
+			return nil, nil, compute.ErrShape
+		}
+	}
+	sum, err := b.newF32Buffer(x.dims...)
+	if err != nil {
+		return nil, nil, err
+	}
+	out, err := b.newF32Buffer(x.dims...)
+	if err != nil {
+		b.Free(sum)
+		return nil, nil, err
+	}
+	rowLen := x.Ne0()
+	rows := x.NumElements() / rowLen
+	var wb *buffer
+	hasW := uint32(0)
+	if w != nil {
+		wb, err = asBuffer(w)
+		if err != nil {
+			b.Free(sum)
+			b.Free(out)
+			return nil, nil, err
+		}
+		hasW = 1
+	}
+	if err := b.dispatch("rms_norm_add", []*buffer{x, r, wb, sum, out},
+		push(uint32(rowLen), uint32(rows), eps, hasW), [3]uint32{uint32(rows), 1, 1}); err != nil {
+		b.Free(sum)
+		b.Free(out)
+		return nil, nil, err
+	}
+	return sum, out, nil
 }
 
 // RMSNormBack implements compute.Backend.
@@ -1303,15 +1372,15 @@ func (b *Backend) WriteKV(cache compute.Buffer, byteOffset int, data []byte) err
 }
 
 func cachedSplitPlan(nKV, nQ, nHead, nHeadKV int) (keysPerSplit, splits int, ok bool) {
-	if nQ > 4 || nKV < 8192 || nHead <= 0 || nHeadKV <= 0 {
+	if nQ > 4 || nKV < 1024 || nHead <= 0 || nHeadKV <= 0 {
 		return 0, 0, false
 	}
 	// Aim for enough workgroups to keep the GPU busy. The GQA decode kernel
 	// merges query heads, so its natural parallelism is nHeadKV per split
 	// instead of nHead*nQ per split.
-	const targetWorkGroups = 256
+	targetWorkGroups := splitTargetWorkGroups
 	const maxSplits = 128
-	const minKeysPerSplit = 256
+	minKeysPerSplit := splitMinKeysPerSplit
 	baseGroups := nHead * nQ
 	if nQ == 1 && nHead/nHeadKV == 6 {
 		baseGroups = nHeadKV
@@ -1823,7 +1892,69 @@ func (b *Backend) GatedDeltaNet(q, k, v, g, beta, state compute.Buffer) (compute
 	scale := float32(1 / math.Sqrt(float64(sv)))
 	groups := [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
 	if err := b.dispatch("gated_delta_net", []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda), groups); err != nil {
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda, uint32(h)), groups); err != nil {
+		b.Free(out)
+		b.Free(ns)
+		return nil, nil, err
+	}
+	return out, ns, nil
+}
+
+// GatedDeltaNetQK is the GQA form used by inference: q/k carry nK distinct
+// heads and are broadcast to the nV value heads inside the shader, avoiding two
+// repeat_heads dispatches and the 3x q/k materialization.
+func (b *Backend) GatedDeltaNetQK(q, k, v, g, beta, state compute.Buffer, nK int) (compute.Buffer, compute.Buffer, error) {
+	tq, err := asBuffer(q)
+	if err != nil {
+		return nil, nil, err
+	}
+	tk, err := asBuffer(k)
+	if err != nil {
+		return nil, nil, err
+	}
+	tv, err := asBuffer(v)
+	if err != nil {
+		return nil, nil, err
+	}
+	tg, err := asBuffer(g)
+	if err != nil {
+		return nil, nil, err
+	}
+	tb, err := asBuffer(beta)
+	if err != nil {
+		return nil, nil, err
+	}
+	ts, err := asBuffer(state)
+	if err != nil {
+		return nil, nil, err
+	}
+	sv := tq.Ne0()
+	nTok := dimOr1(tq.dims, 2)
+	h := dimOr1(tv.dims, 1)
+	gstride := tg.Ne0()
+	if nK <= 0 || h%nK != 0 || dimOr1(tq.dims, 1) != nK || dimOr1(tk.dims, 1) != nK ||
+		tk.Ne0() != sv || tv.Ne0() != sv || ts.Ne0() != sv || sv > 256 {
+		return nil, nil, compute.ErrShape
+	}
+	kda := uint32(0)
+	if gstride == sv {
+		kda = 1
+	} else if gstride != 1 {
+		return nil, nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(sv, h, nTok)
+	if err != nil {
+		return nil, nil, err
+	}
+	ns, err := b.newF32Buffer(sv, sv, h)
+	if err != nil {
+		b.Free(out)
+		return nil, nil, err
+	}
+	scale := float32(1 / math.Sqrt(float64(sv)))
+	groups := [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
+	if err := b.dispatch("gated_delta_net", []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda, uint32(nK)), groups); err != nil {
 		b.Free(out)
 		b.Free(ns)
 		return nil, nil, err
