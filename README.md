@@ -98,14 +98,23 @@ Supported request features include `stream` (SSE), `reasoning_content` deltas,
 enabled by default. Tool calls use the Qwen XML format and are returned as
 OpenAI `tool_calls` with JSON arguments.
 
-Useful flags: `--device auto|cpu|vulkan`, `--context N`,
+Useful flags: `--device auto|cpu|vulkan`, `--context-length 128k|256k|384k|512k`
+(or raw tokens; `--context` is an alias), `--max-concurrent N`,
 `--default-max-tokens N`, `--model-id ID`, and `--api-key KEY` (Bearer auth).
-Streaming usage is included when `stream_options.include_usage` is true.
+The KV cache type is internal: Q4_K by default with Q8_0 as the alternative.
+On Vulkan, K/V are stored device-resident in that quantized format and decode
+attention reads the cache directly. The prefill chunk size is selected
+automatically from the context length and device memory. Streaming usage is
+included when `stream_options.include_usage` is true.
 
 Limitations: only `n=1`; `logprobs`, `response_format`, and multimodal inputs
 are unsupported; `tool_choice: "none"` disables tools but forced tool selection
-is not enforced. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
-underlying pipeline.
+is not enforced. Context values above the native GGUF context (256k) are
+accepted, but YaRN scaling is still being implemented, so 384k/512k currently
+extrapolate and may degrade. Full-attention prefill remains O(T^2), so very long
+prompts are slow even though memory is bounded. See
+[`current-plan.md`](current-plan.md) for status and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the underlying pipeline.
 
 ## Abliteration
 
@@ -202,6 +211,14 @@ The default suite is pure Go and needs neither a GPU nor Python:
 ```sh
 make test;      # go test ./...
 make check;     # fmt-check + vet + test (run this before calling anything done)
+```
+
+To run the suite on a remote GPU host, stream the working tree over SSH and run
+a make target there:
+
+```sh
+bash run-tests.sh debby;          # remote make check
+bash run-tests.sh debby test;     # remote make test
 ```
 
 Tests that need hardware or external data skip automatically, so `make check`

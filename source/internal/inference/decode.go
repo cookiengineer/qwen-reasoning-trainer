@@ -10,18 +10,26 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 )
 
 var seedCounter uint64
 
 // Chat renders the request, generates a response, and streams deltas through
-// emit (which may be nil). It is safe to call concurrently; requests are
-// serialized by the engine.
+// emit (which may be nil). It is safe to call concurrently; complete forward
+// calls are serialized by the model/backend execution guard.
 func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) error) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	e.life.RLock()
+	if e.closed {
+		e.life.RUnlock()
+		return nil, fmt.Errorf("inference: engine is closed")
+	}
+	defer e.life.RUnlock()
+
 	select {
 	case e.sem <- struct{}{}:
 		defer func() { <-e.sem }()
@@ -48,10 +56,59 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 	}
 	rng := rand.New(rand.NewSource(seed))
 
-	st := qwen38.NewState(e.Model.Cfg)
-	res, err := e.Model.Forward(prompt, qwen38.ForwardOptions{State: st, LastTokenOnly: true})
+	capacity := len(prompt) + maxTokens
+	if e.contextLen > 0 && capacity > e.contextLen {
+		capacity = e.contextLen
+	}
+	if _, ok := e.Backend.(qwen38.KVCacheBackend); ok {
+		need := EstimateKVBytes(e.Cfg, capacity, e.kvType)
+		if !e.reserveKV(need) {
+			return nil, fmt.Errorf("inference: KV cache request %s exceeds remaining budget %s",
+				FormatBytes(need), FormatBytes(e.kvBudget))
+		}
+		defer e.releaseKV(need)
+	}
+	var st *qwen38.State
+	err = compute.Run(e.Backend, func() error {
+		var stateErr error
+		st, stateErr = qwen38.NewStateWithOptions(e.Model.Cfg, qwen38.StateOptions{
+			Backend:  e.Backend,
+			KVType:   e.kvType,
+			Capacity: capacity,
+		})
+		return stateErr
+	})
 	if err != nil {
 		return nil, err
+	}
+	defer func() {
+		_ = compute.Run(e.Backend, func() error {
+			st.Free()
+			return nil
+		})
+	}()
+	chunk := e.prefillChunk
+	if chunk <= 0 || chunk > len(prompt) {
+		chunk = len(prompt)
+	}
+	var res *qwen38.ForwardResult
+	for start := 0; start < len(prompt); start += chunk {
+		end := start + chunk
+		if end > len(prompt) {
+			end = len(prompt)
+		}
+		positions := make([]int32, end-start)
+		for i := range positions {
+			positions[i] = int32(start + i)
+		}
+		res, err = e.Model.Forward(prompt[start:end], qwen38.ForwardOptions{
+			State:         st,
+			Positions:     positions,
+			LastTokenOnly: end == len(prompt),
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	parser := newStreamParser(req.EnableThinking, toolArgTypes(req.Tools), emit)

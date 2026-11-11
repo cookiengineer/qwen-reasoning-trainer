@@ -13,6 +13,7 @@ package qwen38
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
@@ -116,6 +117,11 @@ type Model struct {
 	W          *Weights
 	Backend    compute.Backend
 	devWeights map[*Weight]compute.Buffer
+
+	// mu serializes forward passes and device-cache invalidation. The backend
+	// guard below serializes command recording; this guard also protects the
+	// lazy devWeights map and host-fallback execution.
+	mu sync.Mutex
 }
 
 // NewModel creates a model from loaded weights.
@@ -156,6 +162,8 @@ func (m *Model) mm(w *Weight, x *compute.Tensor) (*compute.Tensor, error) {
 // FreeDevice releases device-resident weights. It should be called before the
 // backend is closed.
 func (m *Model) FreeDevice() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.Backend == nil || m.devWeights == nil {
 		return
 	}
@@ -169,6 +177,8 @@ func (m *Model) FreeDevice() {
 // matmul re-uploads them. Call it after mutating a Weight in place (for example
 // after abliteration) so the device does not keep serving the old bytes.
 func (m *Model) InvalidateDevice(ws ...*Weight) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.Backend == nil || m.devWeights == nil {
 		return
 	}

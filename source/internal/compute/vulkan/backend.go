@@ -57,6 +57,14 @@ var matmulTWShaders = map[quant.Type]string{
 // Capabilities implements compute.Backend.
 func (b *Backend) Capabilities() compute.Capabilities { return b.caps }
 
+// Run serializes a complete operation group against other backend users. The
+// callback must not call Run re-entrantly.
+func (b *Backend) Run(fn func() error) error {
+	b.execMu.Lock()
+	defer b.execMu.Unlock()
+	return fn()
+}
+
 func (b *Backend) newF32Buffer(dims ...int) (*buffer, error) {
 	n := 1
 	for _, d := range dims {
@@ -918,6 +926,127 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 		}
 		groups := [3]uint32{chunk, 1, 1}
 		if err := b.dispatch(shader, []*buffer{tq, tk, tv, out}, push(uint32(headDim), uint32(nTok), uint32(nHead), uint32(nHeadKV), scale, c, start), groups); err != nil {
+			b.Free(out)
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// AllocKV allocates a device-resident KV cache buffer with logical dims
+// [headDim, nKVHeads, capacity] and the storage size implied by typ.
+func (b *Backend) AllocKV(headDim, nKVHeads, capacity int, typ quant.Type) (compute.Buffer, error) {
+	if headDim <= 0 || nKVHeads <= 0 || capacity <= 0 {
+		return nil, compute.ErrShape
+	}
+	if !typ.IsQuantized() {
+		return nil, fmt.Errorf("vulkan: KV cache type %s is not quantized", typ)
+	}
+	elements := int64(headDim) * int64(nKVHeads) * int64(capacity)
+	size, err := typ.Size(elements)
+	if err != nil {
+		return nil, err
+	}
+	buf, err := b.allocBuffer(uint64(size), vkBufferUsageStorage|vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
+	if err != nil {
+		return nil, err
+	}
+	buf.dims = []int{headDim, nKVHeads, capacity}
+	buf.typ = typ
+	return buf, nil
+}
+
+// WriteKV writes already-quantized cache bytes at a byte offset. It is used to
+// append K/V blocks after the host has encoded them for the selected type.
+func (b *Backend) WriteKV(cache compute.Buffer, byteOffset int, data []byte) error {
+	x, err := asBuffer(cache)
+	if err != nil {
+		return err
+	}
+	if byteOffset < 0 || uint64(byteOffset)+uint64(len(data)) > x.size {
+		return compute.ErrShape
+	}
+	b.stats.BytesUploaded += uint64(len(data))
+	if x.mapped != nil {
+		dst := unsafe.Slice((*byte)(x.mapped), x.size)
+		copy(dst[byteOffset:byteOffset+len(data)], data)
+		return nil
+	}
+	staging, err := b.allocHostBuffer(uint64(len(data)), vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
+	if err != nil {
+		return err
+	}
+	copy(unsafe.Slice((*byte)(staging.mapped), len(data)), data)
+	if err := b.beginBatch(); err != nil {
+		b.destroyBuffer(staging)
+		return err
+	}
+	region := bufferCopy{srcOffset: 0, dstOffset: uint64(byteOffset), size: uint64(len(data))}
+	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, staging.buf, x.buf, 1, uintptr(unsafe.Pointer(&region)))
+	barrier := memoryBarrier{
+		sType:         vkStructureMemoryBarrier,
+		srcAccessMask: vkAccessTransferWrite,
+		dstAccessMask: vkAccessShaderRead | vkAccessShaderWrite,
+	}
+	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageTransfer, vkPipelineStageCompute, 0, 1, uintptr(unsafe.Pointer(&barrier)), 0, 0, 0, 0)
+	b.Free(staging)
+	return nil
+}
+
+// AttentionCached reads a Q4_K or Q8_0 KV cache directly. q has dims
+// [headDim, nHead, nQ]; the cache has [headDim, nHeadKV, nKV]. The query block
+// starts at absolute position nKV-nQ.
+func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHeadKV, nKV int, scale float32) (compute.Buffer, error) {
+	qb, err := asBuffer(q)
+	if err != nil {
+		return nil, err
+	}
+	kb, err := asBuffer(kcache)
+	if err != nil {
+		return nil, err
+	}
+	vb, err := asBuffer(vcache)
+	if err != nil {
+		return nil, err
+	}
+	hd := qb.Ne0()
+	nQ := dimOr1(qb.dims, 2)
+	if nQ <= 0 || nKV < nQ || nHead <= 0 || nHeadKV <= 0 || nHead%nHeadKV != 0 {
+		return nil, compute.ErrShape
+	}
+	if hd > 256 {
+		return nil, fmt.Errorf("vulkan: cached attention headDim %d > 256", hd)
+	}
+	var shader string
+	switch kb.typ {
+	case quant.TypeQ4_K:
+		if hd%256 != 0 {
+			return nil, fmt.Errorf("vulkan: q4_K cached attention requires headDim %% 256, got %d", hd)
+		}
+		shader = "attention_cached_q4k"
+	case quant.TypeQ8_0:
+		if hd%32 != 0 {
+			return nil, fmt.Errorf("vulkan: q8_0 cached attention requires headDim %% 32, got %d", hd)
+		}
+		shader = "attention_cached_q8_0"
+	default:
+		return nil, fmt.Errorf("vulkan: no cached attention shader for %s", kb.typ)
+	}
+	out, err := b.newF32Buffer(qb.dims...)
+	if err != nil {
+		return nil, err
+	}
+	qStart := uint32(nKV - nQ)
+	const maxPerDispatch = 65535
+	total := uint32(nHead * nQ)
+	for start := uint32(0); start < total; start += maxPerDispatch {
+		chunk := total - start
+		if chunk > maxPerDispatch {
+			chunk = maxPerDispatch
+		}
+		p := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
+			uint32(nKV), qStart, scale, start)
+		if err := b.dispatch(shader, []*buffer{qb, kb, vb, out}, p, [3]uint32{chunk, 1, 1}); err != nil {
 			b.Free(out)
 			return nil, err
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/gguf"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/tokenizer"
 )
 
@@ -27,28 +28,43 @@ type LoadOptions struct {
 	Device string
 	// ContextLength overrides the GGUF context length when > 0.
 	ContextLength int
+	// MaxConcurrent bounds the number of in-flight generation requests.
+	MaxConcurrent int
 	// Log receives backend selection diagnostics. Nil discards them.
 	Log io.Writer
 	// LogLevel is "quiet", "info", or "debug"; quiet silences backend logging.
 	LogLevel string
 }
 
-// Engine owns a loaded model and serializes generation. The model's device
-// weight cache and the Vulkan backend are not safe for concurrent use, so all
-// requests share one generation slot.
+// Engine owns a loaded model and admits generation requests. Individual forward
+// calls are serialized by the model/backend execution guard, so requests may
+// interleave between generated tokens without corrupting shared Vulkan state.
 type Engine struct {
 	Model   *qwen38.Model
 	Vocab   *tokenizer.Vocab
 	Cfg     *modelcfg.Config
 	Backend compute.Backend
 
-	file       *gguf.File
-	contextLen int
-	imEnd      int32
-	hasImEnd   bool
+	file         *gguf.File
+	contextLen   int
+	modelBytes   uint64
+	kvType       quant.Type
+	prefillChunk int
+	imEnd        int32
+	hasImEnd     bool
+
+	kvBudget uint64
+	kvLimit  bool
+	kvUsed   uint64
+	kvMu     sync.Mutex
 
 	sem   chan struct{}
 	close sync.Once
+
+	// life protects the engine lifespan: Chat holds a read lock for its whole
+	// request, Close takes the write lock before freeing model/backend state.
+	life   sync.RWMutex
+	closed bool
 }
 
 // Load opens a GGUF, loads its weights, and selects a compute backend.
@@ -83,6 +99,7 @@ func Load(opt LoadOptions) (*Engine, error) {
 	m := qwen38.NewModel(w)
 	m.Backend = be
 
+	mb := modelBytes(g)
 	ctx := mc.ContextLength
 	if opt.ContextLength > 0 {
 		ctx = opt.ContextLength
@@ -90,15 +107,32 @@ func Load(opt LoadOptions) (*Engine, error) {
 	if ctx <= 0 {
 		ctx = 32768
 	}
+	concurrent := opt.MaxConcurrent
+	if concurrent <= 0 {
+		concurrent = 1
+	}
+	var caps compute.Capabilities
+	if be != nil {
+		caps = be.Capabilities()
+	}
 
 	e := &Engine{
-		Model:      m,
-		Vocab:      vocab,
-		Cfg:        mc,
-		Backend:    be,
-		file:       g,
-		contextLen: ctx,
-		sem:        make(chan struct{}, 1),
+		Model:        m,
+		Vocab:        vocab,
+		Cfg:          mc,
+		Backend:      be,
+		file:         g,
+		contextLen:   ctx,
+		modelBytes:   mb,
+		kvType:       DefaultKVCacheType,
+		prefillChunk: AutoPrefillChunk(ctx, caps),
+		sem:          make(chan struct{}, concurrent),
+	}
+	if be != nil && caps.MemoryBytes > 0 {
+		e.kvLimit = true
+		if caps.MemoryBytes > mb+gpuHeadroomBytes {
+			e.kvBudget = caps.MemoryBytes - mb - gpuHeadroomBytes
+		}
 	}
 	if id, ok := vocab.SpecialID("<|im_end|>"); ok {
 		e.imEnd, e.hasImEnd = id, true
@@ -109,10 +143,59 @@ func Load(opt LoadOptions) (*Engine, error) {
 // ContextLength returns the maximum number of positions the server will use.
 func (e *Engine) ContextLength() int { return e.contextLen }
 
+// ModelBytes returns the GGUF tensor bytes held by the model.
+func (e *Engine) ModelBytes() uint64 { return e.modelBytes }
+
+// KVCacheType returns the selected KV cache storage type.
+func (e *Engine) KVCacheType() quant.Type { return e.kvType }
+
+// EstimatedKVBytes returns the K+V cache size at context tokens.
+func (e *Engine) EstimatedKVBytes(context int) uint64 {
+	return EstimateKVBytes(e.Cfg, context, e.kvType)
+}
+
+// PrefillChunk returns the automatic prompt chunk size for this engine.
+func (e *Engine) PrefillChunk() int { return e.prefillChunk }
+
+// KVBudgetBytes returns the device budget available for KV caches. Zero with
+// KVLimited()==false means no limit was derived from the backend.
+func (e *Engine) KVBudgetBytes() uint64 { return e.kvBudget }
+
+// KVLimited reports whether a device KV budget is enforced.
+func (e *Engine) KVLimited() bool { return e.kvLimit }
+
+func (e *Engine) reserveKV(n uint64) bool {
+	if !e.kvLimit {
+		return true
+	}
+	e.kvMu.Lock()
+	defer e.kvMu.Unlock()
+	if e.kvUsed+n > e.kvBudget {
+		return false
+	}
+	e.kvUsed += n
+	return true
+}
+
+func (e *Engine) releaseKV(n uint64) {
+	if !e.kvLimit {
+		return
+	}
+	e.kvMu.Lock()
+	if e.kvUsed >= n {
+		e.kvUsed -= n
+	} else {
+		e.kvUsed = 0
+	}
+	e.kvMu.Unlock()
+}
+
 // Close releases device weights, the backend, and the GGUF file.
 func (e *Engine) Close() error {
 	var err error
 	e.close.Do(func() {
+		e.life.Lock()
+		e.closed = true
 		if e.Model != nil {
 			e.Model.FreeDevice()
 		}
@@ -122,6 +205,7 @@ func (e *Engine) Close() error {
 		if e.file != nil {
 			err = e.file.Close()
 		}
+		e.life.Unlock()
 	})
 	return err
 }

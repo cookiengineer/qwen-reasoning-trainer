@@ -204,3 +204,19 @@ type Backend interface {
 	// buffer; src is read-only. Used for global gradient-norm clipping.
 	SumSquares(dst, src Buffer) error
 }
+
+// Runner is implemented by backends that need coarse-grained serialization of
+// complete operation groups. Callers should wrap a whole forward pass (or any
+// other sequence that relies on backend-scoped command state) in Run.
+type Runner interface {
+	Run(fn func() error) error
+}
+
+// Run executes fn under the backend's execution guard when the backend
+// implements Runner. Backends without shared command state run fn directly.
+func Run(b Backend, fn func() error) error {
+	if r, ok := b.(Runner); ok {
+		return r.Run(fn)
+	}
+	return fn()
+}

@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
 
 // State carries the recurrent and KV-cache state between forward calls. A
@@ -14,8 +15,14 @@ type State struct {
 	Conv [][]float32
 	// SSM holds the GatedDeltaNet state per layer: HeadVDim*HeadVDim*DtRank.
 	SSM [][]float32
-	// KV holds the key/value cache of each full-attention layer.
+	// KV holds the host key/value cache of each full-attention layer.
 	KV []*kvCache
+	// DeviceKV holds the quantized device cache when enabled. Recurrent layers
+	// have a nil entry.
+	DeviceKV []*DeviceKVCache
+
+	kvBackend KVCacheBackend
+	kvType    quant.Type
 }
 
 // kvCache stores the keys and values of a full-attention layer, laid out as
@@ -25,20 +32,111 @@ type kvCache struct {
 	length int
 }
 
+// KVCacheBackend is implemented by backends that can own a quantized KV cache
+// and run attention directly over it.
+type KVCacheBackend interface {
+	compute.Backend
+	AllocKV(headDim, nKVHeads, capacity int, typ quant.Type) (compute.Buffer, error)
+	WriteKV(cache compute.Buffer, byteOffset int, data []byte) error
+	AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHeadKV, nKV int, scale float32) (compute.Buffer, error)
+}
+
+// DeviceKVCache is one full-attention layer's quantized K/V cache.
+type DeviceKVCache struct {
+	K, V compute.Buffer
+	Len  int
+	Cap  int
+}
+
+// StateOptions configures optional device-resident KV state.
+type StateOptions struct {
+	Backend  compute.Backend
+	KVType   quant.Type
+	Capacity int
+}
+
 // NewState allocates a zeroed state for cfg.
-func NewState(cfg *Config) *State {
+func NewState(cfg *Config) *State { return NewStateWithCapacity(cfg, 0) }
+
+// NewStateWithOptions allocates a state and, when the backend supports it,
+// reserves quantized device KV buffers for the full-attention layers.
+func NewStateWithOptions(cfg *Config, opt StateOptions) (*State, error) {
+	s := NewStateWithCapacity(cfg, 0)
+	kb, ok := opt.Backend.(KVCacheBackend)
+	if !ok || opt.Capacity <= 0 || !opt.KVType.IsQuantized() {
+		return s, nil
+	}
+	s.kvBackend = kb
+	s.kvType = opt.KVType
+	s.DeviceKV = make([]*DeviceKVCache, cfg.TrunkLayers())
+	for il := 0; il < cfg.TrunkLayers(); il++ {
+		if cfg.IsRecurrent(il) {
+			continue
+		}
+		k, err := kb.AllocKV(cfg.HeadDim, cfg.NHeadKV, opt.Capacity, opt.KVType)
+		if err != nil {
+			s.Free()
+			return nil, err
+		}
+		v, err := kb.AllocKV(cfg.HeadDim, cfg.NHeadKV, opt.Capacity, opt.KVType)
+		if err != nil {
+			opt.Backend.Free(k)
+			s.Free()
+			return nil, err
+		}
+		s.DeviceKV[il] = &DeviceKVCache{K: k, V: v, Cap: opt.Capacity}
+	}
+	return s, nil
+}
+
+// Free releases device KV buffers. The host caches are garbage-collected.
+func (s *State) Free() {
+	if s == nil || s.kvBackend == nil {
+		return
+	}
+	for _, c := range s.DeviceKV {
+		if c == nil {
+			continue
+		}
+		if c.K != nil {
+			s.kvBackend.Free(c.K)
+			c.K = nil
+		}
+		if c.V != nil {
+			s.kvBackend.Free(c.V)
+			c.V = nil
+		}
+	}
+	s.DeviceKV = nil
+	s.kvBackend = nil
+}
+
+// NewStateWithCapacity allocates a zeroed state, optionally reserving room for
+// capacity KV positions per full-attention layer. A capacity of zero leaves the
+// cache lazy; appendKVCache grows geometrically from there.
+func NewStateWithCapacity(cfg *Config, capacity int) *State {
 	s := &State{
 		Conv: make([][]float32, cfg.TrunkLayers()),
 		SSM:  make([][]float32, cfg.TrunkLayers()),
 		KV:   make([]*kvCache, cfg.TrunkLayers()),
 	}
+	if capacity < 0 {
+		capacity = 0
+	}
+	stride := cfg.HeadDim * cfg.NHeadKV
 	for il := 0; il < cfg.TrunkLayers(); il++ {
 		if cfg.IsRecurrent(il) {
 			s.Conv[il] = make([]float32, (cfg.DConv-1)*cfg.ConvDim())
 			s.SSM[il] = make([]float32, cfg.HeadVDim()*cfg.HeadVDim()*cfg.DtRank)
-		} else {
-			s.KV[il] = &kvCache{}
+			continue
 		}
+		c := &kvCache{}
+		if capacity > 0 && stride > 0 {
+			elems := capacity * stride
+			c.k = make([]float32, 0, elems)
+			c.v = make([]float32, 0, elems)
+		}
+		s.KV[il] = c
 	}
 	return s
 }
@@ -68,8 +166,22 @@ type ForwardResult struct {
 	State *State
 }
 
-// Forward runs the model on the given token ids.
+// Forward runs the model on the given token ids. Complete forward passes are
+// serialized: the model mutex protects the lazy device-weight cache, and the
+// backend execution guard protects shared Vulkan command/descriptor state.
 func (m *Model) Forward(tokens []int32, opts ForwardOptions) (*ForwardResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var res *ForwardResult
+	err := compute.Run(m.Backend, func() error {
+		r, err := m.forward(tokens, opts)
+		res = r
+		return err
+	})
+	return res, err
+}
+
+func (m *Model) forward(tokens []int32, opts ForwardOptions) (*ForwardResult, error) {
 	cfg := m.Cfg
 	T := len(tokens)
 	if T == 0 {
@@ -108,7 +220,7 @@ func (m *Model) Forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 		if cfg.IsRecurrent(il) {
 			attnOut, err = m.linearAttn(lw, h, st, il)
 		} else {
-			attnOut, err = m.fullAttn(lw, h, positions, st.KV[il])
+			attnOut, err = m.fullAttn(lw, h, positions, st, il)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("qwen38: layer %d attention: %w", il, err)
@@ -169,7 +281,8 @@ func (m *Model) ffn(lw *LayerWeights, h *compute.Tensor) (*compute.Tensor, error
 
 // fullAttn runs a full-attention block on the normalized activation h, using
 // and updating the layer's KV cache.
-func (m *Model) fullAttn(lw *LayerWeights, h *compute.Tensor, positions []int32, cache *kvCache) (*compute.Tensor, error) {
+func (m *Model) fullAttn(lw *LayerWeights, h *compute.Tensor, positions []int32, st *State, il int) (*compute.Tensor, error) {
+	cache := st.KV[il]
 	cfg := m.Cfg
 	hd := cfg.HeadDim
 	T := h.Ne(1)
@@ -224,17 +337,27 @@ func (m *Model) fullAttn(lw *LayerWeights, h *compute.Tensor, positions []int32,
 		return nil, err
 	}
 
-	// Append to the KV cache and attend over the full history.
-	kc, vc, total := appendKVCache(cache, kn, vn, hd, cfg.NHeadKV, T)
-	causal := T == total
-
 	scale := float32(1.0)
 	if hd > 0 {
 		scale = float32(1.0 / math.Sqrt(float64(hd)))
 	}
-	attn, err := compute.Attention(qn, kc, vc, nHead, cfg.NHeadKV, scale, causal)
-	if err != nil {
-		return nil, err
+	var attn *compute.Tensor
+	if dc := deviceCache(st, il); dc != nil {
+		if err := m.appendDeviceKV(dc, st.kvType, kn, vn); err != nil {
+			return nil, err
+		}
+		attn, err = m.attentionCached(qn, dc, nHead, cfg.NHeadKV, scale)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Append to the host KV cache and attend over the full history.
+		kc, vc, total := appendKVCache(cache, kn, vn, hd, cfg.NHeadKV, T)
+		causal := T == total
+		attn, err = compute.Attention(qn, kc, vc, nHead, cfg.NHeadKV, scale, causal)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	gateSig := sigmoidInto(gate)
@@ -393,20 +516,104 @@ func repeatHeads(x *compute.Tensor, headDim, nIn, nOut, T int) *compute.Tensor {
 	return out
 }
 
+func deviceCache(st *State, il int) *DeviceKVCache {
+	if st == nil || il < 0 || il >= len(st.DeviceKV) {
+		return nil
+	}
+	return st.DeviceKV[il]
+}
+
+func (m *Model) appendDeviceKV(dc *DeviceKVCache, typ quant.Type, k, v *compute.Tensor) error {
+	if dc == nil {
+		return fmt.Errorf("qwen38: nil device KV cache")
+	}
+	T := k.Ne(2)
+	if T <= 0 {
+		return nil
+	}
+	if dc.Len+T > dc.Cap {
+		return fmt.Errorf("qwen38: KV cache capacity %d exceeded (%d + %d)", dc.Cap, dc.Len, T)
+	}
+	kb, ok := m.Backend.(KVCacheBackend)
+	if !ok {
+		return fmt.Errorf("qwen38: backend does not support device KV")
+	}
+	kraw, err := quant.QuantizeParallel(typ, k.F32)
+	if err != nil {
+		return err
+	}
+	vraw, err := quant.QuantizeParallel(typ, v.F32)
+	if err != nil {
+		return err
+	}
+	if len(kraw) == 0 || len(kraw)%T != 0 || len(vraw) != len(kraw) {
+		return fmt.Errorf("qwen38: invalid quantized KV size")
+	}
+	perToken := len(kraw) / T
+	off := dc.Len * perToken
+	if err := kb.WriteKV(dc.K, off, kraw); err != nil {
+		return err
+	}
+	if err := kb.WriteKV(dc.V, off, vraw); err != nil {
+		return err
+	}
+	dc.Len += T
+	return nil
+}
+
+func (m *Model) attentionCached(q *compute.Tensor, dc *DeviceKVCache, nHead, nHeadKV int, scale float32) (*compute.Tensor, error) {
+	kb, ok := m.Backend.(KVCacheBackend)
+	if !ok {
+		return nil, fmt.Errorf("qwen38: backend does not support cached attention")
+	}
+	qb, err := m.Backend.Upload(q)
+	if err != nil {
+		return nil, err
+	}
+	defer m.Backend.Free(qb)
+	ob, err := kb.AttentionCached(qb, dc.K, dc.V, nHead, nHeadKV, dc.Len, scale)
+	if err != nil {
+		return nil, err
+	}
+	defer m.Backend.Free(ob)
+	return m.Backend.Download(ob)
+}
+
+// reserve grows the backing arrays to hold need positions, preserving existing
+// values. It reuses the existing allocation when capacity is sufficient and
+// otherwise grows geometrically, which amortizes copying across a generation.
+func (c *kvCache) reserve(stride, need int) {
+	needElems := need * stride
+	if cap(c.k) >= needElems && cap(c.v) >= needElems {
+		c.k = c.k[:needElems]
+		c.v = c.v[:needElems]
+		return
+	}
+	newCap := needElems
+	if cap(c.k) > 0 && cap(c.k)*2 > newCap {
+		newCap = cap(c.k) * 2
+	}
+	if cap(c.v) > 0 && cap(c.v)*2 > newCap {
+		newCap = cap(c.v) * 2
+	}
+	nk := make([]float32, needElems, newCap)
+	nv := make([]float32, needElems, newCap)
+	copy(nk, c.k)
+	copy(nv, c.v)
+	c.k, c.v = nk, nv
+}
+
 // appendKVCache appends T keys/values to cache and returns the combined cache.
 func appendKVCache(cache *kvCache, k, v *compute.Tensor, hd, nKV, T int) (*compute.Tensor, *compute.Tensor, int) {
 	stride := hd * nKV
 	total := cache.length + T
-	nk := compute.NewF32(hd, nKV, total)
-	nv := compute.NewF32(hd, nKV, total)
-	copy(nk.F32, cache.k)
-	copy(nv.F32, cache.v)
-	for t := 0; t < T; t++ {
-		copy(nk.F32[(cache.length+t)*stride:], k.F32[t*stride:(t+1)*stride])
-		copy(nv.F32[(cache.length+t)*stride:], v.F32[t*stride:(t+1)*stride])
-	}
-	cache.k = nk.F32
-	cache.v = nv.F32
+	cache.reserve(stride, total)
+	old := cache.length * stride
+	need := total * stride
+	copy(cache.k[old:need], k.F32[:T*stride])
+	copy(cache.v[old:need], v.F32[:T*stride])
 	cache.length = total
+	nk := &compute.Tensor{Dims: []int{hd, nKV, total}, Type: k.Type, F32: cache.k}
+	nv := &compute.Tensor{Dims: []int{hd, nKV, total}, Type: v.Type, F32: cache.v}
 	return nk, nv, total
 }

@@ -572,6 +572,12 @@ type Backend struct {
 	pipelines map[string]uintptr
 	closed    bool
 
+	// execMu serializes complete backend operation groups. The command buffer,
+	// fence, descriptor pool, recording state, allocator, and buffer pool are
+	// shared, so concurrent callers must hold this guard for a whole forward
+	// pass rather than per individual op.
+	execMu sync.Mutex
+
 	// maxScratchFloats bounds the float32 dequant scratch. It is overridable
 	// in tests to exercise the row-blocking path.
 	maxScratchFloats int
