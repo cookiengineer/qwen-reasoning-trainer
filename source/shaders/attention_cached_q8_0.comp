@@ -15,6 +15,7 @@ layout(push_constant) uniform P {
     uint  nHead;
     uint  nHeadKV;
     uint  nKV;
+    uint  capacity;
     uint  qStart;
     float scale;
     uint  base;
@@ -36,7 +37,7 @@ float f16V(uint o) { return unpackHalf2x16(getbV(o) | (getbV(o + 1u) << 8u)).x; 
 
 float dequantK(uint token, uint kv, uint d) {
     uint bph = p.headDim / 32u;
-    uint blk = (token * p.nHeadKV + kv) * bph + d / 32u;
+    uint blk = (kv * p.capacity + token) * bph + d / 32u;
     uint base = blk * 34u;
     uint b = getbK(base + 2u + d % 32u);
     int q = int(b);
@@ -45,7 +46,7 @@ float dequantK(uint token, uint kv, uint d) {
 }
 float dequantV(uint token, uint kv, uint d) {
     uint bph = p.headDim / 32u;
-    uint blk = (token * p.nHeadKV + kv) * bph + d / 32u;
+    uint blk = (kv * p.capacity + token) * bph + d / 32u;
     uint base = blk * 34u;
     uint b = getbV(base + 2u + d % 32u);
     int q = int(b);

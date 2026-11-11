@@ -616,13 +616,23 @@ func (m *Model) appendDeviceKV(dc *DeviceKVCache, typ quant.Type, k, v *compute.
 	if len(kraw) == 0 || len(kraw)%T != 0 || len(vraw) != len(kraw) {
 		return fmt.Errorf("qwen38: invalid quantized KV size")
 	}
-	perToken := len(kraw) / T
-	off := dc.Len * perToken
-	if err := kb.WriteKV(dc.K, off, kraw); err != nil {
-		return err
+	nHeadKV := k.Ne(1)
+	if nHeadKV <= 0 || len(kraw)%(T*nHeadKV) != 0 {
+		return fmt.Errorf("qwen38: invalid quantized KV shape")
 	}
-	if err := kb.WriteKV(dc.V, off, vraw); err != nil {
-		return err
+	// Host-quantized bytes are token-major; the cache is head-major.
+	perHeadToken := len(kraw) / (T * nHeadKV)
+	for t := 0; t < T; t++ {
+		for h := 0; h < nHeadKV; h++ {
+			src := (t*nHeadKV + h) * perHeadToken
+			dst := ((h*dc.Cap + dc.Len + t) * perHeadToken)
+			if err := kb.WriteKV(dc.K, dst, kraw[src:src+perHeadToken]); err != nil {
+				return err
+			}
+			if err := kb.WriteKV(dc.V, dst, vraw[src:src+perHeadToken]); err != nil {
+				return err
+			}
+		}
 	}
 	dc.Len += T
 	return nil

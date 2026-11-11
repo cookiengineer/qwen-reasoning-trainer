@@ -10,6 +10,7 @@ layout(binding = 1)           buffer CACHE { uint data[]; } cache;
 
 layout(push_constant) uniform P {
     uint headDim;
+    uint capacity;
     uint nHeadKV;
     uint T;
     uint pos;
@@ -29,7 +30,7 @@ void main() {
     uint lane = gl_LocalInvocationID.x;
     uint tbase = t * p.headDim * p.nHeadKV;
     uint xbase = tbase + h * p.headDim;
-    uint blk = (p.pos + t) * p.nHeadKV + h;
+    uint blk = h * p.capacity + (p.pos + t);
     uint wordBase = blk * 68u;
 
     for (uint k = 0u; k < 4u; k++) {

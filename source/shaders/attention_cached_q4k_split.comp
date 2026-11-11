@@ -18,6 +18,7 @@ layout(push_constant) uniform P {
     uint  nHead;
     uint  nHeadKV;
     uint  nKV;
+    uint  capacity;
     uint  qStart;
     float scale;
     uint  nSplit;
@@ -59,7 +60,7 @@ void getScaleMinV(uint j, uint s, out uint d, out uint m) {
 
 float dequantK(uint token, uint kv, uint d) {
     uint bph = p.headDim / 256u;
-    uint blk = (token * p.nHeadKV + kv) * bph + d / 256u;
+    uint blk = (kv * p.capacity + token) * bph + d / 256u;
     uint idx = d % 256u;
     uint base = blk * 144u;
     uint sbase = base + 4u;
@@ -79,7 +80,7 @@ float dequantK(uint token, uint kv, uint d) {
 
 float dequantV(uint token, uint kv, uint d) {
     uint bph = p.headDim / 256u;
-    uint blk = (token * p.nHeadKV + kv) * bph + d / 256u;
+    uint blk = (kv * p.capacity + token) * bph + d / 256u;
     uint idx = d % 256u;
     uint base = blk * 144u;
     uint sbase = base + 4u;

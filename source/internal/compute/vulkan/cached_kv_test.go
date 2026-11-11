@@ -10,6 +10,24 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
 
+// writeKVHeadMajor reorders token-major quantized bytes into the head-major
+// runtime cache layout before uploading them.
+func writeKVHeadMajor(t *testing.T, vb *vulkan.Backend, cache compute.Buffer, raw []byte, capacity, nHeadKV int) {
+	t.Helper()
+	per := len(raw) / (capacity * nHeadKV)
+	out := make([]byte, len(raw))
+	for tok := 0; tok < capacity; tok++ {
+		for h := 0; h < nHeadKV; h++ {
+			src := (tok*nHeadKV + h) * per
+			dst := (h*capacity + tok) * per
+			copy(out[dst:dst+per], raw[src:src+per])
+		}
+	}
+	if err := vb.WriteKV(cache, 0, out); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestVulkanCachedAttention(t *testing.T) {
 	_, be := newBackends(t)
 	vb := be.(*vulkan.Backend)
@@ -52,12 +70,8 @@ func TestVulkanCachedAttention(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := vb.WriteKV(kc, 0, kraw); err != nil {
-				t.Fatal(err)
-			}
-			if err := vb.WriteKV(vc, 0, vraw); err != nil {
-				t.Fatal(err)
-			}
+			writeKVHeadMajor(t, vb, kc, kraw, nKV, nHeadKV)
+			writeKVHeadMajor(t, vb, vc, vraw, nKV, nHeadKV)
 
 			qb := up(t, vb, qTail.Dims, qTail.F32)
 			defer vb.Free(qb)
@@ -122,12 +136,8 @@ func TestVulkanCachedAttentionSplit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := vb.WriteKV(kc, 0, kraw); err != nil {
-				t.Fatal(err)
-			}
-			if err := vb.WriteKV(vc, 0, vraw); err != nil {
-				t.Fatal(err)
-			}
+			writeKVHeadMajor(t, vb, kc, kraw, nKV, nHeadKV)
+			writeKVHeadMajor(t, vb, vc, vraw, nKV, nHeadKV)
 			qb := up(t, vb, q.Dims, q.F32)
 			defer vb.Free(qb)
 			out, err := vb.AttentionCached(qb, kc, vc, nHead, nHeadKV, nKV, scale)
@@ -402,6 +412,18 @@ func TestVulkanConvInputStateChunkSelfConsistency(t *testing.T) {
 	}
 }
 
+func headMajorToTokenMajor(vals []float32, hd, nHeadKV, T int) []float32 {
+	out := make([]float32, len(vals))
+	for t := 0; t < T; t++ {
+		for h := 0; h < nHeadKV; h++ {
+			for d := 0; d < hd; d++ {
+				out[d+h*hd+t*nHeadKV*hd] = vals[d+t*hd+h*T*hd]
+			}
+		}
+	}
+	return out
+}
+
 func TestVulkanAppendKV(t *testing.T) {
 	_, be := newBackends(t)
 	vb := be.(*vulkan.Backend)
@@ -455,6 +477,8 @@ func TestVulkanAppendKV(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			kf = headMajorToTokenMajor(kf, hd, nHeadKV, T)
+			vf = headMajorToTokenMajor(vf, hd, nHeadKV, T)
 			tolBase := float32(2e-1 + 2e-1)
 			for i := range k.F32 {
 				tol := tolBase

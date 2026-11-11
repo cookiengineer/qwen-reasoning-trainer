@@ -1246,7 +1246,7 @@ func (b *Backend) AllocKV(headDim, nKVHeads, capacity int, typ quant.Type) (comp
 	if err != nil {
 		return nil, err
 	}
-	buf.dims = []int{headDim, nKVHeads, capacity}
+	buf.dims = []int{headDim, capacity, nKVHeads}
 	buf.typ = typ
 	return buf, nil
 }
@@ -1325,9 +1325,10 @@ func (b *Backend) AppendKV(k, v, kcache, vcache compute.Buffer, pos int) error {
 		return err
 	}
 	hd := kb.Ne0()
-	nKV := dimOr1(kb.dims, 1)
+	capacity := dimOr1(kc.dims, 1)
+	nKV := dimOr1(kc.dims, 2)
 	T := dimOr1(kb.dims, 2)
-	if hd != 256 || T <= 0 || pos < 0 || kc.typ != vc.typ {
+	if hd != 256 || nKV <= 0 || capacity <= 0 || T <= 0 || pos < 0 || kc.typ != vc.typ {
 		return compute.ErrShape
 	}
 	var shader string
@@ -1340,7 +1341,7 @@ func (b *Backend) AppendKV(k, v, kcache, vcache compute.Buffer, pos int) error {
 	default:
 		return fmt.Errorf("vulkan: no KV append shader for %s", kc.typ)
 	}
-	need := uint64(pos+T) * uint64(nKV) * uint64(blockBytes)
+	need := uint64((nKV-1)*capacity+pos+T) * uint64(blockBytes)
 	if need > kc.size || need > vc.size {
 		return compute.ErrShape
 	}
@@ -1351,7 +1352,7 @@ func (b *Backend) AppendKV(k, v, kcache, vcache compute.Buffer, pos int) error {
 		if chunk > maxPerDispatch {
 			chunk = maxPerDispatch
 		}
-		pc := push(uint32(hd), uint32(nKV), uint32(T), uint32(pos), start)
+		pc := push(uint32(hd), uint32(capacity), uint32(nKV), uint32(T), uint32(pos), start)
 		if err := b.dispatch(shader, []*buffer{kb, kc}, pc, [3]uint32{chunk, 1, 1}); err != nil {
 			return err
 		}
@@ -1415,6 +1416,10 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 	default:
 		return nil, fmt.Errorf("vulkan: no cached attention shader for %s", kb.typ)
 	}
+	capacity := dimOr1(kb.dims, 1)
+	if capacity < nKV || dimOr1(kb.dims, 2) != nHeadKV {
+		return nil, compute.ErrShape
+	}
 	qStart := uint32(nKV - nQ)
 	const maxPerDispatch = 65535
 	total := nHead * nQ
@@ -1430,7 +1435,7 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 				return nil, err
 			}
 			p := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
-				uint32(nKV), qStart, scale)
+				uint32(nKV), uint32(capacity), qStart, scale)
 			if err := b.dispatch(shader+"_block", []*buffer{qb, kb, vb, out}, p,
 				[3]uint32{uint32(blocks), uint32(nHead), 1}); err != nil {
 				b.Free(out)
@@ -1447,7 +1452,7 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 			return nil, err
 		}
 		p1 := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
-			uint32(nKV), qStart, scale, uint32(splits), uint32(keysPerSplit))
+			uint32(nKV), uint32(capacity), qStart, scale, uint32(splits), uint32(keysPerSplit))
 		if err := b.dispatch(stage1, []*buffer{qb, kb, vb, b.dummy, part}, p1,
 			[3]uint32{uint32(total), uint32(splits), 1}); err != nil {
 			b.Free(part)
@@ -1488,7 +1493,7 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 			chunk = maxPerDispatch
 		}
 		p := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
-			uint32(nKV), qStart, scale, start)
+			uint32(nKV), uint32(capacity), qStart, scale, start)
 		if err := b.dispatch(shader, []*buffer{qb, kb, vb, out}, p, [3]uint32{chunk, 1, 1}); err != nil {
 			b.Free(out)
 			return nil, err
