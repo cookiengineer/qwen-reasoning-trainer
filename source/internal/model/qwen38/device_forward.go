@@ -113,11 +113,17 @@ func (m *Model) forwardDevice(tokens []int32, opts ForwardOptions) (*ForwardResu
 	logits, err := be.Download(logitsBuf)
 	be.EndScope()
 	be.Free(x)
-	be.Free(h)
 	if err != nil {
+		be.Free(h)
 		return nil, err
 	}
-	return &ForwardResult{Logits: logits, State: st}, nil
+	res := &ForwardResult{Logits: logits, State: st}
+	if opts.CaptureHidden {
+		res.DeviceHidden = h
+	} else {
+		be.Free(h)
+	}
+	return res, nil
 }
 
 func (m *Model) layerNormWeight(il int) compute.Buffer {
@@ -132,6 +138,10 @@ func (m *Model) layerNormWeight(il int) compute.Buffer {
 }
 
 func (m *Model) deviceAttnBlock(il int, lw *deviceAttnLayer, h, x, nextNorm compute.Buffer, positions []int32, st *State) (compute.Buffer, compute.Buffer, error) {
+	return m.deviceAttnBlockCache(il, lw, h, x, nextNorm, positions, st, deviceCache(st, il))
+}
+
+func (m *Model) deviceAttnBlockCache(il int, lw *deviceAttnLayer, h, x, nextNorm compute.Buffer, positions []int32, st *State, dc *DeviceKVCache) (compute.Buffer, compute.Buffer, error) {
 	cfg := m.Cfg
 	be := m.Backend
 	rb := be.(DeviceForwardBackend)
@@ -180,7 +190,6 @@ func (m *Model) deviceAttnBlock(il int, lw *deviceAttnLayer, h, x, nextNorm comp
 	if err != nil {
 		return nil, nil, err
 	}
-	dc := deviceCache(st, il)
 	if dc == nil || st.kvBackend == nil {
 		return nil, nil, fmt.Errorf("device KV cache missing")
 	}
@@ -248,30 +257,73 @@ func (m *Model) deviceGDNBlock(il int, lw *deviceGDNLayer, h, x, nextNorm comput
 	nK := cfg.GroupCount
 	headKDim := cfg.DState
 	convDim := cfg.ConvDim()
+	var err error
 
-	qkv, err := be.MatMulWeight(lw.qkv, h)
+	var qkv, z, betaRaw, alpha compute.Buffer
+	var qkvBase, betaBase compute.Buffer
+	if T == 1 && lw.qkvGate != nil {
+		qkvBase, err = be.MatMulWeight(lw.qkvGate, h)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		qkv, err = rb.SliceF32(qkvBase, 0, []int{convDim, 1})
+		if err != nil {
+			be.Free(qkvBase)
+			return nil, nil, nil, err
+		}
+		z, err = rb.SliceF32(qkvBase, convDim*4, []int{cfg.ValueDim(), 1})
+		if err != nil {
+			be.Free(qkvBase)
+			return nil, nil, nil, err
+		}
+	} else {
+		qkv, err = be.MatMulWeight(lw.qkv, h)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		z, err = be.MatMulWeight(lw.gate, h)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	if T == 1 && lw.betaAlpha != nil {
+		betaBase, err = be.MatMulWeight(lw.betaAlpha, h)
+		if err != nil {
+			be.Free(qkvBase)
+			return nil, nil, nil, err
+		}
+		betaRaw, err = rb.SliceF32(betaBase, 0, []int{nV, 1})
+		if err != nil {
+			be.Free(qkvBase)
+			be.Free(betaBase)
+			return nil, nil, nil, err
+		}
+		alpha, err = rb.SliceF32(betaBase, nV*4, []int{nV, 1})
+		if err != nil {
+			be.Free(qkvBase)
+			be.Free(betaBase)
+			return nil, nil, nil, err
+		}
+	} else {
+		betaRaw, err = be.MatMulWeight(lw.beta, h)
+		if err != nil {
+			be.Free(qkvBase)
+			return nil, nil, nil, err
+		}
+		alpha, err = be.MatMulWeight(lw.alpha, h)
+		if err != nil {
+			be.Free(qkvBase)
+			return nil, nil, nil, err
+		}
+	}
+	gate, beta, err := rb.GDNGateBeta(alpha, betaRaw, lw.ssmDt, lw.ssmA, nV, T)
 	if err != nil {
+		be.Free(qkvBase)
+		be.Free(betaBase)
 		return nil, nil, nil, err
 	}
-	z, err := be.MatMulWeight(lw.gate, h)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	betaRaw, err := be.MatMulWeight(lw.beta, h)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	beta, err := be.Unary(compute.UnarySigmoid, betaRaw)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	alpha, err := be.MatMulWeight(lw.alpha, h)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	gate, err := rb.GDNGate(alpha, lw.ssmDt, lw.ssmA, nV, T)
-	if err != nil {
-		return nil, nil, nil, err
+	if betaBase != nil {
+		be.Free(betaBase)
 	}
 	betaT, err := be.Reshape(beta, []int{1, nV, T})
 	if err != nil {
@@ -279,17 +331,14 @@ func (m *Model) deviceGDNBlock(il int, lw *deviceGDNLayer, h, x, nextNorm comput
 	}
 	convIn, err := rb.ConvInputState(qkv, st.DeviceConv[il], cfg.DConv, convDim, T)
 	if err != nil {
+		be.Free(qkvBase)
 		return nil, nil, nil, err
 	}
 	convOut, err := rb.SSMConvSilu(convIn, lw.conv1d)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	qPre, kPre, v, err := rb.GatherHeads3(convOut, headKDim, nK, headVDim, nV, T, convDim)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	q, k, err := rb.L2Norm2(qPre, kPre, 1e-6)
+	q, k, v, err := rb.GatherHeads3Norm(convOut, headKDim, nK, headVDim, nV, T, convDim, 1e-6)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -302,6 +351,9 @@ func (m *Model) deviceGDNBlock(il int, lw *deviceGDNLayer, h, x, nextNorm comput
 		return nil, nil, nil, err
 	}
 	gated, err := rb.NormSiluMul(out, lw.ssmNorm, zr, cfg.RmsEps)
+	if qkvBase != nil {
+		be.Free(qkvBase)
+	}
 	if err != nil {
 		return nil, nil, nil, err
 	}

@@ -40,6 +40,16 @@ var gemvRowShaders = map[quant.Type]string{
 	quant.TypeIQ4_XS: "gemv_row_iq4_xs",
 }
 
+// gemvMultiShaders are the multi-row/multi-token kernels used for speculative
+// verification (2..8 activations per weight read).
+var gemvMultiShaders = map[quant.Type]string{
+	quant.TypeQ8_0:   "gemv_multi_q8_0",
+	quant.TypeQ4_K:   "gemv_multi_q4_k",
+	quant.TypeQ6_K:   "gemv_multi_q6_k",
+	quant.TypeQ5_K:   "gemv_multi_q5_k",
+	quant.TypeIQ4_XS: "gemv_multi_iq4_xs",
+}
+
 // legacyGEMV disables the row-cooperative GEMV paths for A/B benchmarking.
 var legacyGEMV = os.Getenv("QWEN38_LEGACY_GEMV") == "1"
 
@@ -769,6 +779,98 @@ func (b *Backend) GDNGate(alpha, dt, a compute.Buffer, nV, T int) (compute.Buffe
 	return out, nil
 }
 
+// GDNGateBeta computes softplus(alpha+dt)*a and sigmoid(betaRaw) in one
+// dispatch. dt/a are broadcast over T.
+func (b *Backend) GDNGateBeta(alpha, betaRaw, dt, a compute.Buffer, nV, T int) (compute.Buffer, compute.Buffer, error) {
+	x, err := asBuffer(alpha)
+	if err != nil {
+		return nil, nil, err
+	}
+	br, err := asBuffer(betaRaw)
+	if err != nil {
+		return nil, nil, err
+	}
+	d, err := asBuffer(dt)
+	if err != nil {
+		return nil, nil, err
+	}
+	av, err := asBuffer(a)
+	if err != nil {
+		return nil, nil, err
+	}
+	if nV <= 0 || T <= 0 || x.NumElements() != nV*T || br.NumElements() != nV*T {
+		return nil, nil, compute.ErrShape
+	}
+	gate, err := b.newF32Buffer(1, nV, T)
+	if err != nil {
+		return nil, nil, err
+	}
+	beta, err := b.newF32Buffer(1, nV, T)
+	if err != nil {
+		b.Free(gate)
+		return nil, nil, err
+	}
+	total := uint32(nV * T)
+	if err := b.dispatch1D("gdn_gate_beta", []*buffer{x, br, d, av, gate, beta}, total, func(base uint32) []byte {
+		return push(uint32(nV), uint32(T), base)
+	}); err != nil {
+		b.Free(gate)
+		b.Free(beta)
+		return nil, nil, err
+	}
+	return gate, beta, nil
+}
+
+// MTPConcat builds the NextN [e_norm ; h_norm] projection input. hiddenRows
+// may be nil for a single-token decode step, in which case row zero uses prevH.
+func (b *Backend) MTPConcat(emb, hiddenRows, prevH, wE, wH compute.Buffer, n, t int, eps float32) (compute.Buffer, error) {
+	e, err := asBuffer(emb)
+	if err != nil {
+		return nil, err
+	}
+	ph, err := asBuffer(prevH)
+	if err != nil {
+		return nil, err
+	}
+	we, err := asBuffer(wE)
+	if err != nil {
+		return nil, err
+	}
+	wh, err := asBuffer(wH)
+	if err != nil {
+		return nil, err
+	}
+	if n <= 0 || t <= 0 || e.NumElements() < n*t || ph.NumElements() < n {
+		return nil, compute.ErrShape
+	}
+	var hr *buffer
+	if hiddenRows != nil {
+		hr, err = asBuffer(hiddenRows)
+		if err != nil {
+			return nil, err
+		}
+		if t > 1 && hr.NumElements() < n*(t-1) {
+			return nil, compute.ErrShape
+		}
+	}
+	out, err := b.newF32Buffer(2*n, t)
+	if err != nil {
+		return nil, err
+	}
+	for base := 0; base < t; base += maxWorkGroups {
+		rows := t - base
+		if rows > maxWorkGroups {
+			rows = maxWorkGroups
+		}
+		pc := push(uint32(n), uint32(t), eps, uint32(base))
+		if err := b.dispatch("mtp_concat", []*buffer{e, hr, ph, we, wh, out}, pc, [3]uint32{uint32(rows), 1, 1}); err != nil {
+			b.Free(out)
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 // SSMConvSilu is the causal conv1d forward with a SiLU epilogue.
 func (b *Backend) SSMConvSilu(sx, c compute.Buffer) (compute.Buffer, error) {
 	s, err := asBuffer(sx)
@@ -832,6 +934,45 @@ func (b *Backend) GatherHeads3(convOut compute.Buffer, headK, nK, headV, nV, T, 
 		b.Free(k)
 		b.Free(v)
 		return nil, nil, nil, err
+	}
+	return q, k, v, nil
+}
+
+// GatherHeads3Norm gathers q, k, and v channels and L2-normalizes q/k in one
+// dispatch.
+func (b *Backend) GatherHeads3Norm(convOut compute.Buffer, headK, nK, headV, nV, T, convDim int, eps float32) (compute.Buffer, compute.Buffer, compute.Buffer, error) {
+	cv, err := asBuffer(convOut)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	q, err := b.newF32Buffer(headK, nK, T)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	k, err := b.newF32Buffer(headK, nK, T)
+	if err != nil {
+		b.Free(q)
+		return nil, nil, nil, err
+	}
+	v, err := b.newF32Buffer(headV, nV, T)
+	if err != nil {
+		b.Free(q)
+		b.Free(k)
+		return nil, nil, nil, err
+	}
+	totalRows := 2*nK*T + nV*T
+	for base := 0; base < totalRows; base += maxWorkGroups {
+		rows := totalRows - base
+		if rows > maxWorkGroups {
+			rows = maxWorkGroups
+		}
+		pc := push(uint32(headK), uint32(nK), uint32(headV), uint32(nV), uint32(T), uint32(convDim), eps, uint32(base))
+		if err := b.dispatch("gather_heads3_norm", []*buffer{cv, q, k, v}, pc, [3]uint32{uint32(rows), 1, 1}); err != nil {
+			b.Free(q)
+			b.Free(k)
+			b.Free(v)
+			return nil, nil, nil, err
+		}
 	}
 	return q, k, v, nil
 }
@@ -946,6 +1087,35 @@ func (b *Backend) Reshape(buf compute.Buffer, dims []int) (compute.Buffer, error
 	}
 	v := *x
 	v.dims = append([]int(nil), dims...)
+	v.shared = true
+	return &v, nil
+}
+
+// SliceF32 returns a non-owning float32 view starting at byteOffset inside buf.
+// Vulkan storage-buffer offsets must satisfy the device alignment; 16 bytes is
+// the minimum guaranteed for every implementation we target. Callers that
+// concatenate weights should align segment boundaries accordingly.
+func (b *Backend) SliceF32(buf compute.Buffer, byteOffset int, dims []int) (compute.Buffer, error) {
+	x, err := asBuffer(buf)
+	if err != nil {
+		return nil, err
+	}
+	if x.typ != quant.TypeF32 || byteOffset < 0 || byteOffset%16 != 0 {
+		return nil, compute.ErrShape
+	}
+	n := 1
+	for _, d := range dims {
+		n *= d
+	}
+	size := uint64(n) * 4
+	start := x.offset + uint64(byteOffset)
+	if start+size > x.offset+x.size {
+		return nil, compute.ErrShape
+	}
+	v := *x
+	v.dims = append([]int(nil), dims...)
+	v.offset = start
+	v.size = size
 	v.shared = true
 	return &v, nil
 }
@@ -1346,7 +1516,7 @@ func (b *Backend) WriteKV(cache compute.Buffer, byteOffset int, data []byte) err
 	}
 	b.stats.BytesUploaded += uint64(len(data))
 	if x.mapped != nil {
-		dst := unsafe.Slice((*byte)(x.mapped), x.size)
+		dst := unsafe.Slice((*byte)(unsafe.Add(x.mapped, x.offset)), x.size)
 		copy(dst[byteOffset:byteOffset+len(data)], data)
 		return nil
 	}
@@ -1359,7 +1529,7 @@ func (b *Backend) WriteKV(cache compute.Buffer, byteOffset int, data []byte) err
 		b.destroyBuffer(staging)
 		return err
 	}
-	region := bufferCopy{srcOffset: 0, dstOffset: uint64(byteOffset), size: uint64(len(data))}
+	region := bufferCopy{srcOffset: 0, dstOffset: x.offset + uint64(byteOffset), size: uint64(len(data))}
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, staging.buf, x.buf, 1, uintptr(unsafe.Pointer(&region)))
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
@@ -1391,6 +1561,37 @@ func cachedSplitPlan(nKV, nQ, nHead, nHeadKV int) (keysPerSplit, splits int, ok 
 	}
 	if splits > maxSplits {
 		splits = maxSplits
+	}
+	if splits < 2 {
+		return 0, 0, false
+	}
+	keysPerSplit = (nKV + splits - 1) / splits
+	return keysPerSplit, splits, true
+}
+
+// flashSplitPlan chooses a key-split count for the long-context FlashAttention
+// prefill path. Splitting is useful when the query block grid alone does not
+// keep the GPU busy, or when the per-workgroup key loop is very long.
+func flashSplitPlan(nKV, nQ, nHead int) (keysPerSplit, splits int, ok bool) {
+	if nKV < 2048 || nQ <= 0 || nHead <= 0 {
+		return 0, 0, false
+	}
+	blocks := (nQ + 15) / 16
+	baseGroups := blocks * nHead
+	target := envInt("QWEN38_FLASH_SPLIT_TARGET", 1024)
+	minKeys := envInt("QWEN38_FLASH_SPLIT_MIN_KEYS", 2048)
+	splits = (target + baseGroups - 1) / baseGroups
+	if maxByKeys := nKV / minKeys; splits > maxByKeys {
+		splits = maxByKeys
+	}
+	const maxSplits = 8
+	if splits > maxSplits {
+		splits = maxSplits
+	}
+	// Bound the partial buffer to roughly 256 MiB; reduce splits if needed.
+	const partialBudget = 256 << 20
+	for splits > 1 && nHead*nQ*splits*(256+2)*4 > partialBudget {
+		splits--
 	}
 	if splits < 2 {
 		return 0, 0, false
@@ -1524,10 +1725,56 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 	if nQ > 4 {
 		blocks := (nQ + flashQueries - 1) / flashQueries
 		if blocks <= maxPerDispatch && nHead <= maxPerDispatch {
-			selected := shader + "_block"
 			if b.flashAttention && hd == 256 {
-				selected = flashShader
+				if keysPerSplit, splits, ok := flashSplitPlan(nKV, nQ, nHead); ok {
+					part, err := b.newF32Buffer(total*splits*(hd+2), 1)
+					if err != nil {
+						return nil, err
+					}
+					p := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
+						uint32(nKV), uint32(capacity), qStart, scale, uint32(splits), uint32(keysPerSplit))
+					if err := b.dispatch(flashShader+"_split", []*buffer{qb, kb, vb, part}, p,
+						[3]uint32{uint32(blocks), uint32(nHead), uint32(splits)}); err != nil {
+						b.Free(part)
+						return nil, err
+					}
+					out, err := b.newF32Buffer(qb.dims...)
+					if err != nil {
+						b.Free(part)
+						return nil, err
+					}
+					utotal := uint32(total)
+					for start := uint32(0); start < utotal; start += maxPerDispatch {
+						chunk := utotal - start
+						if chunk > maxPerDispatch {
+							chunk = maxPerDispatch
+						}
+						p2 := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
+							uint32(nKV), uint32(splits), start)
+						if err := b.dispatch("attention_cached_reduce", []*buffer{part, out}, p2,
+							[3]uint32{chunk, 1, 1}); err != nil {
+							b.Free(part)
+							b.Free(out)
+							return nil, err
+						}
+					}
+					b.Free(part)
+					return out, nil
+				}
+				out, err := b.newF32Buffer(qb.dims...)
+				if err != nil {
+					return nil, err
+				}
+				p := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
+					uint32(nKV), uint32(capacity), qStart, scale)
+				if err := b.dispatch(flashShader, []*buffer{qb, kb, vb, out}, p,
+					[3]uint32{uint32(blocks), uint32(nHead), 1}); err != nil {
+					b.Free(out)
+					return nil, err
+				}
+				return out, nil
 			}
+			selected := shader + "_block"
 			out, err := b.newF32Buffer(qb.dims...)
 			if err != nil {
 				return nil, err
@@ -2372,7 +2619,7 @@ func (b *Backend) Copy(dst, src compute.Buffer) error {
 	if err := b.beginBatch(); err != nil {
 		return err
 	}
-	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: s.size}
+	region := bufferCopy{srcOffset: s.offset, dstOffset: d.offset, size: s.size}
 	// Prior compute writes to src must be visible to the transfer stage, and
 	// the result visible to later compute.
 	pre := memoryBarrier{sType: vkStructureMemoryBarrier, srcAccessMask: vkAccessShaderWrite, dstAccessMask: vkAccessTransferRead}
@@ -2548,6 +2795,88 @@ func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
 	return out, nil
 }
 
+// gemvMulti computes W [K,N] * X [K,M] for a small M (2..8) with one weight
+// read per row and R rows per workgroup. It returns errNoGemv when the type has
+// no multi-token kernel so the caller can use the tiled GEMM.
+func (b *Backend) gemvMulti(w, x *buffer, m int) (compute.Buffer, error) {
+	name, ok := gemvMultiShaders[w.typ]
+	if !ok || m < 1 || m > 8 {
+		return nil, errNoGemv
+	}
+	k := w.Ne0()
+	n := dimOr1(w.dims, 1)
+	if x.Ne0() != k || dimOr1(x.dims, 1) != m {
+		return nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(n, m)
+	if err != nil {
+		return nil, err
+	}
+	// The shader computes R=2 rows per workgroup.
+	const rowsPerGroup = 2
+	const maxRows = maxWorkGroups * rowsPerGroup
+	for base := 0; base < n; base += maxRows {
+		rows := n - base
+		if rows > maxRows {
+			rows = maxRows
+		}
+		groups := [3]uint32{ceilDiv(uint32(rows), rowsPerGroup), 1, 1}
+		pc := push(uint32(k), uint32(n), uint32(m), uint32(base))
+		if err := b.dispatch(name, []*buffer{w, x, out}, pc, groups); err != nil {
+			b.Free(out)
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// gemvSmallMFallback runs one GEMV per activation column for quant types that
+// do not have a multi-token kernel. It is still much cheaper than the padded
+// 64x64 GEMM for M=2..8.
+func (b *Backend) gemvSmallMFallback(w, x *buffer, m int) (compute.Buffer, error) {
+	k := w.Ne0()
+	n := dimOr1(w.dims, 1)
+	if x.Ne0() != k || dimOr1(x.dims, 1) != m || x.typ != quant.TypeF32 {
+		return nil, errNoGemv
+	}
+	if k*4%16 != 0 || n*4%16 != 0 {
+		return nil, errNoGemv
+	}
+	out, err := b.newF32Buffer(n, m)
+	if err != nil {
+		return nil, err
+	}
+	for mi := 0; mi < m; mi++ {
+		xcol, err := b.SliceF32(x, mi*k*4, []int{k, 1})
+		if err != nil {
+			b.Free(out)
+			return nil, err
+		}
+		xc, _ := asBuffer(xcol)
+		g, err := b.gemv(w, xc)
+		if err != nil {
+			b.Free(out)
+			if errors.Is(err, errNoGemv) {
+				return nil, errNoGemv
+			}
+			return nil, err
+		}
+		dst, err := b.SliceF32(out, mi*n*4, []int{n, 1})
+		if err != nil {
+			b.Free(g)
+			b.Free(out)
+			return nil, err
+		}
+		if err := b.Copy(dst, g); err != nil {
+			b.Free(g)
+			b.Free(out)
+			return nil, err
+		}
+		b.Free(g)
+	}
+	return out, nil
+}
+
 // MatMulWeight implements compute.Backend. Quantized weights are processed in
 // row blocks: each block is dequantized on the device into a bounded float32
 // scratch buffer and multiplied, then the results are assembled on the host.
@@ -2582,6 +2911,21 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	// which avoids materializing the weight as float32.
 	if m == 1 {
 		if out, gerr := b.gemv(wb, xb); gerr == nil {
+			return out, nil
+		} else if !errors.Is(gerr, errNoGemv) {
+			return nil, gerr
+		}
+	}
+
+	// Small verification batches: decode each weight row once and reuse it for
+	// all M activations. This avoids the 64-column padding of the tiled GEMM.
+	if m > 1 && m <= 8 {
+		if out, gerr := b.gemvMulti(wb, xb, m); gerr == nil {
+			return out, nil
+		} else if !errors.Is(gerr, errNoGemv) {
+			return nil, gerr
+		}
+		if out, gerr := b.gemvSmallMFallback(wb, xb, m); gerr == nil {
 			return out, nil
 		} else if !errors.Is(gerr, errNoGemv) {
 			return nil, gerr

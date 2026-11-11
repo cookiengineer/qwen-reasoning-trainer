@@ -1,0 +1,76 @@
+#version 450
+
+// Multi-row, multi-token Q8_0 GEMV. See gemv_multi_q4_k.comp.
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint M;
+    uint rowBase;
+} p;
+
+#define R 2u
+#define LS 64u
+#define MAXM 8u
+
+shared float red[R * MAXM * LS];
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+float si8(uint o) {
+    uint v = getb(o);
+    return (v >= 128u) ? float(int(v) - 256) : float(v);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid % LS;
+    uint rowInGroup = tid / LS;
+    uint n = p.rowBase + gl_WorkGroupID.x * R + rowInGroup;
+    bool valid = n < p.N;
+    uint blocksPerRow = p.K / 32u;
+
+    float acc[MAXM];
+    for (uint mi = 0u; mi < MAXM; mi++) {
+        acc[mi] = 0.0;
+    }
+
+    if (valid) {
+        for (uint blk = lane; blk < blocksPerRow; blk += LS) {
+            uint base = (n * blocksPerRow + blk) * 34u;
+            float d = f16(base);
+            uint qoff = base + 2u;
+            uint xoff = blk * 32u;
+            for (uint l = 0u; l < 32u; l++) {
+                float w = d * si8(qoff + l);
+                for (uint mi = 0u; mi < p.M; mi++) {
+                    acc[mi] += w * x[mi * p.K + xoff + l];
+                }
+            }
+        }
+    }
+
+    for (uint mi = 0u; mi < MAXM; mi++) {
+        red[(rowInGroup * MAXM + mi) * LS + lane] = acc[mi];
+    }
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        for (uint mi = 0u; mi < MAXM; mi++) {
+            uint base = (rowInGroup * MAXM + mi) * LS;
+            if (lane < s) {
+                red[base + lane] += red[base + lane + s];
+            }
+        }
+        barrier();
+    }
+    if (lane == 0u && valid) {
+        for (uint mi = 0u; mi < p.M; mi++) {
+            y[mi * p.N + n] = red[(rowInGroup * MAXM + mi) * LS];
+        }
+    }
+}

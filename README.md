@@ -102,34 +102,38 @@ OpenAI `tool_calls` with JSON arguments.
 
 Useful flags:
 
-- `--device auto|cpu|vulkan`
-- `--context-length 128k|256k|384k|512k`
-- `--kv-cache-type q4_k|q8_0` (default `q4_k`)
-- `--max-concurrent N` (default 1)
-- `--default-max-tokens N`
-- `--model-id ID`
-- `--api-key KEY` (Bearer auth token)
+| Flag                     | Values                         | Default         |
+|--------------------------|--------------------------------|-----------------|
+| `--device`               | `auto`, `cpu, `vulkan`         | `auto`          |
+| `--context-length`       | `128k`, `256k`, `384k`, `512k` | (GGUF context)  |
+| `--kv-cache-type`        | `q4_k`, `q8_0`                 | `q4_k`          |
+| `--max-concurrent`       | (int)                          | `1`             |
+| `--default-max-tokens`   | (int)                          | `1024`          |
+| `--speculative`          | `true`, `false`                | `true`          |
+| `--spec-draft-max`       | (int)                          | `4`             |
+| `--spec-draft-min-prob`  | (float64)                      | `0.6`           |
+| `--model-id`             | (string)                       | (GGUF filename) |
+| `--api-key`              | (string)                       |                 |
 
-On Vulkan the full inference forward (norms, attention, GatedDeltaNet, FFN, and
-LM head) runs device-resident, and K/V are stored in the quantized cache and
-appended with GPU shaders. The prefill chunk size is selected automatically from
-the context length and device memory. Streaming usage is included when
-`stream_options.include_usage` is true.
+Environment variables:
 
-Limitations: only `n=1`; `logprobs`, `response_format`, and multimodal inputs
-are unsupported; `tool_choice: "none"` disables tools but forced tool selection
-is not enforced.
+| Variable              | Description     |
+|-----------------------|-----------------|
+| `QWEN_SERVER_MODEL`   | Model GGUF Path |
+| `QWEN_SERVER_API_KEY` | Bearer API Key  |
+
+On Vulkan the full inference forward runs device-resident, and K/V are stored in
+the quantized cache and appended with GPU shaders. The prefill chunk size is
+selected automatically from the context length and device memory.
+
+Streaming usage is included when `stream_options.include_usage` is true.
+
+MTP speculative decoding is enabled by default on both Vulkan and CPU.
 
 Context values above the native GGUF context (256k) select YaRN automatically,
 with the factor derived from `context / native_context`.
 
-Full-attention prefill remains O(T^2) and is submitted one layer at a time to
-avoid driver watchdog resets. The packed Q4_K/Q8_0 flash kernels stage half2
-Q/K/V tiles and keep output accumulators in registers; GQA split decode
-dequantizes each KV head once for all six query heads. Prompts beyond ~32k are
-still dominated by full-attention prefill.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the underlying pipeline.
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the underlying pipeline.
 
 ## Abliteration
 

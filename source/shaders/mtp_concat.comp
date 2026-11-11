@@ -1,0 +1,60 @@
+#version 450
+
+// Build the NextN input projection matrix: for each token, RMS-normalize the
+// token embedding and the previous token's hidden state, then write
+// [e_norm ; h_norm] contiguously. One workgroup handles one token row.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer Emb        { float emb[];        };
+layout(binding = 1) readonly  buffer HiddenRows { float hiddenRows[]; };
+layout(binding = 2) readonly  buffer PrevH      { float prevH[];      };
+layout(binding = 3) readonly  buffer WE         { float wE[];         };
+layout(binding = 4) readonly  buffer WH         { float wH[];         };
+layout(binding = 5) writeonly buffer Concat     { float concat[];     };
+
+layout(push_constant) uniform P {
+    uint  N;
+    uint  T;
+    float eps;
+    uint  base;
+} p;
+
+#define LS 64
+shared float redE[LS];
+shared float redH[LS];
+
+void main() {
+    uint row = p.base + gl_WorkGroupID.x;
+    if (row >= p.T) {
+        return;
+    }
+    uint lane = gl_LocalInvocationID.x;
+    float ssE = 0.0;
+    float ssH = 0.0;
+    for (uint d = lane; d < p.N; d += LS) {
+        float e = emb[row * p.N + d];
+        float h = row == 0u ? prevH[d] : hiddenRows[(row - 1u) * p.N + d];
+        ssE += e * e;
+        ssH += h * h;
+    }
+    redE[lane] = ssE;
+    redH[lane] = ssH;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            redE[lane] += redE[lane + s];
+            redH[lane] += redH[lane + s];
+        }
+        barrier();
+    }
+    float invE = 1.0 / sqrt(redE[0] / float(p.N) + p.eps);
+    float invH = 1.0 / sqrt(redH[0] / float(p.N) + p.eps);
+    uint baseOut = row * 2u * p.N;
+    for (uint d = lane; d < p.N; d += LS) {
+        float e = emb[row * p.N + d];
+        float h = row == 0u ? prevH[d] : hiddenRows[(row - 1u) * p.N + d];
+        concat[baseOut + d] = e * invE * wE[d];
+        concat[baseOut + p.N + d] = h * invH * wH[d];
+    }
+}

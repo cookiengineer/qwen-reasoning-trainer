@@ -719,8 +719,12 @@ type buffer struct {
 	// buffer the owning op already released.
 	scopeIdx int
 	size     uint64
-	dims     []int
-	typ      quant.Type
+	// offset is the byte offset of this (possibly shared) view inside the
+	// underlying Vulkan buffer. Descriptors bind at this offset and shaders see
+	// index zero at the view start.
+	offset uint64
+	dims   []int
+	typ    quant.Type
 }
 
 func (x *buffer) Dims() []int { return x.dims }
@@ -1532,7 +1536,7 @@ func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups 
 		if bindings[i] != nil {
 			buf = bindings[i]
 		}
-		infos[i] = descriptorBufferInfo{buffer: buf.buf, offset: 0, rng: buf.size}
+		infos[i] = descriptorBufferInfo{buffer: buf.buf, offset: buf.offset, rng: buf.size}
 		writes[i] = writeDescriptorSet{
 			sType:           vkStructureWriteDescriptorSet,
 			dstSet:          set,
@@ -1591,10 +1595,10 @@ func (b *Backend) copyRows(dst, src *buffer, rows, m, outRows, rowOffset int) er
 		return fmt.Errorf("vulkan: allocate descriptor set failed")
 	}
 	infos := [4]descriptorBufferInfo{
-		{buffer: src.buf, rng: src.size},
-		{buffer: dst.buf, rng: dst.size},
-		{buffer: b.dummy.buf, rng: b.dummy.size},
-		{buffer: b.dummy.buf, rng: b.dummy.size},
+		{buffer: src.buf, offset: src.offset, rng: src.size},
+		{buffer: dst.buf, offset: dst.offset, rng: dst.size},
+		{buffer: b.dummy.buf, offset: b.dummy.offset, rng: b.dummy.size},
+		{buffer: b.dummy.buf, offset: b.dummy.offset, rng: b.dummy.size},
 	}
 	writes := make([]writeDescriptorSet, 4)
 	for i := 0; i < 4; i++ {
@@ -1660,7 +1664,11 @@ func (b *Backend) writeBytes(x *buffer, src []byte) error {
 	}
 	b.stats.BytesUploaded += uint64(len(src))
 	if x.mapped != nil {
-		copy(unsafe.Slice((*byte)(x.mapped), len(src)), src)
+		if x.offset+uint64(len(src)) > x.size {
+			return compute.ErrShape
+		}
+		dst := unsafe.Slice((*byte)(unsafe.Add(x.mapped, x.offset)), len(src))
+		copy(dst, src)
 		return nil
 	}
 	staging, err := b.allocHostBuffer(uint64(len(src)), vkBufferUsageTransferSrc|vkBufferUsageTransferDst)
@@ -1672,7 +1680,7 @@ func (b *Backend) writeBytes(x *buffer, src []byte) error {
 		b.destroyBuffer(staging)
 		return err
 	}
-	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: uint64(len(src))}
+	region := bufferCopy{srcOffset: 0, dstOffset: x.offset, size: uint64(len(src))}
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, staging.buf, x.buf, 1, uintptr(unsafe.Pointer(&region)))
 	// Make the transfer visible to the compute stage before any dispatch reads
 	// the buffer.
@@ -1691,8 +1699,11 @@ func (b *Backend) writeBytes(x *buffer, src []byte) error {
 func (b *Backend) readBytes(x *buffer, n int) ([]byte, error) {
 	b.stats.BytesDownloaded += uint64(n)
 	if x.mapped != nil {
+		if x.offset+uint64(n) > x.size {
+			return nil, compute.ErrShape
+		}
 		out := make([]byte, n)
-		copy(out, unsafe.Slice((*byte)(x.mapped), n))
+		copy(out, unsafe.Slice((*byte)(unsafe.Add(x.mapped, x.offset)), n))
 		return out, nil
 	}
 	if err := b.beginBatch(); err != nil {
@@ -1702,7 +1713,7 @@ func (b *Backend) readBytes(x *buffer, n int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	region := bufferCopy{srcOffset: 0, dstOffset: 0, size: uint64(n)}
+	region := bufferCopy{srcOffset: x.offset, dstOffset: 0, size: uint64(n)}
 	// Make prior compute writes visible to the transfer stage.
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,

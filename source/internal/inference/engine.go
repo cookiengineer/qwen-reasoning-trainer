@@ -33,6 +33,12 @@ type LoadOptions struct {
 	MaxConcurrent int
 	// KVCacheType is "q4_k" (default) or "q8_0".
 	KVCacheType string
+	// Speculative enables the MTP draft head when the model has one.
+	Speculative bool
+	// DraftMax bounds the number of tokens drafted per speculative round.
+	DraftMax int
+	// DraftMinProb stops drafting when the MTP top probability falls below it.
+	DraftMinProb float64
 	// Log receives backend selection diagnostics. Nil discards them.
 	Log io.Writer
 	// LogLevel is "quiet", "info", or "debug"; quiet silences backend logging.
@@ -60,6 +66,10 @@ type Engine struct {
 	kvLimit  bool
 	kvUsed   uint64
 	kvMu     sync.Mutex
+
+	speculative  bool
+	draftMax     int
+	draftMinProb float64
 
 	sem   chan struct{}
 	close sync.Once
@@ -152,6 +162,15 @@ func Load(opt LoadOptions) (*Engine, error) {
 		kvType:       kvType,
 		prefillChunk: AutoPrefillChunk(ctx, caps),
 		sem:          make(chan struct{}, concurrent),
+		speculative:  opt.Speculative && m.W.MTP != nil,
+		draftMax:     opt.DraftMax,
+		draftMinProb: opt.DraftMinProb,
+	}
+	if e.draftMax <= 0 {
+		e.draftMax = 4
+	}
+	if e.draftMinProb <= 0 || e.draftMinProb > 1 {
+		e.draftMinProb = 0.6
 	}
 	if be != nil && caps.MemoryBytes > 0 {
 		e.kvLimit = true
@@ -181,6 +200,12 @@ func (e *Engine) EstimatedKVBytes(context int) uint64 {
 
 // PrefillChunk returns the automatic prompt chunk size for this engine.
 func (e *Engine) PrefillChunk() int { return e.prefillChunk }
+
+// Speculative reports whether MTP speculative decoding is active.
+func (e *Engine) Speculative() bool { return e.speculative }
+
+// DraftMax returns the maximum draft length per speculative round.
+func (e *Engine) DraftMax() int { return e.draftMax }
 
 // KVBudgetBytes returns the device budget available for KV caches. Zero with
 // KVLimited()==false means no limit was derived from the backend.

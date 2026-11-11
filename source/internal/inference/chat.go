@@ -75,6 +75,8 @@ type Result struct {
 	ToolCalls        []ToolCall
 	FinishReason     string
 	Usage            Usage
+	// Tokens is the exact generated token sequence (excluding the final EOS).
+	Tokens []int32
 }
 
 func (e *Engine) render(req ChatRequest) ([]int32, error) {

@@ -1,0 +1,105 @@
+#version 450
+
+// Multi-row, multi-token Q4_K GEMV. One workgroup computes R output rows for
+// up to MAXM activation columns. The weight row is decoded once and reused for
+// all M token vectors, which is what makes speculative verification (M = 2..8)
+// cost roughly one weight read instead of M reads.
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { vec4 x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint M;
+    uint rowBase;
+} p;
+
+#define R 2u
+#define LS 64u
+#define MAXM 8u
+
+shared float red[R * MAXM * LS];
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+
+void scaleMin(uint base, uint s, out float dl, out float ml) {
+    float d = f16(base);
+    float mn = f16(base + 2u);
+    uint sc, m;
+    if (s < 4u) {
+        sc = getb(base + 4u + s) & 63u;
+        m = getb(base + 8u + s) & 63u;
+    } else {
+        sc = (getb(base + 8u + s) & 0xFu) | ((getb(base + s) >> 6u) << 4u);
+        m = (getb(base + 8u + s) >> 4u) | ((getb(base + 4u + s) >> 6u) << 4u);
+    }
+    dl = d * float(sc);
+    ml = mn * float(m);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid % LS;
+    uint rowInGroup = tid / LS;
+    uint n = p.rowBase + gl_WorkGroupID.x * R + rowInGroup;
+    bool valid = n < p.N;
+    uint bpr = p.K / 256u;
+
+    float acc[MAXM];
+    for (uint mi = 0u; mi < MAXM; mi++) {
+        acc[mi] = 0.0;
+    }
+
+    if (valid) {
+        for (uint gi = lane; gi < bpr * 4u; gi += LS) {
+            uint b = gi >> 2u;
+            uint g = gi & 3u;
+            uint base = (n * bpr + b) * 144u;
+            float dl0, ml0, dl1, ml1;
+            scaleMin(base, g * 2u, dl0, ml0);
+            scaleMin(base, g * 2u + 1u, dl1, ml1);
+            vec4 vml0 = vec4(ml0);
+            vec4 vml1 = vec4(ml1);
+            uint qw = (base + 16u + g * 32u) >> 2u;
+            uint k0 = b * 256u + g * 64u;
+            for (uint i = 0u; i < 8u; i++) {
+                uint w = data[qw + i];
+                uvec4 lo = uvec4(
+                    w & 0xFu, (w >> 8u) & 0xFu, (w >> 16u) & 0xFu, (w >> 24u) & 0xFu);
+                uvec4 hi = uvec4(
+                    (w >> 4u) & 0xFu, (w >> 12u) & 0xFu,
+                    (w >> 20u) & 0xFu, (w >> 28u) & 0xFu);
+                vec4 vlo = dl0 * vec4(float(lo.x), float(lo.y), float(lo.z), float(lo.w)) - vml0;
+                vec4 vhi = dl1 * vec4(float(hi.x), float(hi.y), float(hi.z), float(hi.w)) - vml1;
+                for (uint mi = 0u; mi < p.M; mi++) {
+                    uint rowOff = mi * p.K;
+                    acc[mi] += dot(vlo, x[((rowOff + k0) >> 2u) + i]) +
+                               dot(vhi, x[((rowOff + k0 + 32u) >> 2u) + i]);
+                }
+            }
+        }
+    }
+
+    for (uint mi = 0u; mi < MAXM; mi++) {
+        red[(rowInGroup * MAXM + mi) * LS + lane] = acc[mi];
+    }
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        for (uint mi = 0u; mi < MAXM; mi++) {
+            uint base = (rowInGroup * MAXM + mi) * LS;
+            if (lane < s) {
+                red[base + lane] += red[base + lane + s];
+            }
+        }
+        barrier();
+    }
+    if (lane == 0u && valid) {
+        for (uint mi = 0u; mi < p.M; mi++) {
+            y[mi * p.N + n] = red[(rowInGroup * MAXM + mi) * LS];
+        }
+    }
+}

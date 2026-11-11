@@ -1,0 +1,76 @@
+#version 450
+
+// Gather GatedDeltaNet q/k/v channel groups and L2-normalize q/k in the same
+// dispatch. One 64-lane workgroup handles one head/token row, so the reduction
+// does not need a second kernel.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer ConvOut { float cv[]; };
+layout(binding = 1) writeonly buffer QOut    { float q[];  };
+layout(binding = 2) writeonly buffer KOut    { float k[];  };
+layout(binding = 3) writeonly buffer VOut    { float v[];  };
+
+layout(push_constant) uniform P {
+    uint  headK;
+    uint  nK;
+    uint  headV;
+    uint  nV;
+    uint  T;
+    uint  convDim;
+    float eps;
+    uint  base;
+} p;
+
+#define LS 64
+shared float red[LS];
+
+void main() {
+    uint row = p.base + gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint qkRows = 2u * p.nK * p.T;
+    uint vRows = p.nV * p.T;
+    if (row >= qkRows + vRows) {
+        return;
+    }
+
+    if (row < qkRows) {
+        bool isK = row >= p.nK * p.T;
+        uint idx = isK ? row - p.nK * p.T : row;
+        uint hh = idx % p.nK;
+        uint t = idx / p.nK;
+        uint srcBase = (isK ? p.headK * p.nK : 0u) + hh * p.headK + t * p.convDim;
+        float ss = 0.0;
+        for (uint d = lane; d < p.headK; d += LS) {
+            float x = cv[srcBase + d];
+            ss += x * x;
+        }
+        red[lane] = ss;
+        barrier();
+        for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                red[lane] += red[lane + s];
+            }
+            barrier();
+        }
+        float inv = 1.0 / sqrt(red[0] + p.eps);
+        uint dstBase = hh * p.headK + t * (p.nK * p.headK);
+        for (uint d = lane; d < p.headK; d += LS) {
+            float x = cv[srcBase + d] * inv;
+            if (isK) {
+                k[dstBase + d] = x;
+            } else {
+                q[dstBase + d] = x;
+            }
+        }
+    } else {
+        uint idx = row - qkRows;
+        uint hh = idx % p.nV;
+        uint t = idx / p.nV;
+        uint srcBase = 2u * p.headK * p.nK + hh * p.headV + t * p.convDim;
+        uint dstBase = hh * p.headV + t * (p.nV * p.headV);
+        for (uint d = lane; d < p.headV; d += LS) {
+            v[dstBase + d] = cv[srcBase + d];
+        }
+    }
+}

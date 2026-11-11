@@ -23,6 +23,9 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if e.speculative {
+		return e.chatSpec(ctx, req, emit)
+	}
 	e.life.RLock()
 	if e.closed {
 		e.life.RUnlock()
@@ -169,6 +172,7 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 		PromptTokens:     len(prompt),
 		CompletionTokens: len(generated),
 	}
+	result.Tokens = append([]int32(nil), generated...)
 	return &result, nil
 }
 

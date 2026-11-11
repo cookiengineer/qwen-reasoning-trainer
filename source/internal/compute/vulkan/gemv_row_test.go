@@ -139,3 +139,60 @@ func BenchmarkGEMVTypesFFN(b *testing.B) {
 		})
 	}
 }
+
+// TestVulkanGEMVMultiParity checks the small-M multi-token GEMV kernels. It
+// also covers a type without a multi kernel (Q5_K), which must transparently
+// fall back to the tiled GEMM.
+func TestVulkanGEMVMultiParity(t *testing.T) {
+	v, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer v.Close()
+
+	types := []quant.Type{quant.TypeQ4_K, quant.TypeQ5_K, quant.TypeQ6_K, quant.TypeQ8_0, quant.TypeIQ4_XS}
+	for _, typ := range types {
+		for _, m := range []int{2, 5, 8} {
+			typ, m := typ, m
+			t.Run(typ.String(), func(t *testing.T) {
+				const k, n = 512, 37
+				data := make([]float32, k*n)
+				for i := range data {
+					data[i] = float32(math.Sin(float64(i))) * 2
+				}
+				raw, err := quant.Quantize(typ, data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				x := make([]float32, k*m)
+				for i := range x {
+					x[i] = float32(math.Cos(float64(i))) * 0.5
+				}
+				wb, err := v.UploadWeight(typ, raw, []int{k, n})
+				if err != nil {
+					t.Fatal(err)
+				}
+				xb := up(t, v, []int{k, m}, x)
+				got, err := v.MatMulWeight(wb, xb)
+				if err != nil {
+					t.Fatal(err)
+				}
+				dequant, err := quant.Dequant(typ, raw, int64(k*n))
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, err := compute.MatMul(
+					&compute.Tensor{Dims: []int{k, n}, F32: dequant},
+					&compute.Tensor{Dims: []int{k, m}, F32: x},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				compare(t, typ.String(), down(t, v, got), want.F32)
+				v.Free(wb)
+				v.Free(xb)
+				v.Free(got)
+			})
+		}
+	}
+}

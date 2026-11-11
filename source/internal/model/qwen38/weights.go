@@ -40,6 +40,27 @@ type LayerWeights struct {
 	FfnDown *Weight
 }
 
+// MTPWeights is the single NextN/NextN draft block stored after the trunk.
+// It is a full-attention decoder block plus the input projection that mixes the
+// trunk hidden state with the next-token embedding.
+type MTPWeights struct {
+	AttnNorm     []float32
+	PostAttnNorm []float32
+	AttnQ        *Weight
+	AttnK        *Weight
+	AttnV        *Weight
+	AttnOutput   *Weight
+	AttnQNorm    []float32
+	AttnKNorm    []float32
+	FfnGate      *Weight
+	FfnUp        *Weight
+	FfnDown      *Weight
+	EHProj       *Weight
+	ENorm        []float32
+	HNorm        []float32
+	SharedNorm   []float32
+}
+
 // Weights holds all model parameters. Large matrices keep their on-disk
 // quantization; the resident footprint is close to the GGUF file size.
 type Weights struct {
@@ -48,6 +69,7 @@ type Weights struct {
 	OutputNorm []float32
 	Output     *Weight
 	Layers     []LayerWeights
+	MTP        *MTPWeights
 }
 
 func loadVector(g *gguf.File, name string) ([]float32, error) {
@@ -172,6 +194,65 @@ func LoadFromGGUF(g *gguf.File, mc *modelcfg.Config) (*Weights, error) {
 		}
 		w.Layers[il] = lw
 	}
+	if cfg.NextNPredict > 0 && trunk < len(mc.LayerTypes) {
+		mtp := &MTPWeights{}
+		prefix := fmt.Sprintf("blk.%d.", trunk)
+		vecreq := func(dst *[]float32, suffix string) error {
+			v, err := loadVector(g, prefix+suffix)
+			if err != nil {
+				return err
+			}
+			*dst = v
+			return nil
+		}
+		wreq := func(dst **Weight, suffix string) error {
+			v, err := loadWeightFromGGUF(g, prefix+suffix)
+			if err != nil {
+				return err
+			}
+			*dst = v
+			return nil
+		}
+		if err := vecreq(&mtp.AttnNorm, "attn_norm.weight"); err != nil {
+			return nil, err
+		}
+		if err := vecreq(&mtp.PostAttnNorm, "post_attention_norm.weight"); err != nil {
+			return nil, err
+		}
+		for _, e := range []struct {
+			dst    **Weight
+			suffix string
+		}{
+			{&mtp.AttnQ, "attn_q.weight"},
+			{&mtp.AttnK, "attn_k.weight"},
+			{&mtp.AttnV, "attn_v.weight"},
+			{&mtp.AttnOutput, "attn_output.weight"},
+			{&mtp.FfnGate, "ffn_gate.weight"},
+			{&mtp.FfnUp, "ffn_up.weight"},
+			{&mtp.FfnDown, "ffn_down.weight"},
+			{&mtp.EHProj, "nextn.eh_proj.weight"},
+		} {
+			if err := wreq(e.dst, e.suffix); err != nil {
+				return nil, err
+			}
+		}
+		if err := vecreq(&mtp.AttnQNorm, "attn_q_norm.weight"); err != nil {
+			return nil, err
+		}
+		if err := vecreq(&mtp.AttnKNorm, "attn_k_norm.weight"); err != nil {
+			return nil, err
+		}
+		if err := vecreq(&mtp.ENorm, "nextn.enorm.weight"); err != nil {
+			return nil, err
+		}
+		if err := vecreq(&mtp.HNorm, "nextn.hnorm.weight"); err != nil {
+			return nil, err
+		}
+		if err := vecreq(&mtp.SharedNorm, "nextn.shared_head_norm.weight"); err != nil {
+			return nil, err
+		}
+		w.MTP = mtp
+	}
 	return w, nil
 }
 
@@ -196,6 +277,14 @@ func (w *Weights) FreeRaw() {
 			&lw.AttnQ, &lw.AttnK, &lw.AttnV, &lw.AttnOutput,
 			&lw.AttnQKV, &lw.AttnGate, &lw.SSMOut, &lw.SSMAlpha, &lw.SSMBeta,
 			&lw.FfnGate, &lw.FfnUp, &lw.FfnDown,
+		} {
+			free(p)
+		}
+	}
+	if w.MTP != nil {
+		for _, p := range []**Weight{
+			&w.MTP.AttnQ, &w.MTP.AttnK, &w.MTP.AttnV, &w.MTP.AttnOutput,
+			&w.MTP.FfnGate, &w.MTP.FfnUp, &w.MTP.FfnDown, &w.MTP.EHProj,
 		} {
 			free(p)
 		}
@@ -256,6 +345,25 @@ func NewRandom(cfg *Config, seed int64) *Weights {
 		lw.FfnUp = mk(cfg.NEmbd, cfg.NFf)
 		lw.FfnDown = mk(cfg.NFf, cfg.NEmbd)
 		w.Layers[il] = lw
+	}
+	if cfg.NextNPredict > 0 {
+		w.MTP = &MTPWeights{
+			AttnNorm:     ones(cfg.NEmbd),
+			PostAttnNorm: ones(cfg.NEmbd),
+			AttnQ:        mk(cfg.NEmbd, cfg.NHead*cfg.HeadDim*2),
+			AttnK:        mk(cfg.NEmbd, cfg.NHeadKV*cfg.HeadDim),
+			AttnV:        mk(cfg.NEmbd, cfg.NHeadKV*cfg.HeadDim),
+			AttnOutput:   mk(cfg.NHead*cfg.HeadDim, cfg.NEmbd),
+			AttnQNorm:    ones(cfg.HeadDim),
+			AttnKNorm:    ones(cfg.HeadDim),
+			FfnGate:      mk(cfg.NEmbd, cfg.NFf),
+			FfnUp:        mk(cfg.NEmbd, cfg.NFf),
+			FfnDown:      mk(cfg.NFf, cfg.NEmbd),
+			EHProj:       mk(2*cfg.NEmbd, cfg.NEmbd),
+			ENorm:        ones(cfg.NEmbd),
+			HNorm:        ones(cfg.NEmbd),
+			SharedNorm:   ones(cfg.NEmbd),
+		}
 	}
 	return w
 }

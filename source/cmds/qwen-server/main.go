@@ -39,6 +39,9 @@ func run() error {
 	maxConcurrent := flag.Int("max-concurrent", 1, "maximum in-flight generation requests")
 	kvCacheType := flag.String("kv-cache-type", "q4_k", "KV cache type: q4_k|q8_0")
 	maxTokens := flag.Int("default-max-tokens", 1024, "default max_tokens when the request omits it")
+	speculative := flag.Bool("speculative", true, "enable MTP speculative decoding (disable with --speculative=false)")
+	specDraftMax := flag.Int("spec-draft-max", 4, "maximum MTP draft tokens per speculative round")
+	specDraftMinProb := flag.Float64("spec-draft-min-prob", 0.6, "stop drafting when the MTP top probability falls below this value")
 	temperature := flag.Float64("default-temperature", 1.0, "default temperature")
 	topP := flag.Float64("default-top-p", 1.0, "default top_p")
 	topK := flag.Int("default-top-k", 0, "default top_k (0 = disabled)")
@@ -68,6 +71,9 @@ func run() error {
 		ContextLength: contextLen,
 		MaxConcurrent: *maxConcurrent,
 		KVCacheType:   *kvCacheType,
+		Speculative:   *speculative,
+		DraftMax:      *specDraftMax,
+		DraftMinProb:  *specDraftMinProb,
 		Log:           os.Stderr,
 		LogLevel:      *logLevel,
 	})
@@ -117,6 +123,7 @@ func run() error {
 	}
 	logger.Printf("rope-scaling=%s factor=%.3f attn-scale=%.3f",
 		engine.Model.Cfg.RopeScaling, engine.Model.Cfg.RopeScaleFactor, engine.Model.Cfg.AttnScale)
+	logger.Printf("speculative=%t draft-max=%d", engine.Speculative(), engine.DraftMax())
 	logger.Printf("listening on http://%s (model=%s, context=%d)", addr, id, engine.ContextLength())
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
