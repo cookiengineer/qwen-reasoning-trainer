@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"unsafe"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
@@ -31,7 +32,15 @@ var gemvShaders = map[quant.Type]string{
 // instead of one invocation per row with strided reads.
 var gemvRowShaders = map[quant.Type]string{
 	quant.TypeQ8_0: "gemv_row_q8_0",
+	quant.TypeQ4_K: "gemv_row_q4_k",
+	// Q5_K currently stays on the row-per-thread fast path: the cooperative
+	// shader is slower than the legacy kernel at the model's projection shapes.
+	quant.TypeQ6_K:   "gemv_row_q6_k",
+	quant.TypeIQ4_XS: "gemv_row_iq4_xs",
 }
+
+// legacyGEMV disables the row-cooperative GEMV paths for A/B benchmarking.
+var legacyGEMV = os.Getenv("QWEN38_LEGACY_GEMV") == "1"
 
 // matmulWShaders maps a quantized type to its fused dequantize+GEMM shader
 // (C = W x). It removes the float32 scratch of MatMulWeight for m > 1.
@@ -1293,20 +1302,31 @@ func (b *Backend) WriteKV(cache compute.Buffer, byteOffset int, data []byte) err
 	return nil
 }
 
-func cachedSplitPlan(nKV, nQ int) (keysPerSplit, splits int, ok bool) {
-	if nQ > 4 || nKV < 8192 {
+func cachedSplitPlan(nKV, nQ, nHead, nHeadKV int) (keysPerSplit, splits int, ok bool) {
+	if nQ > 4 || nKV < 8192 || nHead <= 0 || nHeadKV <= 0 {
 		return 0, 0, false
 	}
-	const maxSplits = 64
-	keysPerSplit = 8192
-	splits = (nKV + keysPerSplit - 1) / keysPerSplit
+	// Aim for enough workgroups to keep the GPU busy. The GQA decode kernel
+	// merges query heads, so its natural parallelism is nHeadKV per split
+	// instead of nHead*nQ per split.
+	const targetWorkGroups = 256
+	const maxSplits = 128
+	const minKeysPerSplit = 256
+	baseGroups := nHead * nQ
+	if nQ == 1 && nHead/nHeadKV == 6 {
+		baseGroups = nHeadKV
+	}
+	splits = (targetWorkGroups + baseGroups - 1) / baseGroups
+	if maxByKeys := nKV / minKeysPerSplit; splits > maxByKeys {
+		splits = maxByKeys
+	}
 	if splits > maxSplits {
 		splits = maxSplits
-		keysPerSplit = (nKV + splits - 1) / splits
 	}
 	if splits < 2 {
 		return 0, 0, false
 	}
+	keysPerSplit = (nKV + splits - 1) / splits
 	return keysPerSplit, splits, true
 }
 
@@ -1454,7 +1474,7 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 		}
 	}
 
-	if keysPerSplit, splits, ok := cachedSplitPlan(nKV, nQ); ok {
+	if keysPerSplit, splits, ok := cachedSplitPlan(nKV, nQ, nHead, nHeadKV); ok {
 		stage1 := shader + "_split"
 		groups := [3]uint32{uint32(total), uint32(splits), 1}
 		if nQ == 1 {
@@ -2353,7 +2373,10 @@ func (b *Backend) DequantWeight(w compute.Buffer) (compute.Buffer, error) {
 // gemv computes y = W * x for a single activation column using a fused
 // dequantize+GEMV shader. It returns errNoGemv when the type has no shader.
 func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
-	name, rowCooperative := gemvRowShaders[w.typ]
+	name, rowCooperative := "", false
+	if !legacyGEMV {
+		name, rowCooperative = gemvRowShaders[w.typ]
+	}
 	if !rowCooperative {
 		var ok bool
 		name, ok = gemvShaders[w.typ]

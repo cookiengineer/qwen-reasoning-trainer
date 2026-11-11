@@ -62,7 +62,7 @@ NEEDLE_CONTEXTS ?= 128k 256k 384k 512k
 .PHONY: all build build-all server shaders test vet fmt fmt-check tidy clean check \
         verify-ref verify-data verify-quants e2e-venv inspect gpu-info \
         test-real test-real-parity test-real-bench test-real-quality test-real-needle \
-        test-real-decode
+        test-real-decode bench-gemv
 
 all: build
 
@@ -105,6 +105,13 @@ test-real-bench: shaders
 			$(GO) -C $(SRC) test ./internal/inference \
 			-run 'TestRealLongContextBench' -count=1 -v -timeout 6h || exit $$?; \
 	done
+
+# GEMV throughput at real projection shapes (requires a Vulkan device).
+# Override BENCH_RE to narrow the benchmark set, e.g. BENCH_RE=BenchmarkGEMVTypesFFN.
+BENCH_RE ?= BenchmarkGEMV
+bench-gemv: shaders
+	$(GO) -C $(SRC) test ./internal/compute/vulkan \
+		-run '^$$' -bench '$(BENCH_RE)' -benchtime=3x -count=1 -v
 
 # Isolated steady-state decode benchmark (weights + attention + GDN).
 test-real-decode: shaders

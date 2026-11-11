@@ -285,12 +285,16 @@ No cgo. `vulkan.go` loads `libvulkan.so.1` with `purego.Dlopen`, resolves
   `attention_flash_{q4k,q8_0}` (half2 tiles, register accumulators, vector
   quantized word unpack), `attention_decode_gqa_{q4k,q8_0}` (six query heads
   per KV-head split),
-  `attention_cached_{q4k,q8_0}_split`/`attention_cached_reduce`,
+  `attention_cached_{q4k,q8_0}_split`/`attention_cached_reduce` (adaptive split
+  count targeting ~256 workgroups),
   `attn_back_dq_tile`/`attn_back_dkv_tile` (+ `attn_back_dq`/`attn_back_dkv`).
 - Recurrent: `ssm_conv(_back_sx/_back_c)`, `gated_delta_net`, `gdn_back`
   (atomic fallback, needs `VK_EXT_shader_atomic_float`), and the chunked
   `gdn_chunk_{cumsum,ab,fwd,bwd,bwd_local}`.
 - Dequantize/GEMV: `dequant_<type>`, `gemv_<type>` for all nine model types.
+  Q8_0, Q4_K, Q6_K, and IQ4_XS also have row-cooperative `gemv_row_<type>`
+  kernels (one workgroup per output row); Q5_K uses the legacy `gemv_q5_k_fast`
+  path because it is faster at the model's projection shapes.
 - Optimizer: `opt_step_adamw`.
 
 The `.spv` files are committed and embedded (`go:embed`); end users only need

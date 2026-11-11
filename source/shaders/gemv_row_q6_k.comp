@@ -1,0 +1,87 @@
+#version 450
+
+// Row-cooperative Q6_K GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
+// One 64-lane workgroup computes one output row. Lanes split the K reduction
+// into 32-value sub-blocks, unpack four quantized values per unaligned word,
+// and read the activation four floats at a time.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { vec4 x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint rowBase;
+} p;
+
+#define LS 64
+shared float red[LS];
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+uint load4(uint o) {
+    uint w0 = data[o >> 2u];
+    uint sh = (o & 3u) * 8u;
+    if (sh == 0u) {
+        return w0;
+    }
+    uint w1 = data[(o >> 2u) + 1u];
+    return (w0 >> sh) | (w1 << (32u - sh));
+}
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+float s8(uint o) {
+    uint v = getb(o);
+    return (v >= 128u) ? float(int(v) - 256) : float(v);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint n = p.rowBase + gl_WorkGroupID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    float acc = 0.0;
+    for (uint sb = lane; sb < bpr * 8u; sb += LS) {
+        uint b = sb >> 3u;
+        uint s = sb & 7u;
+        uint part = s >> 2u;
+        uint local = s & 3u;
+        uint base = (n * bpr + b) * 210u;
+        float d = f16(base + 208u);
+        uint qlBase = base + part * 64u + (local & 1u) * 32u;
+        uint qhBase = base + 128u + part * 32u;
+        uint scBase = base + 192u + part * 8u + local * 2u;
+        uint shift = local * 2u;
+        uint nibShift = (local >> 1u) * 4u;
+        uint xoff = b * 256u + s * 32u;
+        for (uint hpart = 0u; hpart < 2u; hpart++) {
+            float sc = d * s8(scBase + hpart);
+            uint l0 = hpart * 16u;
+            for (uint i = 0u; i < 4u; i++) {
+                uint ql4 = load4(qlBase + l0 + i * 4u);
+                uint qh4 = load4(qhBase + l0 + i * 4u);
+                uvec4 q = uvec4(
+                    (((ql4 & 0xFFu) >> nibShift) & 0xFu) | (((qh4 & 0xFFu) >> shift) & 3u) << 4u,
+                    ((((ql4 >> 8u) & 0xFFu) >> nibShift) & 0xFu) | ((((qh4 >> 8u) & 0xFFu) >> shift) & 3u) << 4u,
+                    ((((ql4 >> 16u) & 0xFFu) >> nibShift) & 0xFu) | ((((qh4 >> 16u) & 0xFFu) >> shift) & 3u) << 4u,
+                    ((((ql4 >> 24u) & 0xFFu) >> nibShift) & 0xFu) | ((((qh4 >> 24u) & 0xFFu) >> shift) & 3u) << 4u);
+                vec4 qv = vec4(float(q.x), float(q.y), float(q.z), float(q.w)) - vec4(32.0);
+                acc += sc * dot(qv, x[(xoff + l0 + i * 4u) >> 2u]);
+            }
+        }
+    }
+    red[lane] = acc;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] += red[lane + s];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        y[n] = red[0];
+    }
+}

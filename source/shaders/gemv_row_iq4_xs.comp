@@ -1,0 +1,85 @@
+#version 450
+
+// Row-cooperative IQ4_XS GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
+// One 64-lane workgroup computes one output row. Lanes split the K reduction
+// into 32-value sub-blocks, unpack four quantized values per word, and share
+// the 16-entry value lookup table.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { vec4 x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint rowBase;
+} p;
+
+#define LS 64
+shared float KV[16];
+shared float red[LS];
+
+const float KVALS[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    if (lane < 16u) {
+        KV[lane] = KVALS[lane];
+    }
+    barrier();
+
+    uint n = p.rowBase + gl_WorkGroupID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    float acc = 0.0;
+    for (uint sb = lane; sb < bpr * 8u; sb += LS) {
+        uint b = sb >> 3u;
+        uint ib = sb & 7u;
+        uint base = (n * bpr + b) * 136u;
+        float d = f16(base);
+        uint sh = getb(base + 2u) | (getb(base + 3u) << 8u);
+        uint sl = getb(base + 4u + (ib >> 1u));
+        int ls = int((sl >> (4u * (ib & 1u))) & 0xFu) | int(((sh >> (2u * ib)) & 3u) << 4u);
+        float dl = d * float(ls - 32);
+        uint qw = (base + 8u + ib * 16u) >> 2u;
+        uint xoff = b * 256u + ib * 32u;
+        uint xl = xoff >> 2u;
+        uint xh = (xoff + 16u) >> 2u;
+        for (uint i = 0u; i < 4u; i++) {
+            uint w = data[qw + i];
+            uvec4 lo = uvec4(
+                w & 0xFu,
+                (w >> 8u) & 0xFu,
+                (w >> 16u) & 0xFu,
+                (w >> 24u) & 0xFu);
+            uvec4 hi = uvec4(
+                (w >> 4u) & 0xFu,
+                (w >> 12u) & 0xFu,
+                (w >> 20u) & 0xFu,
+                (w >> 28u) & 0xFu);
+            vec4 vlo = vec4(KV[lo.x], KV[lo.y], KV[lo.z], KV[lo.w]);
+            vec4 vhi = vec4(KV[hi.x], KV[hi.y], KV[hi.z], KV[hi.w]);
+            acc += dl * (dot(vlo, x[xl + i]) + dot(vhi, x[xh + i]));
+        }
+    }
+    red[lane] = acc;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] += red[lane + s];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        y[n] = red[0];
+    }
+}
