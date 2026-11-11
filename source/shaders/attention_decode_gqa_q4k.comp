@@ -1,0 +1,224 @@
+#version 450
+
+// GQA-aware split decode attention over a Q4_K KV cache.
+//
+// One workgroup handles all query heads that share a KV head for one key split.
+// Every K/V element is dequantized once and reused by the whole GQA group
+// instead of once per query head. Outputs per-head partial softmax state for
+// attention_cached_reduce. Requires nQ == 1 and headDim == 256.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer Q { float q[]; };
+layout(binding = 1) readonly  buffer K { uint data[]; } kbuf;
+layout(binding = 2) readonly  buffer V { uint data[]; } vbuf;
+layout(binding = 3) writeonly buffer O { float o[]; };
+layout(binding = 4) writeonly buffer PART { float part[]; };
+
+layout(push_constant) uniform P {
+    uint  headDim;
+    uint  nQ;
+    uint  nHead;
+    uint  nHeadKV;
+    uint  nKV;
+    uint  capacity;
+    uint  qStart;
+    float scale;
+    uint  nSplit;
+    uint  keysPerSplit;
+} p;
+
+#define LS 64
+#define HD 256
+#define TILE 64
+#define GROUP 6
+
+shared float qs[GROUP][HD];
+shared float logits[TILE][GROUP];
+shared float mval[GROUP];
+shared float lval[GROUP];
+shared float corr[GROUP];
+
+uint getbK(uint o) { return (kbuf.data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+uint getbV(uint o) { return (vbuf.data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16K(uint o) { return unpackHalf2x16(getbK(o) | (getbK(o + 1u) << 8u)).x; }
+float f16V(uint o) { return unpackHalf2x16(getbV(o) | (getbV(o + 1u) << 8u)).x; }
+
+void getScaleMinK(uint j, uint s, out uint d, out uint m) {
+    if (j < 4u) {
+        d = getbK(s + j) & 63u;
+        m = getbK(s + j + 4u) & 63u;
+    } else {
+        d = (getbK(s + j + 4u) & 0xFu) | ((getbK(s + j - 4u) >> 6) << 4);
+        m = (getbK(s + j + 4u) >> 4) | ((getbK(s + j) >> 6) << 4);
+    }
+}
+void getScaleMinV(uint j, uint s, out uint d, out uint m) {
+    if (j < 4u) {
+        d = getbV(s + j) & 63u;
+        m = getbV(s + j + 4u) & 63u;
+    } else {
+        d = (getbV(s + j + 4u) & 0xFu) | ((getbV(s + j - 4u) >> 6) << 4);
+        m = (getbV(s + j + 4u) >> 4) | ((getbV(s + j) >> 6) << 4);
+    }
+}
+
+float dequantK(uint token, uint kv, uint d) {
+    uint blk = kv * p.capacity + token;
+    uint idx = d % 256u;
+    uint base = blk * 144u;
+    uint sbase = base + 4u;
+    uint qbase = base + 16u;
+    float dd = f16K(base);
+    float mn = f16K(base + 2u);
+    uint j = idx / 64u;
+    uint r = idx % 64u;
+    uint is = j * 2u + r / 32u;
+    uint l = r % 32u;
+    uint sc, m;
+    getScaleMinK(is, sbase, sc, m);
+    uint qv = getbK(qbase + j * 32u + l);
+    uint val = (r < 32u) ? (qv & 0xFu) : (qv >> 4u);
+    return dd * float(sc) * float(val) - mn * float(m);
+}
+
+float dequantV(uint token, uint kv, uint d) {
+    uint blk = kv * p.capacity + token;
+    uint idx = d % 256u;
+    uint base = blk * 144u;
+    uint sbase = base + 4u;
+    uint qbase = base + 16u;
+    float dd = f16V(base);
+    float mn = f16V(base + 2u);
+    uint j = idx / 64u;
+    uint r = idx % 64u;
+    uint is = j * 2u + r / 32u;
+    uint l = r % 32u;
+    uint sc, m;
+    getScaleMinV(is, sbase, sc, m);
+    uint qv = getbV(qbase + j * 32u + l);
+    uint val = (r < 32u) ? (qv & 0xFu) : (qv >> 4u);
+    return dd * float(sc) * float(val) - mn * float(m);
+}
+
+void main() {
+    uint kv = gl_WorkGroupID.y;
+    uint split = gl_WorkGroupID.x;
+    if (kv >= p.nHeadKV || split >= p.nSplit) {
+        return;
+    }
+    if (p.headDim != HD || p.nQ != 1u) {
+        return;
+    }
+    if (p.nHead / p.nHeadKV != GROUP) {
+        return;
+    }
+    uint lane = gl_LocalInvocationID.x;
+
+    uint start = split * p.keysPerSplit;
+    uint end = min(start + p.keysPerSplit, p.nKV);
+    if (start >= end) {
+        return;
+    }
+
+    for (uint g = 0u; g < GROUP; g++) {
+        uint h = kv * GROUP + g;
+        for (uint d = lane; d < HD; d += LS) {
+            qs[g][d] = q[h * HD + d];
+        }
+    }
+    float acc[GROUP * 4];
+    for (uint i = 0u; i < GROUP * 4u; i++) {
+        acc[i] = 0.0;
+    }
+    if (lane == 0u) {
+        for (uint g = 0u; g < GROUP; g++) {
+            mval[g] = -1e30;
+            lval[g] = 0.0;
+            corr[g] = 1.0;
+        }
+    }
+    barrier();
+
+    for (uint t0 = start; t0 < end; t0 += TILE) {
+        uint tlen = min(uint(TILE), end - t0);
+
+        if (lane < tlen) {
+            uint e = lane;
+            float dots[GROUP];
+            for (uint g = 0u; g < GROUP; g++) {
+                dots[g] = 0.0;
+            }
+            for (uint d = 0u; d < HD; d++) {
+                float kval = dequantK(t0 + e, kv, d);
+                for (uint g = 0u; g < GROUP; g++) {
+                    dots[g] += qs[g][d] * kval;
+                }
+            }
+            for (uint g = 0u; g < GROUP; g++) {
+                logits[e][g] = dots[g] * p.scale;
+            }
+        }
+        barrier();
+
+        if (lane < GROUP) {
+            uint g = lane;
+            float tileMax = -1e30;
+            for (uint e = 0u; e < tlen; e++) {
+                tileMax = max(tileMax, logits[e][g]);
+            }
+            float newM = max(mval[g], tileMax);
+            float c = exp(mval[g] - newM);
+            float sum = 0.0;
+            for (uint e = 0u; e < tlen; e++) {
+                float pe = exp(logits[e][g] - newM);
+                logits[e][g] = pe;
+                sum += pe;
+            }
+            lval[g] = lval[g] * c + sum;
+            mval[g] = newM;
+            corr[g] = c;
+        }
+        barrier();
+
+        uint d0 = lane;
+        uint d1 = lane + LS;
+        for (uint g = 0u; g < GROUP; g++) {
+            float c = corr[g];
+            acc[g * 4u] *= c;
+            acc[g * 4u + 1u] *= c;
+            acc[g * 4u + 2u] *= c;
+            acc[g * 4u + 3u] *= c;
+        }
+        for (uint e = 0u; e < tlen; e++) {
+            float v0 = dequantV(t0 + e, kv, d0 * 2u);
+            float v1 = dequantV(t0 + e, kv, d0 * 2u + 1u);
+            float v2 = dequantV(t0 + e, kv, d1 * 2u);
+            float v3 = dequantV(t0 + e, kv, d1 * 2u + 1u);
+            for (uint g = 0u; g < GROUP; g++) {
+                float w = logits[e][g];
+                acc[g * 4u] += w * v0;
+                acc[g * 4u + 1u] += w * v1;
+                acc[g * 4u + 2u] += w * v2;
+                acc[g * 4u + 3u] += w * v3;
+            }
+        }
+        barrier();
+    }
+
+    uint stride = HD + 2u;
+    uint d0 = lane;
+    uint d1 = lane + LS;
+    for (uint g = 0u; g < GROUP; g++) {
+        uint h = kv * GROUP + g;
+        uint off = (h * p.nSplit + split) * stride;
+        if (lane == 0u) {
+            part[off] = mval[g];
+            part[off + 1u] = lval[g];
+        }
+        part[off + 2u + d0 * 2u] = acc[g * 4u];
+        part[off + 2u + d0 * 2u + 1u] = acc[g * 4u + 1u];
+        part[off + 2u + d1 * 2u] = acc[g * 4u + 2u];
+        part[off + 2u + d1 * 2u + 1u] = acc[g * 4u + 3u];
+    }
+}

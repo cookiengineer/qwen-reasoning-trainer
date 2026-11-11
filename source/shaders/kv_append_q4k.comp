@@ -1,12 +1,15 @@
 #version 450
 
 // Quantizes one 256-value K/V head block to Q4_K and appends it to a KV cache.
-// One workgroup handles one (token, KV head); headDim must be 256.
+// K and V are processed in parallel by the two 64-lane halves of the workgroup;
+// one workgroup handles one (token, KV head). headDim must be 256.
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 128) in;
 
-layout(binding = 0) readonly  buffer X     { float x[];    };
-layout(binding = 1)           buffer CACHE { uint data[]; } cache;
+layout(binding = 0) readonly  buffer XK { vec4 x[]; } kx;
+layout(binding = 1) readonly  buffer XV { vec4 x[]; } vx;
+layout(binding = 2)           buffer KC { uvec4 data[]; } kcache;
+layout(binding = 3)           buffer VC { uvec4 data[]; } vcache;
 
 layout(push_constant) uniform P {
     uint headDim;
@@ -17,16 +20,18 @@ layout(push_constant) uniform P {
     uint base;
 } p;
 
-shared float vals[256];
-shared float sbMin[8];
-shared float sbMax[8];
-shared float sbScale[8];
-shared float sbMinQ[8];
-shared float qd;
-shared float qdmin;
-shared uint scArr[8];
-shared uint mArr[8];
-shared uint sb[144];
+// First 256 entries are K, second 256 are V.
+shared float vals[512];
+shared float sbMin[16];
+shared float sbMax[16];
+shared float sbScale[16];
+shared float sbMinQ[16];
+shared float qd[2];
+shared float qdmin[2];
+shared uint scArr[16];
+shared uint mArr[16];
+// 144 uint slots per half (bytes of one Q4_K block).
+shared uint sb[288];
 
 float rnd(float v) { return floor(v + 0.5); }
 
@@ -36,57 +41,64 @@ void main() {
     uint t = qid / p.nHeadKV;
     uint h = qid % p.nHeadKV;
     uint lane = gl_LocalInvocationID.x;
+    bool isV = lane >= 64u;
+    uint sl = lane & 63u;
+    uint sidx = isV ? 8u : 0u;
+    uint sbo = isV ? 144u : 0u;
+    uint vbase = isV ? 256u : 0u;
+
     uint tbase = t * p.headDim * p.nHeadKV;
     uint xbase = tbase + h * p.headDim;
-    uint blk = h * p.capacity + (p.pos + t);
-    uint wordBase = blk * 36u;
-
-    for (uint k = 0u; k < 4u; k++) {
-        uint idx = lane * 4u + k;
-        vals[idx] = x[xbase + idx];
-    }
+    uint xw = (xbase >> 2u) + sl;
+    vec4 v = isV ? vx.x[xw] : kx.x[xw];
+    vals[vbase + sl * 4u] = v.x;
+    vals[vbase + sl * 4u + 1u] = v.y;
+    vals[vbase + sl * 4u + 2u] = v.z;
+    vals[vbase + sl * 4u + 3u] = v.w;
     barrier();
 
-    if (lane < 8u) {
-        float lo = vals[lane * 32u];
+    if (sl < 8u) {
+        float lo = vals[vbase + sl * 32u];
         float hi = lo;
         for (uint i = 1u; i < 32u; i++) {
-            float v = vals[lane * 32u + i];
-            lo = min(lo, v);
-            hi = max(hi, v);
+            float x = vals[vbase + sl * 32u + i];
+            lo = min(lo, x);
+            hi = max(hi, x);
         }
         if (lo > 0.0) lo = 0.0;
-        sbMin[lane] = lo;
-        sbMax[lane] = hi;
-        sbScale[lane] = hi > lo ? (hi - lo) / 15.0 : 0.0;
-        sbMinQ[lane] = -lo;
+        sbMin[sidx + sl] = lo;
+        sbMax[sidx + sl] = hi;
+        sbScale[sidx + sl] = hi > lo ? (hi - lo) / 15.0 : 0.0;
+        sbMinQ[sidx + sl] = -lo;
     }
     barrier();
 
-    if (lane == 0u) {
+    if (sl == 0u) {
         float maxScale = 0.0;
         float maxMin = 0.0;
         for (uint i = 0u; i < 8u; i++) {
-            maxScale = max(maxScale, sbScale[i]);
-            maxMin = max(maxMin, sbMinQ[i]);
+            maxScale = max(maxScale, sbScale[sidx + i]);
+            maxMin = max(maxMin, sbMinQ[sidx + i]);
         }
-        qd = maxScale / 63.0;
-        qdmin = maxMin / 63.0;
+        float dsc = maxScale / 63.0;
+        float dmin = maxMin / 63.0;
+        qd[isV ? 1u : 0u] = dsc;
+        qdmin[isV ? 1u : 0u] = dmin;
         for (uint i = 0u; i < 8u; i++) {
-            scArr[i] = qd > 0.0 ? uint(clamp(rnd(sbScale[i] / qd), 0.0, 63.0)) : 0u;
-            mArr[i] = qdmin > 0.0 ? uint(clamp(rnd(sbMinQ[i] / qdmin), 0.0, 63.0)) : 0u;
+            scArr[sidx + i] = dsc > 0.0 ? uint(clamp(rnd(sbScale[sidx + i] / dsc), 0.0, 63.0)) : 0u;
+            mArr[sidx + i] = dmin > 0.0 ? uint(clamp(rnd(sbMinQ[sidx + i] / dmin), 0.0, 63.0)) : 0u;
         }
-        uint hd = packHalf2x16(vec2(qd, 0.0));
-        uint hm = packHalf2x16(vec2(qdmin, 0.0));
-        sb[0] = hd & 0xFFu;
-        sb[1] = (hd >> 8u) & 0xFFu;
-        sb[2] = hm & 0xFFu;
-        sb[3] = (hm >> 8u) & 0xFFu;
+        uint hd = packHalf2x16(vec2(dsc, 0.0));
+        uint hm = packHalf2x16(vec2(dmin, 0.0));
+        sb[sbo + 0u] = hd & 0xFFu;
+        sb[sbo + 1u] = (hd >> 8u) & 0xFFu;
+        sb[sbo + 2u] = hm & 0xFFu;
+        sb[sbo + 3u] = (hm >> 8u) & 0xFFu;
         uint packed[12];
         for (uint i = 0u; i < 12u; i++) { packed[i] = 0u; }
         for (uint j = 0u; j < 8u; j++) {
-            uint l = scArr[j];
-            uint m = mArr[j];
+            uint l = scArr[sidx + j];
+            uint m = mArr[sidx + j];
             if (j < 4u) {
                 packed[j] = l;
                 packed[j + 4u] = m;
@@ -97,34 +109,51 @@ void main() {
             }
         }
         for (uint i = 0u; i < 12u; i++) {
-            sb[4u + i] = packed[i];
+            sb[sbo + 4u + i] = packed[i];
         }
     }
     barrier();
 
-    float dsc = qd;
-    float dmin = qdmin;
+    float dsc = qd[isV ? 1u : 0u];
+    float dmin = qdmin[isV ? 1u : 0u];
     for (uint pass = 0u; pass < 2u; pass++) {
-        uint b = lane + pass * 64u;
+        uint b = sl + pass * 64u;
         uint g = b / 32u;
         uint within = b % 32u;
         uint i0 = g * 64u + within;
         uint i1 = g * 64u + 32u + within;
         uint s0 = i0 / 32u;
         uint s1 = i1 / 32u;
-        float d0 = dsc * float(scArr[s0]);
-        float d1 = dsc * float(scArr[s1]);
-        float q0 = d0 != 0.0 ? rnd((vals[i0] + dmin * float(mArr[s0])) / d0) : 0.0;
-        float q1 = d1 != 0.0 ? rnd((vals[i1] + dmin * float(mArr[s1])) / d1) : 0.0;
+        float d0 = dsc * float(scArr[sidx + s0]);
+        float d1 = dsc * float(scArr[sidx + s1]);
+        float q0 = d0 != 0.0 ? rnd((vals[vbase + i0] + dmin * float(mArr[sidx + s0])) / d0) : 0.0;
+        float q1 = d1 != 0.0 ? rnd((vals[vbase + i1] + dmin * float(mArr[sidx + s1])) / d1) : 0.0;
         uint u0 = uint(clamp(q0, 0.0, 15.0));
         uint u1 = uint(clamp(q1, 0.0, 15.0));
-        sb[16u + b] = u0 | (u1 << 4u);
+        sb[sbo + 16u + b] = u0 | (u1 << 4u);
     }
     barrier();
 
-    for (uint i = lane; i < 36u; i += 64u) {
-        uint w = sb[i * 4u] | (sb[i * 4u + 1u] << 8u) |
-                 (sb[i * 4u + 2u] << 16u) | (sb[i * 4u + 3u] << 24u);
-        cache.data[wordBase + i] = w;
+    uint blk = h * p.capacity + (p.pos + t);
+    uint wordBase = blk * 36u;
+    for (uint i = sl; i < 9u; i += 64u) {
+        uint j = sbo + i * 16u;
+        uint b0 = sb[j];
+        uint b1 = sb[j + 1u];
+        uint b2 = sb[j + 2u];
+        uint b3 = sb[j + 3u];
+        uvec4 packedOut = uvec4(
+            b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u),
+            sb[j + 4u] | (sb[j + 5u] << 8u) |
+                (sb[j + 6u] << 16u) | (sb[j + 7u] << 24u),
+            sb[j + 8u] | (sb[j + 9u] << 8u) |
+                (sb[j + 10u] << 16u) | (sb[j + 11u] << 24u),
+            sb[j + 12u] | (sb[j + 13u] << 8u) |
+                (sb[j + 14u] << 16u) | (sb[j + 15u] << 24u));
+        if (isV) {
+            vcache.data[(wordBase >> 2u) + i] = packedOut;
+        } else {
+            kcache.data[(wordBase >> 2u) + i] = packedOut;
+        }
     }
 }

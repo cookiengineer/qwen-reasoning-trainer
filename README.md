@@ -124,8 +124,10 @@ Context values above the native GGUF context (256k) select YaRN automatically,
 with the factor derived from `context / native_context`.
 
 Full-attention prefill remains O(T^2) and is submitted one layer at a time to
-avoid driver watchdog resets. The blocked cached-attention shaders amortize KV
-dequantization across 16 queries, but prompts beyond ~32k are still slow.
+avoid driver watchdog resets. The packed Q4_K flash kernel stages half2 Q/K/V
+tiles and keeps output accumulators in registers; GQA split decode dequantizes
+each KV head once for all six query heads. Prompts beyond ~32k are still
+dominated by full-attention prefill.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the underlying pipeline.
 

@@ -27,7 +27,11 @@ func TestRealDecodeBench(t *testing.T) {
 		t.Fatalf("prefill tokens %d leave no room for %d decode tokens", prefillTokens, decodeTokens)
 	}
 
-	engine, backend := loadRealEngine(t, contextLength, "q4_k")
+	kvType := "q4_k"
+	if value := envString(t, "QWEN38_DECODE_KV"); value != "" {
+		kvType = value
+	}
+	engine, backend := loadRealEngine(t, contextLength, kvType)
 	defer engine.Close()
 	backend.ResetStats()
 

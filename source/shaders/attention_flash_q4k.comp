@@ -8,6 +8,12 @@
 // and the PV phase keeps four value-dimension accumulators, so the inner loops
 // have instruction-level parallelism instead of a serial dot chain.
 //
+// Shared-memory footprint is kept small so more than one workgroup can reside
+// per CU: Q is packed as half2 pairs across queries, K/V tiles are packed as
+// half2 pairs across the head dimension, and the output accumulators live in
+// per-lane registers. Quantized K/V words are unpacked four bytes at a time
+// instead of one byte per value.
+//
 // Dispatch is [queryBlocks, nHead]. This shader requires headDim == 256.
 
 layout(local_size_x = 64) in;
@@ -32,10 +38,13 @@ layout(push_constant) uniform P {
 #define QB 16
 #define KT 16
 #define HD 256
+#define QP (QB / 2)
+#define KP (HD / 2)
 
-shared float qs[QB][HD + 1];
-shared float acc[QB][HD + 1];
-shared float ktile[KT][HD + 1];
+// qs[d][qp] packs the two query vectors qp*2 and qp*2+1 at dimension d.
+shared uint qs[HD][QP + 1];
+// ktile[e][p] packs dimensions 2*p and 2*p+1 of key/value e.
+shared uint ktile[KT][KP + 1];
 shared float logits[QB][KT + 1];
 shared float ss[KT][8];
 shared float sm[KT][8];
@@ -45,13 +54,13 @@ shared float corr[QB];
 
 uint getbK(uint o) { return (kbuf.data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
 uint getbV(uint o) { return (vbuf.data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
-float f16K(uint o) { return unpackHalf2x16(getbK(o) | (getbK(o + 1u) << 8u)).x; }
-float f16V(uint o) { return unpackHalf2x16(getbV(o) | (getbV(o + 1u) << 8u)).x; }
 
 void loadScales(uint base, bool useV, uint e) {
-    float d = useV ? f16V(base) : f16K(base);
-    float mn = useV ? f16V(base + 2u) : f16K(base + 2u);
-    uint sw = (base + 4u) >> 2u;
+    uint hdr = useV ? vbuf.data[base >> 2u] : kbuf.data[base >> 2u];
+    vec2 dm = unpackHalf2x16(hdr);
+    float d = dm.x;
+    float mn = dm.y;
+    uint sw = (base >> 2u) + 1u;
     uint w0 = useV ? vbuf.data[sw] : kbuf.data[sw];
     uint w1 = useV ? vbuf.data[sw + 1u] : kbuf.data[sw + 1u];
     uint w2 = useV ? vbuf.data[sw + 2u] : kbuf.data[sw + 2u];
@@ -75,6 +84,34 @@ void loadScales(uint base, bool useV, uint e) {
     sm[e][7] = mn * float((b11 >> 4u) | ((b7 >> 6u) << 4u));
 }
 
+// Unpack one 4-byte Q4_K word (8 values: four low nibbles then four high
+// nibbles) into four half2 words in ktile.
+void dequantWord(uint e, uint wj, uint packed) {
+    uint g = wj / 8u;
+    uint d0 = g * 64u + (wj % 8u) * 4u;
+    uint sLo = g * 2u;
+    uint sHi = sLo + 1u;
+    float loD = ss[e][sLo], loM = sm[e][sLo];
+    float hiD = ss[e][sHi], hiM = sm[e][sHi];
+    uint b0 = packed & 0xFFu;
+    uint b1 = (packed >> 8u) & 0xFFu;
+    uint b2 = (packed >> 16u) & 0xFFu;
+    uint b3 = (packed >> 24u) & 0xFFu;
+    uint p = d0 >> 1u;
+    ktile[e][p] = packHalf2x16(vec2(
+        loD * float(b0 & 0xFu) - loM,
+        loD * float(b1 & 0xFu) - loM));
+    ktile[e][p + 1u] = packHalf2x16(vec2(
+        loD * float(b2 & 0xFu) - loM,
+        loD * float(b3 & 0xFu) - loM));
+    ktile[e][p + 16u] = packHalf2x16(vec2(
+        hiD * float(b0 >> 4u) - hiM,
+        hiD * float(b1 >> 4u) - hiM));
+    ktile[e][p + 17u] = packHalf2x16(vec2(
+        hiD * float(b2 >> 4u) - hiM,
+        hiD * float(b3 >> 4u) - hiM));
+}
+
 void main() {
     uint h = gl_WorkGroupID.y;
     uint i0 = gl_WorkGroupID.x * QB;
@@ -88,20 +125,25 @@ void main() {
     uint kv = h / group;
     uint lane = gl_LocalInvocationID.x;
 
-    for (uint qi = 0u; qi < QB; qi++) {
-        uint i = i0 + qi;
-        if (i < p.nQ) {
-            uint qOff = (i * p.nHead + h) * HD;
-            for (uint d = lane; d < HD; d += LS) {
-                qs[qi][d] = q[qOff + d];
-                acc[qi][d] = 0.0;
-            }
-        } else {
-            for (uint d = lane; d < HD; d += LS) {
-                qs[qi][d] = 0.0;
-                acc[qi][d] = 0.0;
-            }
+    for (uint qp = 0u; qp < QP; qp++) {
+        uint qa = i0 + qp * 2u;
+        uint qb = qa + 1u;
+        uint aOff = 0u, bOff = 0u;
+        if (qa < p.nQ) {
+            aOff = (qa * p.nHead + h) * HD;
         }
+        if (qb < p.nQ) {
+            bOff = (qb * p.nHead + h) * HD;
+        }
+        for (uint d = lane; d < HD; d += LS) {
+            float va = qa < p.nQ ? q[aOff + d] : 0.0;
+            float vb = qb < p.nQ ? q[bOff + d] : 0.0;
+            qs[d][qp] = packHalf2x16(vec2(va, vb));
+        }
+    }
+    float acc[QB * 4];
+    for (uint i = 0u; i < QB * 4u; i++) {
+        acc[i] = 0.0;
     }
     if (lane < QB) {
         mval[lane] = -1e30;
@@ -129,31 +171,39 @@ void main() {
         }
         barrier();
 
-        for (uint idx = lane; idx < KT * HD; idx += LS) {
-            uint e = idx / HD;
-            uint d = idx - e * HD;
+        for (uint wi = lane; wi < KT * 32u; wi += LS) {
+            uint e = wi / 32u;
+            uint wj = wi % 32u;
             if (e < tlen) {
                 uint base = (kv * p.capacity + (t0 + e)) * 144u;
-                uint sub = d / 32u;
-                uint l = d % 32u;
-                uint qv = getbK(base + 16u + (sub >> 1u) * 32u + l);
-                uint val = (sub & 1u) == 0u ? (qv & 0xFu) : (qv >> 4u);
-                ktile[e][d] = ss[e][sub] * float(val) - sm[e][sub];
+                uint packed = kbuf.data[(base >> 2u) + 4u + wj];
+                dequantWord(e, wj, packed);
             } else {
-                ktile[e][d] = 0.0;
+                uint g = wj / 8u;
+                uint d0 = g * 64u + (wj % 8u) * 4u;
+                uint pp = d0 >> 1u;
+                ktile[e][pp] = 0u;
+                ktile[e][pp + 1u] = 0u;
+                ktile[e][pp + 16u] = 0u;
+                ktile[e][pp + 17u] = 0u;
             }
         }
         barrier();
 
         uint e = lane / 4u;
         uint qi0 = (lane % 4u) * 4u;
+        uint qp = qi0 >> 1u;
         float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
-        for (uint d = 0u; d < HD; d++) {
-            float kval = ktile[e][d];
-            a0 += qs[qi0 + 0u][d] * kval;
-            a1 += qs[qi0 + 1u][d] * kval;
-            a2 += qs[qi0 + 2u][d] * kval;
-            a3 += qs[qi0 + 3u][d] * kval;
+        for (uint pi = 0u; pi < KP; pi++) {
+            vec2 kval = unpackHalf2x16(ktile[e][pi]);
+            vec2 q01 = unpackHalf2x16(qs[pi * 2u][qp]);
+            vec2 q23 = unpackHalf2x16(qs[pi * 2u][qp + 1u]);
+            vec2 q01b = unpackHalf2x16(qs[pi * 2u + 1u][qp]);
+            vec2 q23b = unpackHalf2x16(qs[pi * 2u + 1u][qp + 1u]);
+            a0 += q01.x * kval.x + q01b.x * kval.y;
+            a1 += q01.y * kval.x + q01b.y * kval.y;
+            a2 += q23.x * kval.x + q23b.x * kval.y;
+            a3 += q23.y * kval.x + q23b.y * kval.y;
         }
         uint maxJ = t0 + e;
         for (uint qq = 0u; qq < 4u; qq++) {
@@ -204,55 +254,62 @@ void main() {
         }
         barrier();
 
-        for (uint idx = lane; idx < KT * HD; idx += LS) {
-            uint ve = idx / HD;
-            uint d = idx - ve * HD;
+        for (uint wi = lane; wi < KT * 32u; wi += LS) {
+            uint ve = wi / 32u;
+            uint wj = wi % 32u;
             if (ve < tlen) {
                 uint base = (kv * p.capacity + (t0 + ve)) * 144u;
-                uint sub = d / 32u;
-                uint l = d % 32u;
-                uint qv = getbV(base + 16u + (sub >> 1u) * 32u + l);
-                uint val = (sub & 1u) == 0u ? (qv & 0xFu) : (qv >> 4u);
-                ktile[ve][d] = ss[ve][sub] * float(val) - sm[ve][sub];
+                uint packed = vbuf.data[(base >> 2u) + 4u + wj];
+                dequantWord(ve, wj, packed);
             } else {
-                ktile[ve][d] = 0.0;
+                uint g = wj / 8u;
+                uint d0 = g * 64u + (wj % 8u) * 4u;
+                uint pp = d0 >> 1u;
+                ktile[ve][pp] = 0u;
+                ktile[ve][pp + 1u] = 0u;
+                ktile[ve][pp + 16u] = 0u;
+                ktile[ve][pp + 17u] = 0u;
             }
         }
         barrier();
 
-        uint d0 = lane;
-        uint d1 = lane + LS;
-        uint d2 = lane + 2u * LS;
-        uint d3 = lane + 3u * LS;
+        uint p0 = lane;
+        uint p1 = lane + LS;
         for (uint qi = 0u; qi < QB; qi++) {
             float c = corr[qi];
-            float p0 = acc[qi][d0] * c;
-            float p1 = acc[qi][d1] * c;
-            float p2 = acc[qi][d2] * c;
-            float p3 = acc[qi][d3] * c;
+            float s0 = acc[qi * 4u] * c;
+            float s1 = acc[qi * 4u + 1u] * c;
+            float s2 = acc[qi * 4u + 2u] * c;
+            float s3 = acc[qi * 4u + 3u] * c;
             for (uint j = 0u; j < tlen; j++) {
                 float w = logits[qi][j];
-                p0 += w * ktile[j][d0];
-                p1 += w * ktile[j][d1];
-                p2 += w * ktile[j][d2];
-                p3 += w * ktile[j][d3];
+                vec2 kv0 = unpackHalf2x16(ktile[j][p0]);
+                vec2 kv1 = unpackHalf2x16(ktile[j][p1]);
+                s0 += w * kv0.x;
+                s1 += w * kv0.y;
+                s2 += w * kv1.x;
+                s3 += w * kv1.y;
             }
-            acc[qi][d0] = p0;
-            acc[qi][d1] = p1;
-            acc[qi][d2] = p2;
-            acc[qi][d3] = p3;
+            acc[qi * 4u] = s0;
+            acc[qi * 4u + 1u] = s1;
+            acc[qi * 4u + 2u] = s2;
+            acc[qi * 4u + 3u] = s3;
         }
         barrier();
     }
 
+    uint d0 = lane * 2u;
+    uint d1 = (lane + LS) * 2u;
     for (uint qi = 0u; qi < QB; qi++) {
         uint i = i0 + qi;
         if (i >= p.nQ) {
             continue;
         }
         uint qOff = (i * p.nHead + h) * HD;
-        for (uint d = lane; d < HD; d += LS) {
-            o[qOff + d] = acc[qi][d] / lval[qi];
-        }
+        float inv = 1.0 / lval[qi];
+        o[qOff + d0] = acc[qi * 4u] * inv;
+        o[qOff + d0 + 1u] = acc[qi * 4u + 1u] * inv;
+        o[qOff + d1] = acc[qi * 4u + 2u] * inv;
+        o[qOff + d1 + 1u] = acc[qi * 4u + 3u] * inv;
     }
 }

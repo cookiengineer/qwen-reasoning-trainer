@@ -502,3 +502,102 @@ func TestVulkanAppendKV(t *testing.T) {
 		})
 	}
 }
+
+// TestVulkanCachedAttentionSplitGQA exercises the GQA-aware split decode
+// kernels, which dequantize each KV head once for a group of six query heads.
+func TestVulkanCachedAttentionSplitGQA(t *testing.T) {
+	_, be := newBackends(t)
+	vb := be.(*vulkan.Backend)
+	const (
+		hd      = 256
+		nHead   = 12
+		nHeadKV = 2
+		nKV     = 9000
+	)
+	q := autograd.Random(211, 1.0, hd, nHead, 1)
+	k := autograd.Random(212, 1.0, hd, nHeadKV, nKV)
+	vv := autograd.Random(213, 1.0, hd, nHeadKV, nKV)
+	scale := float32(1.0 / math.Sqrt(float64(hd)))
+	group := nHead / nHeadKV
+
+	for _, typ := range []quant.Type{quant.TypeQ4_K, quant.TypeQ8_0} {
+		t.Run(typ.String(), func(t *testing.T) {
+			kc, err := vb.AllocKV(hd, nHeadKV, nKV, typ)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vb.Free(kc)
+			vc, err := vb.AllocKV(hd, nHeadKV, nKV, typ)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vb.Free(vc)
+			kraw, err := quant.Quantize(typ, k.F32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			vraw, err := quant.Quantize(typ, vv.F32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeKVHeadMajor(t, vb, kc, kraw, nKV, nHeadKV)
+			writeKVHeadMajor(t, vb, vc, vraw, nKV, nHeadKV)
+			qb := up(t, vb, q.Dims, q.F32)
+			defer vb.Free(qb)
+			out, err := vb.AttentionCached(qb, kc, vc, nHead, nHeadKV, nKV, scale)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer vb.Free(out)
+			got := down(t, vb, out)
+
+			kf, err := quant.Dequant(typ, kraw, int64(len(k.F32)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			vf, err := quant.Dequant(typ, vraw, int64(len(vv.F32)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			probs := make([]float64, nKV)
+			want := make([]float32, hd*nHead)
+			for h := 0; h < nHead; h++ {
+				kv := h / group
+				maxLogit := math.Inf(-1)
+				for j := 0; j < nKV; j++ {
+					kOff := (j*nHeadKV + kv) * hd
+					qOff := h * hd
+					var dot float64
+					for d := 0; d < hd; d++ {
+						dot += float64(q.F32[qOff+d]) * float64(kf[kOff+d])
+					}
+					dot *= float64(scale)
+					probs[j] = dot
+					if dot > maxLogit {
+						maxLogit = dot
+					}
+				}
+				var sum float64
+				for j := 0; j < nKV; j++ {
+					e := math.Exp(probs[j] - maxLogit)
+					probs[j] = e
+					sum += e
+				}
+				for d := 0; d < hd; d++ {
+					var acc float64
+					for j := 0; j < nKV; j++ {
+						vOff := (j*nHeadKV + kv) * hd
+						acc += probs[j] * float64(vf[vOff+d])
+					}
+					want[h*hd+d] = float32(acc / sum)
+				}
+			}
+			for i := range want {
+				tol := float32(1e-1 + 1e-1*math.Abs(float64(want[i])))
+				if d := float32(math.Abs(float64(got[i] - want[i]))); d > tol {
+					t.Fatalf("[%d]: got %v want %v (diff %v)", i, got[i], want[i], d)
+				}
+			}
+		})
+	}
+}

@@ -1,12 +1,15 @@
 #version 450
 
 // Quantizes one 256-value K/V head block to Q8_0 and appends it to a KV cache.
-// One workgroup handles one (token, KV head); headDim must be 256.
+// K and V are processed in parallel by the two 64-lane halves of the workgroup;
+// one workgroup handles one (token, KV head). headDim must be 256.
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 128) in;
 
-layout(binding = 0) readonly  buffer X     { float x[];    };
-layout(binding = 1)           buffer CACHE { uint data[]; } cache;
+layout(binding = 0) readonly  buffer XK { vec4 x[]; } kx;
+layout(binding = 1) readonly  buffer XV { vec4 x[]; } vx;
+layout(binding = 2)           buffer KC { uvec4 data[]; } kcache;
+layout(binding = 3)           buffer VC { uvec4 data[]; } vcache;
 
 layout(push_constant) uniform P {
     uint headDim;
@@ -17,8 +20,10 @@ layout(push_constant) uniform P {
     uint base;
 } p;
 
-shared float vals[256];
-shared uint sb[272];
+// First 256 entries are K, second 256 are V.
+shared float vals[512];
+// 272 uint slots per half (bytes of one Q8_0 block).
+shared uint sb[544];
 
 float rnd(float v) { return floor(v + 0.5); }
 
@@ -28,40 +33,61 @@ void main() {
     uint t = qid / p.nHeadKV;
     uint h = qid % p.nHeadKV;
     uint lane = gl_LocalInvocationID.x;
+    bool isV = lane >= 64u;
+    uint sl = lane & 63u;
+    uint sbo = isV ? 272u : 0u;
+    uint vbase = isV ? 256u : 0u;
+
     uint tbase = t * p.headDim * p.nHeadKV;
     uint xbase = tbase + h * p.headDim;
-    uint blk = h * p.capacity + (p.pos + t);
-    uint wordBase = blk * 68u;
-
-    for (uint k = 0u; k < 4u; k++) {
-        uint idx = lane * 4u + k;
-        vals[idx] = x[xbase + idx];
-    }
+    uint xw = (xbase >> 2u) + sl;
+    vec4 v = isV ? vx.x[xw] : kx.x[xw];
+    vals[vbase + sl * 4u] = v.x;
+    vals[vbase + sl * 4u + 1u] = v.y;
+    vals[vbase + sl * 4u + 2u] = v.z;
+    vals[vbase + sl * 4u + 3u] = v.w;
     barrier();
 
-    if (lane < 8u) {
-        uint b = lane;
+    if (sl < 8u) {
+        uint b = sl;
         uint off = b * 32u;
         float amax = 0.0;
         for (uint i = 0u; i < 32u; i++) {
-            amax = max(amax, abs(vals[off + i]));
+            amax = max(amax, abs(vals[vbase + off + i]));
         }
         float d = amax / 127.0;
         float id = d != 0.0 ? 1.0 / d : 0.0;
         uint hd = packHalf2x16(vec2(d, 0.0));
         uint bb = b * 34u;
-        sb[bb] = hd & 0xFFu;
-        sb[bb + 1u] = (hd >> 8u) & 0xFFu;
+        sb[sbo + bb] = hd & 0xFFu;
+        sb[sbo + bb + 1u] = (hd >> 8u) & 0xFFu;
         for (uint i = 0u; i < 32u; i++) {
-            int q = int(clamp(rnd(vals[off + i] * id), -128.0, 127.0));
-            sb[bb + 2u + i] = uint(q) & 0xFFu;
+            int q = int(clamp(rnd(vals[vbase + off + i] * id), -128.0, 127.0));
+            sb[sbo + bb + 2u + i] = uint(q) & 0xFFu;
         }
     }
     barrier();
 
-    for (uint i = lane; i < 68u; i += 64u) {
-        uint w = sb[i * 4u] | (sb[i * 4u + 1u] << 8u) |
-                 (sb[i * 4u + 2u] << 16u) | (sb[i * 4u + 3u] << 24u);
-        cache.data[wordBase + i] = w;
+    uint blk = h * p.capacity + (p.pos + t);
+    uint wordBase = blk * 68u;
+    for (uint i = sl; i < 17u; i += 64u) {
+        uint j = sbo + i * 16u;
+        uint b0 = sb[j];
+        uint b1 = sb[j + 1u];
+        uint b2 = sb[j + 2u];
+        uint b3 = sb[j + 3u];
+        uvec4 packedOut = uvec4(
+            b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u),
+            sb[j + 4u] | (sb[j + 5u] << 8u) |
+                (sb[j + 6u] << 16u) | (sb[j + 7u] << 24u),
+            sb[j + 8u] | (sb[j + 9u] << 8u) |
+                (sb[j + 10u] << 16u) | (sb[j + 11u] << 24u),
+            sb[j + 12u] | (sb[j + 13u] << 8u) |
+                (sb[j + 14u] << 16u) | (sb[j + 15u] << 24u));
+        if (isV) {
+            vcache.data[(wordBase >> 2u) + i] = packedOut;
+        } else {
+            kcache.data[(wordBase >> 2u) + i] = packedOut;
+        }
     }
 }

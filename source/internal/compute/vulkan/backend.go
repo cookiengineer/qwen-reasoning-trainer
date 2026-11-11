@@ -72,9 +72,9 @@ func (b *Backend) Run(fn func() error) error {
 	return fn()
 }
 
-// SetFlashAttention selects the experimental tiled FlashAttention prefill
-// kernel. It is disabled by default because the blocked kernel is faster on the
-// current target GPU.
+// SetFlashAttention selects the packed tiled FlashAttention prefill kernel.
+// It is enabled by default for headDim 256; disabling it selects the older
+// blocked cached-attention fallback.
 func (b *Backend) SetFlashAttention(enabled bool) { b.flashAttention = enabled }
 
 func (b *Backend) newF32Buffer(dims ...int) (*buffer, error) {
@@ -1358,10 +1358,7 @@ func (b *Backend) AppendKV(k, v, kcache, vcache compute.Buffer, pos int) error {
 			chunk = maxPerDispatch
 		}
 		pc := push(uint32(hd), uint32(capacity), uint32(nKV), uint32(T), uint32(pos), start)
-		if err := b.dispatch(shader, []*buffer{kb, kc}, pc, [3]uint32{chunk, 1, 1}); err != nil {
-			return err
-		}
-		if err := b.dispatch(shader, []*buffer{vb, vc}, pc, [3]uint32{chunk, 1, 1}); err != nil {
+		if err := b.dispatch(shader, []*buffer{kb, vb, kc, vc}, pc, [3]uint32{chunk, 1, 1}); err != nil {
 			return err
 		}
 	}
@@ -1459,14 +1456,26 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 
 	if keysPerSplit, splits, ok := cachedSplitPlan(nKV, nQ); ok {
 		stage1 := shader + "_split"
+		groups := [3]uint32{uint32(total), uint32(splits), 1}
+		if nQ == 1 {
+			if group := nHead / nHeadKV; group == 6 {
+				switch kb.typ {
+				case quant.TypeQ4_K:
+					stage1 = "attention_decode_gqa_q4k"
+					groups = [3]uint32{uint32(splits), uint32(nHeadKV), 1}
+				case quant.TypeQ8_0:
+					stage1 = "attention_decode_gqa_q8_0"
+					groups = [3]uint32{uint32(splits), uint32(nHeadKV), 1}
+				}
+			}
+		}
 		part, err := b.newF32Buffer(total*splits*(hd+2), 1)
 		if err != nil {
 			return nil, err
 		}
 		p1 := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
 			uint32(nKV), uint32(capacity), qStart, scale, uint32(splits), uint32(keysPerSplit))
-		if err := b.dispatch(stage1, []*buffer{qb, kb, vb, b.dummy, part}, p1,
-			[3]uint32{uint32(total), uint32(splits), 1}); err != nil {
+		if err := b.dispatch(stage1, []*buffer{qb, kb, vb, b.dummy, part}, p1, groups); err != nil {
 			b.Free(part)
 			return nil, err
 		}
