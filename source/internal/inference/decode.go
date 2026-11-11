@@ -102,10 +102,12 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 		for i := range positions {
 			positions[i] = int32(start + i)
 		}
+		// Intermediate prefill chunks only need to append their KV/state; the
+		// discarded logits would otherwise be a full-vocabulary download.
 		res, err = e.Model.Forward(prompt[start:end], qwen38.ForwardOptions{
 			State:         st,
 			Positions:     positions,
-			LastTokenOnly: end == len(prompt),
+			LastTokenOnly: true,
 		})
 		if err != nil {
 			return nil, err

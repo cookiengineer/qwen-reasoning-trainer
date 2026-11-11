@@ -1,0 +1,85 @@
+#version 450
+
+// Optimized Q5_K GEMV. One invocation per output row. Scales are decoded once
+// per 256-value block and q/high-bit bytes are read as words.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint K; uint N; } p;
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint base = (n * bpr + blk) * 176u;
+        uint sbase = base + 4u;
+        uint qhbase = base + 16u;
+        uint qlbase = base + 48u;
+        uint xb = blk * 256u;
+        float d = f16(base);
+        float mn = f16(base + 2u);
+
+        uint sw = sbase >> 2u;
+        uint w0 = data[sw];
+        uint w1 = data[sw + 1u];
+        uint w2 = data[sw + 2u];
+        uint b0 = w0 & 0xFFu, b1 = (w0 >> 8u) & 0xFFu;
+        uint b2 = (w0 >> 16u) & 0xFFu, b3 = (w0 >> 24u) & 0xFFu;
+        uint b4 = w1 & 0xFFu, b5 = (w1 >> 8u) & 0xFFu;
+        uint b6 = (w1 >> 16u) & 0xFFu, b7 = (w1 >> 24u) & 0xFFu;
+        uint b8 = w2 & 0xFFu, b9 = (w2 >> 8u) & 0xFFu;
+        uint b10 = (w2 >> 16u) & 0xFFu, b11 = (w2 >> 24u) & 0xFFu;
+        float ds[8];
+        float dm[8];
+        ds[0] = d * float(b0 & 63u); dm[0] = mn * float(b4 & 63u);
+        ds[1] = d * float(b1 & 63u); dm[1] = mn * float(b5 & 63u);
+        ds[2] = d * float(b2 & 63u); dm[2] = mn * float(b6 & 63u);
+        ds[3] = d * float(b3 & 63u); dm[3] = mn * float(b7 & 63u);
+        ds[4] = d * float((b8 & 0xFu) | ((b0 >> 6u) << 4u));
+        dm[4] = mn * float((b8 >> 4u) | ((b4 >> 6u) << 4u));
+        ds[5] = d * float((b9 & 0xFu) | ((b1 >> 6u) << 4u));
+        dm[5] = mn * float((b9 >> 4u) | ((b5 >> 6u) << 4u));
+        ds[6] = d * float((b10 & 0xFu) | ((b2 >> 6u) << 4u));
+        dm[6] = mn * float((b10 >> 4u) | ((b6 >> 6u) << 4u));
+        ds[7] = d * float((b11 & 0xFu) | ((b3 >> 6u) << 4u));
+        dm[7] = mn * float((b11 >> 4u) | ((b7 >> 6u) << 4u));
+
+        uint qhw = qhbase >> 2u;
+        for (uint grp = 0u; grp < 4u; grp++) {
+            uint is = grp * 2u;
+            float d0 = ds[is];
+            float m0 = dm[is];
+            float d1 = ds[is + 1u];
+            float m1 = dm[is + 1u];
+            uint u1 = 1u << (2u * grp);
+            uint u2 = 2u << (2u * grp);
+            uint wq = (qlbase + grp * 32u) >> 2u;
+            uint xoff = xb + grp * 64u;
+            for (uint wi = 0u; wi < 8u; wi++) {
+                uint q = data[wq + wi];
+                uint h = data[qhw + wi];
+                for (uint l = 0u; l < 4u; l++) {
+                    uint idx = wi * 4u + l;
+                    uint qb = (q >> (l * 8u)) & 0xFFu;
+                    uint hb = (h >> (l * 8u)) & 0xFFu;
+                    uint v1 = (qb & 0xFu) + (((hb & u1) != 0u) ? 16u : 0u);
+                    uint v2 = (qb >> 4u) + (((hb & u2) != 0u) ? 16u : 0u);
+                    acc += (d0 * float(v1) - m0) * x[xoff + idx];
+                    acc += (d1 * float(v2) - m1) * x[xoff + 32u + idx];
+                }
+            }
+        }
+    }
+    y[n] = acc;
+}

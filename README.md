@@ -115,8 +115,10 @@ Limitations: only `n=1`; `logprobs`, `response_format`, and multimodal inputs
 are unsupported; `tool_choice: "none"` disables tools but forced tool selection
 is not enforced. Context values above the native GGUF context (256k) select
 YaRN automatically, with the factor derived from `context / native_context`.
-Full-attention prefill remains O(T^2), so very long prompts are slow even though
-memory is bounded. See
+Full-attention prefill remains O(T^2) and is submitted one layer at a time to
+avoid driver watchdog resets; the blocked cached-attention shaders amortize KV
+dequantization across 16 queries, but prompts beyond ~32k are still slow
+(roughly 1.6 h projected for 128k and 18 h for 512k prefill on the target GPU). See
 [`current-plan.md`](current-plan.md) for status and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the underlying pipeline.
 

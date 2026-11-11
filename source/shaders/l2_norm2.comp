@@ -1,0 +1,38 @@
+#version 450
+
+// L2-normalize two equally shaped tensors in one dispatch.
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) readonly  buffer X0 { float x0[]; };
+layout(binding = 1) writeonly buffer Y0 { float y0[]; };
+layout(binding = 2) readonly  buffer X1 { float x1[]; };
+layout(binding = 3) writeonly buffer Y1 { float y1[]; };
+
+layout(push_constant) uniform P {
+    uint  rowLen;
+    uint  rows;
+    float eps;
+} p;
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= p.rows) {
+        return;
+    }
+    uint base = r * p.rowLen;
+    float ss0 = 0.0;
+    float ss1 = 0.0;
+    for (uint i = 0u; i < p.rowLen; i++) {
+        float a = x0[base + i];
+        float b = x1[base + i];
+        ss0 += a * a;
+        ss1 += b * b;
+    }
+    float inv0 = 1.0 / sqrt(ss0 + p.eps);
+    float inv1 = 1.0 / sqrt(ss1 + p.eps);
+    for (uint i = 0u; i < p.rowLen; i++) {
+        y0[base + i] = x0[base + i] * inv0;
+        y1[base + i] = x1[base + i] * inv1;
+    }
+}

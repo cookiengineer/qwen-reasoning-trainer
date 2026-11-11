@@ -18,12 +18,19 @@ var gemvShaders = map[quant.Type]string{
 	quant.TypeF16:    "gemv_f16",
 	quant.TypeQ8_0:   "gemv_q8_0",
 	quant.TypeQ4_K:   "gemv_q4_k",
-	quant.TypeQ5_K:   "gemv_q5_k",
-	quant.TypeQ6_K:   "gemv_q6_k",
+	quant.TypeQ5_K:   "gemv_q5_k_fast",
+	quant.TypeQ6_K:   "gemv_q6_k_fast",
 	quant.TypeQ3_K:   "gemv_q3_k",
-	quant.TypeIQ4_XS: "gemv_iq4_xs",
+	quant.TypeIQ4_XS: "gemv_iq4_xs_shared2",
 	quant.TypeIQ4_NL: "gemv_iq4_nl",
 	quant.TypeIQ3_S:  "gemv_iq3_s",
+}
+
+// gemvRowShaders maps a quantized type to its row-cooperative GEMV shader.
+// These use one workgroup per output row so lanes read contiguous weight bytes,
+// instead of one invocation per row with strided reads.
+var gemvRowShaders = map[quant.Type]string{
+	quant.TypeQ8_0: "gemv_row_q8_0",
 }
 
 // matmulWShaders maps a quantized type to its fused dequantize+GEMM shader
@@ -583,6 +590,16 @@ func (b *Backend) CrossEntropy(logits compute.Buffer, targets []int32, ignoreInd
 
 // SplitQG implements compute.Backend.
 func (b *Backend) SplitQG(qg compute.Buffer, hd, nHead, T int) (compute.Buffer, compute.Buffer, error) {
+	return b.splitQG(qg, hd, nHead, T, false)
+}
+
+// SplitQGSigmoid splits Q+gate and applies sigmoid to the gate half in the same
+// dispatch.
+func (b *Backend) SplitQGSigmoid(qg compute.Buffer, hd, nHead, T int) (compute.Buffer, compute.Buffer, error) {
+	return b.splitQG(qg, hd, nHead, T, true)
+}
+
+func (b *Backend) splitQG(qg compute.Buffer, hd, nHead, T int, sigmoid bool) (compute.Buffer, compute.Buffer, error) {
 	x, err := asBuffer(qg)
 	if err != nil {
 		return nil, nil, err
@@ -596,15 +613,211 @@ func (b *Backend) SplitQG(qg compute.Buffer, hd, nHead, T int) (compute.Buffer, 
 		b.Free(q)
 		return nil, nil, err
 	}
+	sig := uint32(0)
+	if sigmoid {
+		sig = 1
+	}
 	total := uint32(hd * nHead * T)
 	if err := b.dispatch1D("qg_split", []*buffer{x, q, gate}, total, func(base uint32) []byte {
-		return push(uint32(hd), uint32(nHead), uint32(T), base)
+		return push(uint32(hd), uint32(nHead), uint32(T), base, sig)
 	}); err != nil {
 		b.Free(q)
 		b.Free(gate)
 		return nil, nil, err
 	}
 	return q, gate, nil
+}
+
+// GatedSilu computes silu(gate) * up in one dispatch.
+func (b *Backend) GatedSilu(gate, up compute.Buffer) (compute.Buffer, error) {
+	g, err := asBuffer(gate)
+	if err != nil {
+		return nil, err
+	}
+	u, err := asBuffer(up)
+	if err != nil {
+		return nil, err
+	}
+	if g.NumElements() != u.NumElements() {
+		return nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(g.dims...)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(g.NumElements())
+	if err := b.dispatch1D("gated_silu", []*buffer{g, u, out}, total, func(base uint32) []byte {
+		return push(total, base)
+	}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// GDNGate computes softplus(alpha+dt)*a with dt/a broadcast over T.
+func (b *Backend) GDNGate(alpha, dt, a compute.Buffer, nV, T int) (compute.Buffer, error) {
+	x, err := asBuffer(alpha)
+	if err != nil {
+		return nil, err
+	}
+	d, err := asBuffer(dt)
+	if err != nil {
+		return nil, err
+	}
+	av, err := asBuffer(a)
+	if err != nil {
+		return nil, err
+	}
+	if nV <= 0 || T <= 0 || x.NumElements() != nV*T {
+		return nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(1, nV, T)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(nV * T)
+	if err := b.dispatch1D("gdn_gate", []*buffer{x, d, av, out}, total, func(base uint32) []byte {
+		return push(uint32(nV), uint32(T), base)
+	}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// SSMConvSilu is the causal conv1d forward with a SiLU epilogue.
+func (b *Backend) SSMConvSilu(sx, c compute.Buffer) (compute.Buffer, error) {
+	s, err := asBuffer(sx)
+	if err != nil {
+		return nil, err
+	}
+	cc, err := asBuffer(c)
+	if err != nil {
+		return nil, err
+	}
+	if dimOr1(s.dims, 2) != 1 {
+		return nil, fmt.Errorf("vulkan: SSMConvSilu supports a single sequence")
+	}
+	dConv := cc.Ne0()
+	dInner := dimOr1(cc.dims, 1)
+	ncs := s.Ne0()
+	nT := ncs - dConv + 1
+	if nT < 0 || dimOr1(s.dims, 1) != dInner {
+		return nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(dInner, nT, 1)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(dInner * nT)
+	if err := b.dispatch1D("ssm_conv_silu", []*buffer{s, cc, out}, total, func(base uint32) []byte {
+		return push(uint32(dConv), uint32(dInner), uint32(ncs), uint32(nT), base)
+	}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// GatherHeads3 gathers q, k, and v channels in one dispatch.
+func (b *Backend) GatherHeads3(convOut compute.Buffer, headK, nK, headV, nV, T, convDim int) (compute.Buffer, compute.Buffer, compute.Buffer, error) {
+	cv, err := asBuffer(convOut)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	q, err := b.newF32Buffer(headK, nK, T)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	k, err := b.newF32Buffer(headK, nK, T)
+	if err != nil {
+		b.Free(q)
+		return nil, nil, nil, err
+	}
+	v, err := b.newF32Buffer(headV, nV, T)
+	if err != nil {
+		b.Free(q)
+		b.Free(k)
+		return nil, nil, nil, err
+	}
+	total := uint32(2*headK*nK*T + headV*nV*T)
+	if err := b.dispatch1D("gather_heads3", []*buffer{cv, q, k, v}, total, func(base uint32) []byte {
+		return push(uint32(headK), uint32(nK), uint32(headV), uint32(nV), uint32(T), uint32(convDim), base)
+	}); err != nil {
+		b.Free(q)
+		b.Free(k)
+		b.Free(v)
+		return nil, nil, nil, err
+	}
+	return q, k, v, nil
+}
+
+// L2Norm2 normalizes two equally shaped tensors in one dispatch.
+func (b *Backend) L2Norm2(a, c compute.Buffer, eps float32) (compute.Buffer, compute.Buffer, error) {
+	x0, err := asBuffer(a)
+	if err != nil {
+		return nil, nil, err
+	}
+	x1, err := asBuffer(c)
+	if err != nil {
+		return nil, nil, err
+	}
+	if x0.NumElements() != x1.NumElements() {
+		return nil, nil, compute.ErrShape
+	}
+	y0, err := b.newF32Buffer(x0.dims...)
+	if err != nil {
+		return nil, nil, err
+	}
+	y1, err := b.newF32Buffer(x1.dims...)
+	if err != nil {
+		b.Free(y0)
+		return nil, nil, err
+	}
+	rowLen := x0.Ne0()
+	rows := x0.NumElements() / rowLen
+	if err := b.dispatch("l2_norm2", []*buffer{x0, y0, x1, y1},
+		push(uint32(rowLen), uint32(rows), eps), [3]uint32{uint32(rows), 1, 1}); err != nil {
+		b.Free(y0)
+		b.Free(y1)
+		return nil, nil, err
+	}
+	return y0, y1, nil
+}
+
+// NormSiluMul computes rms_norm(x, w) * silu(z) in one dispatch.
+func (b *Backend) NormSiluMul(x, w, z compute.Buffer, eps float32) (compute.Buffer, error) {
+	xb, err := asBuffer(x)
+	if err != nil {
+		return nil, err
+	}
+	wb, err := asBuffer(w)
+	if err != nil {
+		return nil, err
+	}
+	zb, err := asBuffer(z)
+	if err != nil {
+		return nil, err
+	}
+	if xb.NumElements() != zb.NumElements() || wb.NumElements() <= 0 {
+		return nil, compute.ErrShape
+	}
+	rowLen := wb.NumElements()
+	if xb.NumElements()%rowLen != 0 {
+		return nil, compute.ErrShape
+	}
+	rows := xb.NumElements() / rowLen
+	out, err := b.newF32Buffer(xb.dims...)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.dispatch("norm_silu_mul", []*buffer{xb, wb, zb, out},
+		push(uint32(rowLen), uint32(rows), eps), [3]uint32{uint32(rows), 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
 }
 
 // SplitQGBack implements compute.Backend.
@@ -1205,6 +1418,27 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 	qStart := uint32(nKV - nQ)
 	const maxPerDispatch = 65535
 	total := nHead * nQ
+
+	// Prefill uses the blocked shader: one workgroup handles several queries
+	// per head and dequantizes each K/V element once for the whole block.
+	const blockQueries = 16
+	if nQ > 4 {
+		blocks := (nQ + blockQueries - 1) / blockQueries
+		if blocks <= maxPerDispatch && nHead <= maxPerDispatch {
+			out, err := b.newF32Buffer(qb.dims...)
+			if err != nil {
+				return nil, err
+			}
+			p := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
+				uint32(nKV), qStart, scale)
+			if err := b.dispatch(shader+"_block", []*buffer{qb, kb, vb, out}, p,
+				[3]uint32{uint32(blocks), uint32(nHead), 1}); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
+	}
 
 	if keysPerSplit, splits, ok := cachedSplitPlan(nKV, nQ); ok {
 		stage1 := shader + "_split"
@@ -2093,9 +2327,13 @@ func (b *Backend) DequantWeight(w compute.Buffer) (compute.Buffer, error) {
 // gemv computes y = W * x for a single activation column using a fused
 // dequantize+GEMV shader. It returns errNoGemv when the type has no shader.
 func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
-	name, ok := gemvShaders[w.typ]
-	if !ok {
-		return nil, errNoGemv
+	name, rowCooperative := gemvRowShaders[w.typ]
+	if !rowCooperative {
+		var ok bool
+		name, ok = gemvShaders[w.typ]
+		if !ok {
+			return nil, errNoGemv
+		}
 	}
 	k := w.Ne0()
 	n := dimOr1(w.dims, 1)
@@ -2105,6 +2343,22 @@ func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
 	out, err := b.newF32Buffer(n, 1)
 	if err != nil {
 		return nil, err
+	}
+	if rowCooperative {
+		// One workgroup per row; dispatch in chunks to stay below the
+		// per-dimension group limit.
+		for base := uint32(0); base < uint32(n); base += maxWorkGroups {
+			rows := uint32(n) - base
+			if rows > maxWorkGroups {
+				rows = maxWorkGroups
+			}
+			pc := push(uint32(k), uint32(n), base)
+			if err := b.dispatch(name, []*buffer{w, x, out}, pc, [3]uint32{rows, 1, 1}); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+		}
+		return out, nil
 	}
 	groups := [3]uint32{ceilDiv(uint32(n), 64), 1, 1}
 	if err := b.dispatch(name, []*buffer{w, x, out}, push(uint32(k), uint32(n)), groups); err != nil {

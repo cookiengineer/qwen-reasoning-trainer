@@ -1,0 +1,76 @@
+#version 450
+
+// Optimized Q6_K GEMV. One invocation per output row. Each 128-value part
+// loads its ql/qh bytes as words once and precomputes the eight signed scales.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint K; uint N; } p;
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+float si8(uint o) {
+    uint v = getb(o);
+    return (v >= 128u) ? float(int(v) - 256) : float(v);
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint base = (n * bpr + blk) * 210u;
+        uint xb = blk * 256u;
+        float d = f16(base + 208u);
+        for (uint part = 0u; part < 2u; part++) {
+            uint qlA = base + part * 64u;
+            uint qlB = qlA + 32u;
+            uint qhA = base + 128u + part * 32u;
+            uint sc = base + 192u + part * 8u;
+            float s0 = d * si8(sc + 0u);
+            float s1 = d * si8(sc + 1u);
+            float s2 = d * si8(sc + 2u);
+            float s3 = d * si8(sc + 3u);
+            float s4 = d * si8(sc + 4u);
+            float s5 = d * si8(sc + 5u);
+            float s6 = d * si8(sc + 6u);
+            float s7 = d * si8(sc + 7u);
+            uint xo = xb + part * 128u;
+            for (uint l = 0u; l < 32u; l++) {
+                uint oA = qlA + l;
+                uint oB = qlB + l;
+                uint oH = qhA + l;
+                uint qlLo = (data[oA >> 2u] >> ((oA & 3u) * 8u)) & 0xFFu;
+                uint qlHi = (data[oB >> 2u] >> ((oB & 3u) * 8u)) & 0xFFu;
+                uint qh = (data[oH >> 2u] >> ((oH & 3u) * 8u)) & 0xFFu;
+                int q1 = int((qlLo & 0xFu) | (((qh >> 0u) & 3u) << 4u)) - 32;
+                int q2 = int((qlHi & 0xFu) | (((qh >> 2u) & 3u) << 4u)) - 32;
+                int q3 = int((qlLo >> 4u) | (((qh >> 4u) & 3u) << 4u)) - 32;
+                int q4 = int((qlHi >> 4u) | (((qh >> 6u) & 3u) << 4u)) - 32;
+                float a0 = s0;
+                float a1 = s2;
+                float a2 = s4;
+                float a3 = s6;
+                if (l >= 16u) {
+                    a0 = s1;
+                    a1 = s3;
+                    a2 = s5;
+                    a3 = s7;
+                }
+                uint o = xo + l;
+                acc += a0 * float(q1) * x[o];
+                acc += a1 * float(q2) * x[o + 32u];
+                acc += a2 * float(q3) * x[o + 64u];
+                acc += a3 * float(q4) * x[o + 96u];
+            }
+        }
+    }
+    y[n] = acc;
+}

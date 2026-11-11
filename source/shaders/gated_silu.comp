@@ -1,0 +1,23 @@
+#version 450
+
+// Fused SwiGLU activation: out[i] = silu(gate[i]) * up[i].
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer Gate { float gate[]; };
+layout(binding = 1) readonly  buffer Up   { float up[];   };
+layout(binding = 2) writeonly buffer Out  { float y[];    };
+
+layout(push_constant) uniform P {
+    uint n;
+    uint base;
+} p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + p.base;
+    if (i >= p.n) {
+        return;
+    }
+    float v = gate[i];
+    y[i] = (v / (1.0 + exp(-v))) * up[i];
+}

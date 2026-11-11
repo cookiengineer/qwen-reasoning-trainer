@@ -50,8 +50,19 @@ E2E_VENV      := $(E2E_DIR)/.venv
 E2E_PYTHON ?= $(CURDIR)/$(E2E_VENV)/bin/python
 E2E_STAMP  := $(E2E_VENV)/.deps-ok
 
+# Opt-in real-model tests. run-tests.sh does not sync the 27B GGUF; on the
+# target host ./models is a symlink to the model directory. Override REAL_MODEL
+# for a different checkpoint and PPL_TEXT for a different evaluation corpus.
+REAL_MODEL    ?= $(CURDIR)/models/Qwen3.8-27B-UD-Q4_K_M.gguf
+PPL_TEXT      ?= $(CURDIR)/datasets/wikitext2-test.txt
+REAL_ENV      := QWEN38_REAL_DEVICE=1 QWEN38_MODEL="$(REAL_MODEL)"
+REAL_CONTEXTS ?= 128k 256k 384k 512k
+NEEDLE_CONTEXTS ?= 128k 256k 384k 512k
+
 .PHONY: all build build-all server shaders test vet fmt fmt-check tidy clean check \
-        verify-ref verify-data verify-quants e2e-venv inspect gpu-info
+        verify-ref verify-data verify-quants e2e-venv inspect gpu-info \
+        test-real test-real-parity test-real-bench test-real-quality test-real-needle \
+        test-real-decode
 
 all: build
 
@@ -77,6 +88,45 @@ shaders: $(SHADER_SPV)
 
 test: shaders
 	$(GO) -C $(SRC) test ./...
+
+# Real-model device-vs-host parity and memory estimate checks (R1).
+test-real: test-real-parity
+
+test-real-parity: shaders
+	$(REAL_ENV) $(GO) -C $(SRC) test ./internal/inference \
+		-run 'TestRealDevice' -count=1 -v -timeout 2h
+
+# Long-context prefill/decode benchmarks (R2). Each preset runs in its own
+# process so resident host weights from the previous preset are reclaimed.
+test-real-bench: shaders
+	@for context in $(REAL_CONTEXTS); do \
+		echo "=== real benchmark $$context ==="; \
+		$(REAL_ENV) QWEN38_REAL_BENCH=1 QWEN38_BENCH_CONTEXT=$$context \
+			$(GO) -C $(SRC) test ./internal/inference \
+			-run 'TestRealLongContextBench' -count=1 -v -timeout 6h || exit $$?; \
+	done
+
+# Isolated steady-state decode benchmark (weights + attention + GDN).
+test-real-decode: shaders
+	$(REAL_ENV) QWEN38_REAL_DECODE=1 \
+		$(GO) -C $(SRC) test ./internal/inference \
+		-run 'TestRealDecodeBench' -count=1 -v -timeout 2h
+
+# Q4_K vs Q8_0 KV quality on WikiText-2 (R3).
+test-real-quality: shaders
+	$(REAL_ENV) QWEN38_REAL_QUALITY=1 QWEN38_PPL_TEXT="$(PPL_TEXT)" \
+		$(GO) -C $(SRC) test ./internal/inference \
+		-run 'TestRealKVQuality' -count=1 -v -timeout 6h
+
+# Optional long-context needle/retrieval checks, including YaRN 1.5/2.0 (R3).
+test-real-needle: shaders
+	@for context in $(NEEDLE_CONTEXTS); do \
+		echo "=== real needle $$context ==="; \
+		$(REAL_ENV) QWEN38_REAL_NEEDLE=1 QWEN38_NEEDLE_CONTEXT=$$context \
+			QWEN38_PPL_TEXT="$(PPL_TEXT)" \
+			$(GO) -C $(SRC) test ./internal/inference \
+			-run 'TestRealNeedle' -count=1 -v -timeout 12h || exit $$?; \
+	done
 
 vet:
 	$(GO) -C $(SRC) vet ./...

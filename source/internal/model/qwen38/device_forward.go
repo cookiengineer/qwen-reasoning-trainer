@@ -7,17 +7,6 @@ import (
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 )
 
-func uploadConstVec(be compute.Backend, v []float32, T int) (compute.Buffer, error) {
-	if len(v) == 0 || T <= 0 {
-		return nil, fmt.Errorf("qwen38: invalid constant vector")
-	}
-	data := make([]float32, len(v)*T)
-	for t := 0; t < T; t++ {
-		copy(data[t*len(v):], v)
-	}
-	return be.Upload(&compute.Tensor{Dims: []int{len(v), T}, F32: data})
-}
-
 func (m *Model) forwardDevice(tokens []int32, opts ForwardOptions) (*ForwardResult, error) {
 	cfg := m.Cfg
 	be := m.Backend
@@ -141,11 +130,7 @@ func (m *Model) deviceAttnBlock(il int, lw *deviceAttnLayer, x compute.Buffer, p
 	if err != nil {
 		return nil, err
 	}
-	qSplit, gate, err := be.SplitQG(qg, hd, nHead, T)
-	if err != nil {
-		return nil, err
-	}
-	gateSig, err := be.Unary(compute.UnarySigmoid, gate)
+	qSplit, gateSig, err := rb.SplitQGSigmoid(qg, hd, nHead, T)
 	if err != nil {
 		return nil, err
 	}
@@ -229,11 +214,7 @@ func (m *Model) deviceAttnBlock(il int, lw *deviceAttnLayer, x compute.Buffer, p
 	if err != nil {
 		return nil, err
 	}
-	silu, err := be.Unary(compute.UnarySilu, fg)
-	if err != nil {
-		return nil, err
-	}
-	act, err := be.Binary(compute.BinaryMul, silu, up)
+	act, err := rb.GatedSilu(fg, up)
 	if err != nil {
 		return nil, err
 	}
@@ -253,9 +234,7 @@ func (m *Model) deviceGDNBlock(il int, lw *deviceGDNLayer, x compute.Buffer, st 
 	nV := cfg.DtRank
 	nK := cfg.GroupCount
 	headKDim := cfg.DState
-	keyDim := cfg.KeyDim()
 	convDim := cfg.ConvDim()
-	src := m.W.Layers[il]
 
 	h, err := be.RMSNorm(x, lw.norm, cfg.RmsEps)
 	if err != nil {
@@ -281,27 +260,7 @@ func (m *Model) deviceGDNBlock(il int, lw *deviceGDNLayer, x compute.Buffer, st 
 	if err != nil {
 		return nil, nil, err
 	}
-	dtB, err := uploadConstVec(be, src.SSMDt, T)
-	if err != nil {
-		return nil, nil, err
-	}
-	aB, err := uploadConstVec(be, src.SSMA, T)
-	if err != nil {
-		return nil, nil, err
-	}
-	pre, err := be.Binary(compute.BinaryAdd, alpha, dtB)
-	if err != nil {
-		return nil, nil, err
-	}
-	sp, err := be.Unary(compute.UnarySoftplus, pre)
-	if err != nil {
-		return nil, nil, err
-	}
-	gateFlat, err := be.Binary(compute.BinaryMul, sp, aB)
-	if err != nil {
-		return nil, nil, err
-	}
-	gate, err := be.Reshape(gateFlat, []int{1, nV, T})
+	gate, err := rb.GDNGate(alpha, lw.ssmDt, lw.ssmA, nV, T)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -313,31 +272,15 @@ func (m *Model) deviceGDNBlock(il int, lw *deviceGDNLayer, x compute.Buffer, st 
 	if err != nil {
 		return nil, nil, err
 	}
-	convRaw, err := be.SSMConv(convIn, lw.conv1d)
+	convOut, err := rb.SSMConvSilu(convIn, lw.conv1d)
 	if err != nil {
 		return nil, nil, err
 	}
-	convOut, err := be.Unary(compute.UnarySilu, convRaw)
+	qPre, kPre, v, err := rb.GatherHeads3(convOut, headKDim, nK, headVDim, nV, T, convDim)
 	if err != nil {
 		return nil, nil, err
 	}
-	qPre, err := be.GatherHeads(convOut, 0, headKDim, nK, T, convDim)
-	if err != nil {
-		return nil, nil, err
-	}
-	kPre, err := be.GatherHeads(convOut, keyDim, headKDim, nK, T, convDim)
-	if err != nil {
-		return nil, nil, err
-	}
-	v, err := be.GatherHeads(convOut, 2*keyDim, headVDim, nV, T, convDim)
-	if err != nil {
-		return nil, nil, err
-	}
-	q, err := be.L2Norm(qPre, 1e-6)
-	if err != nil {
-		return nil, nil, err
-	}
-	k, err := be.L2Norm(kPre, 1e-6)
+	q, k, err := rb.L2Norm2(qPre, kPre, 1e-6)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -353,19 +296,11 @@ func (m *Model) deviceGDNBlock(il int, lw *deviceGDNLayer, x compute.Buffer, st 
 	if err != nil {
 		return nil, nil, err
 	}
-	norm, err := be.RMSNorm(out, lw.ssmNorm, cfg.RmsEps)
-	if err != nil {
-		return nil, nil, err
-	}
 	zr, err := be.Reshape(z, []int{headVDim, nV, T})
 	if err != nil {
 		return nil, nil, err
 	}
-	siluZ, err := be.Unary(compute.UnarySilu, zr)
-	if err != nil {
-		return nil, nil, err
-	}
-	gated, err := be.Binary(compute.BinaryMul, norm, siluZ)
+	gated, err := rb.NormSiluMul(out, lw.ssmNorm, zr, cfg.RmsEps)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -393,11 +328,7 @@ func (m *Model) deviceGDNBlock(il int, lw *deviceGDNLayer, x compute.Buffer, st 
 	if err != nil {
 		return nil, nil, err
 	}
-	silu, err := be.Unary(compute.UnarySilu, fg)
-	if err != nil {
-		return nil, nil, err
-	}
-	act, err := be.Binary(compute.BinaryMul, silu, up)
+	act, err := rb.GatedSilu(fg, up)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -15,6 +15,7 @@ layout(push_constant) uniform P {
     uint nHead;
     uint T;
     uint base;
+    uint sigmoid;
 } p;
 
 void main() {
@@ -30,5 +31,9 @@ void main() {
     uint d = rem % p.hd;
     uint src = t * (2u * row) + hh * 2u * p.hd + d;
     q[gid] = qg[src];
-    gate[gid] = qg[src + p.hd];
+    float g = qg[src + p.hd];
+    if (p.sigmoid == 1u) {
+        g = 1.0 / (1.0 + exp(-g));
+    }
+    gate[gid] = g;
 }

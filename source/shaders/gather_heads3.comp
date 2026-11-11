@@ -1,0 +1,54 @@
+#version 450
+
+// Gather the GatedDeltaNet q, k, and v channel groups from a conv output
+// [convDim,T] in one dispatch. q/k are [headK,nK,T], v is [headV,nV,T].
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer ConvOut { float cv[]; };
+layout(binding = 1) writeonly buffer QOut    { float q[];  };
+layout(binding = 2) writeonly buffer KOut    { float k[];  };
+layout(binding = 3) writeonly buffer VOut    { float v[];  };
+
+layout(push_constant) uniform P {
+    uint headK;
+    uint nK;
+    uint headV;
+    uint nV;
+    uint T;
+    uint convDim;
+    uint base;
+} p;
+
+void main() {
+    uint gid = p.base + gl_GlobalInvocationID.x;
+    uint qkTotal = p.headK * p.nK * p.T;
+    uint vTotal = p.headV * p.nV * p.T;
+    uint total = 2u * qkTotal + vTotal;
+    if (gid >= total) {
+        return;
+    }
+    if (gid < qkTotal) {
+        uint d = gid % p.headK;
+        uint rem = gid / p.headK;
+        uint hh = rem % p.nK;
+        uint t = rem / p.nK;
+        q[gid] = cv[(hh * p.headK + d) + t * p.convDim];
+    } else if (gid < 2u * qkTotal) {
+        uint idx = gid - qkTotal;
+        uint d = idx % p.headK;
+        uint rem = idx / p.headK;
+        uint hh = rem % p.nK;
+        uint t = rem / p.nK;
+        uint offset = p.headK * p.nK;
+        k[idx] = cv[(offset + hh * p.headK + d) + t * p.convDim];
+    } else {
+        uint idx = gid - 2u * qkTotal;
+        uint d = idx % p.headV;
+        uint rem = idx / p.headV;
+        uint hh = rem % p.nV;
+        uint t = rem / p.nV;
+        uint offset = 2u * p.headK * p.nK;
+        v[idx] = cv[(offset + hh * p.headV + d) + t * p.convDim];
+    }
+}

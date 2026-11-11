@@ -1,0 +1,57 @@
+#version 450
+
+// Row-cooperative Q8_0 GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
+// One 64-lane workgroup computes one output row. Lanes split the K reduction
+// into contiguous 32-value blocks.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint rowBase;
+} p;
+
+#define LS 64
+shared float red[LS];
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+float si8(uint o) {
+    uint v = getb(o);
+    return (v >= 128u) ? float(int(v) - 256) : float(v);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint n = p.rowBase + gl_WorkGroupID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint blocksPerRow = p.K / 32u;
+    float acc = 0.0;
+    for (uint blk = lane; blk < blocksPerRow; blk += LS) {
+        uint base = (n * blocksPerRow + blk) * 34u;
+        float d = f16(base);
+        uint qoff = base + 2u;
+        uint xoff = blk * 32u;
+        for (uint l = 0u; l < 32u; l++) {
+            acc += d * si8(qoff + l) * x[xoff + l];
+        }
+    }
+    red[lane] = acc;
+    barrier();
+    for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[lane] += red[lane + s];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        y[n] = red[0];
+    }
+}

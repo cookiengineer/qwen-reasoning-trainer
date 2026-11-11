@@ -1,0 +1,184 @@
+#version 450
+
+// Blocked cached attention over a Q8_0 KV cache for prefill. See
+// attention_cached_q4k_block.comp. Dispatch is [queryBlocks, nHead].
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer Q { float q[]; };
+layout(binding = 1) readonly  buffer K { uint data[]; } kbuf;
+layout(binding = 2) readonly  buffer V { uint data[]; } vbuf;
+layout(binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint  headDim;
+    uint  nQ;
+    uint  nHead;
+    uint  nHeadKV;
+    uint  nKV;
+    uint  qStart;
+    float scale;
+} p;
+
+#define LS 64
+#define MAX_HD 256
+#define TILE 256
+#define QB 16
+
+shared float qs[QB][MAX_HD];
+shared float acc[QB][MAX_HD];
+shared float logits[QB][TILE];
+shared float red[QB][LS];
+
+uint getbK(uint o) { return (kbuf.data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+uint getbV(uint o) { return (vbuf.data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16K(uint o) { return unpackHalf2x16(getbK(o) | (getbK(o + 1u) << 8u)).x; }
+float f16V(uint o) { return unpackHalf2x16(getbV(o) | (getbV(o + 1u) << 8u)).x; }
+
+float dequantK(uint token, uint kv, uint d) {
+    uint bph = p.headDim / 32u;
+    uint blk = (token * p.nHeadKV + kv) * bph + d / 32u;
+    uint base = blk * 34u;
+    uint b = getbK(base + 2u + d % 32u);
+    int q = int(b);
+    if (q >= 128) q -= 256;
+    return f16K(base) * float(q);
+}
+
+float dequantV(uint token, uint kv, uint d) {
+    uint bph = p.headDim / 32u;
+    uint blk = (token * p.nHeadKV + kv) * bph + d / 32u;
+    uint base = blk * 34u;
+    uint b = getbV(base + 2u + d % 32u);
+    int q = int(b);
+    if (q >= 128) q -= 256;
+    return f16V(base) * float(q);
+}
+
+void main() {
+    uint h = gl_WorkGroupID.y;
+    uint i0 = gl_WorkGroupID.x * QB;
+    if (h >= p.nHead || i0 >= p.nQ) {
+        return;
+    }
+    uint hd = p.headDim;
+    if (hd > MAX_HD || hd % 32u != 0u) {
+        return;
+    }
+    uint group = p.nHead / p.nHeadKV;
+    uint kv = h / group;
+    uint lane = gl_LocalInvocationID.x;
+
+    for (uint qi = 0u; qi < QB; qi++) {
+        uint i = i0 + qi;
+        if (i >= p.nQ) {
+            continue;
+        }
+        uint qOff = (i * p.nHead + h) * hd;
+        for (uint d = lane; d < hd; d += LS) {
+            qs[qi][d] = q[qOff + d];
+            acc[qi][d] = 0.0;
+        }
+    }
+    barrier();
+
+    float m[QB];
+    float l[QB];
+    for (uint qi = 0u; qi < QB; qi++) {
+        m[qi] = -1e30;
+        l[qi] = 0.0;
+    }
+
+    uint lastI = min(i0 + QB - 1u, p.nQ - 1u);
+    uint maxJBlock = min(p.nKV, p.qStart + lastI + 1u);
+    for (uint t0 = 0u; t0 < maxJBlock; t0 += TILE) {
+        uint tlen = min(uint(TILE), maxJBlock - t0);
+
+        for (uint e = lane; e < tlen; e += LS) {
+            float dots[QB];
+            for (uint qi = 0u; qi < QB; qi++) {
+                dots[qi] = 0.0;
+            }
+            for (uint d = 0u; d < hd; d++) {
+                float kval = dequantK(t0 + e, kv, d);
+                for (uint qi = 0u; qi < QB; qi++) {
+                    dots[qi] += qs[qi][d] * kval;
+                }
+            }
+            for (uint qi = 0u; qi < QB; qi++) {
+                uint i = i0 + qi;
+                uint maxJ = min(p.nKV, p.qStart + i + 1u);
+                if (i < p.nQ && t0 + e < maxJ) {
+                    logits[qi][e] = dots[qi] * p.scale;
+                } else {
+                    logits[qi][e] = -1e30;
+                }
+            }
+        }
+        barrier();
+
+        float corr[QB];
+        for (uint qi = 0u; qi < QB; qi++) {
+            float lm = -1e30;
+            for (uint e = lane; e < tlen; e += LS) {
+                lm = max(lm, logits[qi][e]);
+            }
+            red[qi][lane] = lm;
+            barrier();
+            for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+                if (lane < s) {
+                    red[qi][lane] = max(red[qi][lane], red[qi][lane + s]);
+                }
+                barrier();
+            }
+            float newM = max(m[qi], red[qi][0]);
+            float c = exp(m[qi] - newM);
+            corr[qi] = c;
+            float ls = 0.0;
+            for (uint e = lane; e < tlen; e += LS) {
+                float pe = exp(logits[qi][e] - newM);
+                logits[qi][e] = pe;
+                ls += pe;
+            }
+            red[qi][lane] = ls;
+            barrier();
+            for (uint s = LS / 2u; s > 0u; s >>= 1u) {
+                if (lane < s) {
+                    red[qi][lane] += red[qi][lane + s];
+                }
+                barrier();
+            }
+            l[qi] = l[qi] * c + red[qi][0];
+            m[qi] = newM;
+            barrier();
+        }
+
+        for (uint d = lane; d < hd; d += LS) {
+            float a[QB];
+            for (uint qi = 0u; qi < QB; qi++) {
+                a[qi] = acc[qi][d] * corr[qi];
+            }
+            for (uint e = 0u; e < tlen; e++) {
+                float vv = dequantV(t0 + e, kv, d);
+                for (uint qi = 0u; qi < QB; qi++) {
+                    a[qi] += logits[qi][e] * vv;
+                }
+            }
+            for (uint qi = 0u; qi < QB; qi++) {
+                acc[qi][d] = a[qi];
+            }
+        }
+        barrier();
+    }
+
+    for (uint qi = 0u; qi < QB; qi++) {
+        uint i = i0 + qi;
+        if (i >= p.nQ) {
+            continue;
+        }
+        uint qOff = (i * p.nHead + h) * hd;
+        for (uint d = lane; d < hd; d += LS) {
+            o[qOff + d] = acc[qi][d] / l[qi];
+        }
+    }
+}

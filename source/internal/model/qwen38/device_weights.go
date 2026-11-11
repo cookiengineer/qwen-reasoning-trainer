@@ -13,6 +13,13 @@ type DeviceForwardBackend interface {
 	RoPEScaled(a compute.Buffer, positions []int32, theta float64, nDims int, sc compute.RoPEScaling) (compute.Buffer, error)
 	ConvInputState(qkv, hist compute.Buffer, dConv, convDim, T int) (compute.Buffer, error)
 	LastToken(x compute.Buffer) (compute.Buffer, error)
+	SplitQGSigmoid(qg compute.Buffer, hd, nHead, T int) (q, gate compute.Buffer, err error)
+	GatedSilu(gate, up compute.Buffer) (compute.Buffer, error)
+	GDNGate(alpha, dt, a compute.Buffer, nV, T int) (compute.Buffer, error)
+	SSMConvSilu(sx, c compute.Buffer) (compute.Buffer, error)
+	GatherHeads3(convOut compute.Buffer, headK, nK, headV, nV, T, convDim int) (q, k, v compute.Buffer, err error)
+	L2Norm2(a, b compute.Buffer, eps float32) (compute.Buffer, compute.Buffer, error)
+	NormSiluMul(x, w, z compute.Buffer, eps float32) (compute.Buffer, error)
 }
 
 type deviceAttnLayer struct {
@@ -22,6 +29,7 @@ type deviceAttnLayer struct {
 
 type deviceGDNLayer struct {
 	norm, postNorm, ssmNorm, conv1d, alpha, beta compute.Buffer
+	ssmDt, ssmA                                  compute.Buffer
 	qkv, gate, out, fg, fu, fd                   compute.Buffer
 }
 
@@ -73,6 +81,8 @@ func (d *deviceModel) free(be compute.Backend) {
 			free(g.conv1d)
 			free(g.alpha)
 			free(g.beta)
+			free(g.ssmDt)
+			free(g.ssmA)
 			free(g.qkv)
 			free(g.gate)
 			free(g.out)
@@ -149,6 +159,14 @@ func (m *Model) EnableDeviceForward() error {
 				return err
 			}
 			if g.beta, err = upW(lw.SSMBeta); err != nil {
+				d.free(be)
+				return err
+			}
+			if g.ssmDt, err = upV(lw.SSMDt); err != nil {
+				d.free(be)
+				return err
+			}
+			if g.ssmA, err = upV(lw.SSMA); err != nil {
 				d.free(be)
 				return err
 			}

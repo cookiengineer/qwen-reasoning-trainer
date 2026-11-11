@@ -2,9 +2,8 @@
 /build/
 /bin/
 
-# Downloaded models and datasets
+# Downloaded models
 /models/
-/datasets/
 
 # Read-only upstream reference checkouts (llama.cpp, heretic)
 /references/

@@ -1,0 +1,65 @@
+#version 450
+
+// Optimized IQ4_XS GEMV with a shared lookup table and word-packed q loads.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P { uint K; uint N; } p;
+
+uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
+float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
+
+shared float KV[16];
+const float KVALS[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+
+void addWord(uint w, float dl, uint xbase, inout float acc) {
+    uint b0 = w & 0xFFu;
+    uint b1 = (w >> 8u) & 0xFFu;
+    uint b2 = (w >> 16u) & 0xFFu;
+    uint b3 = (w >> 24u) & 0xFFu;
+    acc += dl * KV[b0 & 0xFu] * x[xbase + 0u];
+    acc += dl * KV[b0 >> 4u] * x[xbase + 16u];
+    acc += dl * KV[b1 & 0xFu] * x[xbase + 1u];
+    acc += dl * KV[b1 >> 4u] * x[xbase + 17u];
+    acc += dl * KV[b2 & 0xFu] * x[xbase + 2u];
+    acc += dl * KV[b2 >> 4u] * x[xbase + 18u];
+    acc += dl * KV[b3 & 0xFu] * x[xbase + 3u];
+    acc += dl * KV[b3 >> 4u] * x[xbase + 19u];
+}
+
+void main() {
+    if (gl_LocalInvocationID.x < 16u) {
+        KV[gl_LocalInvocationID.x] = KVALS[gl_LocalInvocationID.x];
+    }
+    barrier();
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    float acc = 0.0;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint base = (n * bpr + blk) * 136u;
+        uint xb = blk * 256u;
+        float d = f16(base);
+        uint sh = getb(base + 2u) | (getb(base + 3u) << 8u);
+        for (uint ib = 0u; ib < 8u; ib++) {
+            uint sl = getb(base + 4u + (ib >> 1u));
+            int ls = int((sl >> (4u * (ib & 1u))) & 0xFu) | int(((sh >> (2u * ib)) & 3u) << 4u);
+            float dl = d * float(ls - 32);
+            uint wb = (base + 8u + ib * 16u) >> 2u;
+            uint xoff = xb + ib * 32u;
+            addWord(data[wb + 0u], dl, xoff, acc);
+            addWord(data[wb + 1u], dl, xoff + 4u, acc);
+            addWord(data[wb + 2u], dl, xoff + 8u, acc);
+            addWord(data[wb + 3u], dl, xoff + 12u, acc);
+        }
+    }
+    y[n] = acc;
+}
