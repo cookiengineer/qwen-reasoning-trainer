@@ -100,11 +100,16 @@ Supported request features include `stream` (SSE), `reasoning_content` deltas,
 enabled by default. Tool calls use the Qwen XML format and are returned as
 OpenAI `tool_calls` with JSON arguments.
 
-Useful flags: `--device auto|cpu|vulkan`, `--context-length 128k|256k|384k|512k`
-(or raw tokens; `--context` is an alias), `--kv-cache-type q4_k|q8_0`,
-`--max-concurrent N` (default 1), `--default-max-tokens N`, `--model-id ID`,
-and `--api-key KEY` (Bearer auth). Q4_K is the default KV cache type; Q8_0 is
-the higher-quality alternative.
+Useful flags:
+
+- `--device auto|cpu|vulkan`
+- `--context-length 128k|256k|384k|512k`
+- `--kv-cache-type q4_k|q8_0` (default `q4_k`)
+- `--max-concurrent N` (default 1)
+- `--default-max-tokens N`
+- `--model-id ID`
+- `--api-key KEY` (Bearer auth token)
+
 On Vulkan the full inference forward (norms, attention, GatedDeltaNet, FFN, and
 LM head) runs device-resident, and K/V are stored in the quantized cache and
 appended with GPU shaders. The prefill chunk size is selected automatically from
@@ -113,14 +118,16 @@ the context length and device memory. Streaming usage is included when
 
 Limitations: only `n=1`; `logprobs`, `response_format`, and multimodal inputs
 are unsupported; `tool_choice: "none"` disables tools but forced tool selection
-is not enforced. Context values above the native GGUF context (256k) select
-YaRN automatically, with the factor derived from `context / native_context`.
+is not enforced.
+
+Context values above the native GGUF context (256k) select YaRN automatically,
+with the factor derived from `context / native_context`.
+
 Full-attention prefill remains O(T^2) and is submitted one layer at a time to
-avoid driver watchdog resets; the blocked cached-attention shaders amortize KV
-dequantization across 16 queries, but prompts beyond ~32k are still slow
-(roughly 1.6 h projected for 128k and 18 h for 512k prefill on the target GPU). See
-[`current-plan.md`](current-plan.md) for status and
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the underlying pipeline.
+avoid driver watchdog resets. The blocked cached-attention shaders amortize KV
+dequantization across 16 queries, but prompts beyond ~32k are still slow.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the underlying pipeline.
 
 ## Abliteration
 
@@ -275,8 +282,4 @@ The dataset reader is additionally checked against a fixture emitted by the
 ## License
 
 Released under the MIT License. See [LICENSE.txt](LICENSE.txt).
-
-Note: this project is a clean-room reimplementation; the bundled read-only
-reference checkouts (`references/llama_cpp`, `references/heretic`) are not part
-of the build and keep their own licenses (Heretic is AGPL-3.0).
 
