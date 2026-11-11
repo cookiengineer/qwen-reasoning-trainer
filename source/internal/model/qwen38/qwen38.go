@@ -33,6 +33,14 @@ type Config struct {
 	RopeTheta float64
 	RmsEps    float32
 
+	// Long-context rope scaling (none, linear, yarn).
+	RopeScaling         string
+	RopeScaleFactor     float64
+	RopeOriginalContext int
+	RopeBetaFast        float64
+	RopeBetaSlow        float64
+	AttnScale           float32
+
 	DConv      int
 	DState     int
 	DInner     int
@@ -78,24 +86,28 @@ func (c *Config) IsRecurrent(il int) bool {
 // FromModelcfg derives the forward-pass configuration.
 func FromModelcfg(mc *modelcfg.Config) (*Config, error) {
 	c := &Config{
-		NEmbd:            mc.EmbeddingLength,
-		NHead:            mc.HeadCount,
-		NHeadKV:          mc.HeadCountKV,
-		HeadDim:          mc.KeyLength,
-		NRot:             mc.RopeDimCount,
-		NFf:              mc.FeedForwardLength,
-		NLayer:           mc.BlockCount,
-		NVocab:           mc.VocabSize,
-		RopeTheta:        mc.RopeTheta,
-		RmsEps:           float32(mc.RMSNormEps),
-		DConv:            mc.SSMConvKernel,
-		DState:           mc.SSMStateSize,
-		DInner:           mc.SSMInnerSize,
-		DtRank:           mc.SSMTimeStepRank,
-		GroupCount:       mc.SSMGroupCount,
-		FullAttnInterval: mc.FullAttentionInterval,
-		NextNPredict:     mc.NextNPredictLayers,
-		LayerTypes:       mc.LayerTypes,
+		NEmbd:               mc.EmbeddingLength,
+		NHead:               mc.HeadCount,
+		NHeadKV:             mc.HeadCountKV,
+		HeadDim:             mc.KeyLength,
+		NRot:                mc.RopeDimCount,
+		NFf:                 mc.FeedForwardLength,
+		NLayer:              mc.BlockCount,
+		NVocab:              mc.VocabSize,
+		RopeTheta:           mc.RopeTheta,
+		RmsEps:              float32(mc.RMSNormEps),
+		RopeScaling:         "none",
+		RopeScaleFactor:     1,
+		RopeOriginalContext: mc.ContextLength,
+		AttnScale:           1,
+		DConv:               mc.SSMConvKernel,
+		DState:              mc.SSMStateSize,
+		DInner:              mc.SSMInnerSize,
+		DtRank:              mc.SSMTimeStepRank,
+		GroupCount:          mc.SSMGroupCount,
+		FullAttnInterval:    mc.FullAttentionInterval,
+		NextNPredict:        mc.NextNPredictLayers,
+		LayerTypes:          mc.LayerTypes,
 	}
 	if c.HeadDim == 0 && c.NHead > 0 {
 		c.HeadDim = c.NEmbd / c.NHead
@@ -107,6 +119,35 @@ func FromModelcfg(mc *modelcfg.Config) (*Config, error) {
 		return nil, fmt.Errorf("qwen38: incomplete config (n_embd=%d n_layer=%d)", c.NEmbd, c.NLayer)
 	}
 	return c, nil
+}
+
+// RopeScalingOptions returns the compute-layer rope scaling configuration.
+func (c *Config) RopeScalingOptions() compute.RoPEScaling {
+	return compute.RoPEScaling{
+		Mode:            c.RopeScaling,
+		Factor:          c.RopeScaleFactor,
+		OriginalContext: c.RopeOriginalContext,
+		BetaFast:        c.RopeBetaFast,
+		BetaSlow:        c.RopeBetaSlow,
+	}
+}
+
+// SetRopeScaling configures long-context rope scaling and its attention factor.
+func (c *Config) SetRopeScaling(mode string, factor float64, originalContext int) {
+	if mode == "" {
+		mode = "none"
+	}
+	if factor <= 0 {
+		factor = 1
+	}
+	if originalContext <= 0 {
+		originalContext = c.RopeOriginalContext
+	}
+	c.RopeScaling = mode
+	c.RopeScaleFactor = factor
+	c.RopeOriginalContext = originalContext
+	sc := c.RopeScalingOptions()
+	c.AttnScale = sc.AttentionScale()
 }
 
 // Model binds configuration and weights for a forward pass. When Backend is

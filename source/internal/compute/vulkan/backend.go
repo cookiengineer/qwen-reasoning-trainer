@@ -849,6 +849,11 @@ func (b *Backend) GetRowsWeight(w compute.Buffer, indices []int32) (compute.Buff
 
 // RoPE implements compute.Backend.
 func (b *Backend) RoPE(a compute.Buffer, positions []int32, theta float64, nDims int) (compute.Buffer, error) {
+	return b.RoPEScaled(a, positions, theta, nDims, compute.RoPEScaling{})
+}
+
+// RoPEScaled implements optional scaled rope (linear or YaRN).
+func (b *Backend) RoPEScaled(a compute.Buffer, positions []int32, theta float64, nDims int, sc compute.RoPEScaling) (compute.Buffer, error) {
 	x, err := asBuffer(a)
 	if err != nil {
 		return nil, err
@@ -868,10 +873,29 @@ func (b *Backend) RoPE(a compute.Buffer, positions []int32, theta float64, nDims
 	if err != nil {
 		return nil, err
 	}
+	mode := uint32(0)
+	switch sc.Mode {
+	case "linear":
+		mode = 1
+	case "yarn":
+		mode = 2
+	}
+	factor := sc.Factor
+	if factor <= 0 {
+		factor = 1
+	}
+	betaFast, betaSlow := sc.BetaFast, sc.BetaSlow
+	if betaFast <= 0 {
+		betaFast = 32
+	}
+	if betaSlow <= 0 {
+		betaSlow = 1
+	}
 	// One invocation per (token, head, dim) so the non-rotary dims are copied.
 	total := uint32(nTok * nHead * headDim)
 	if err := b.dispatch1D("rope", []*buffer{x, posBuf, out}, total, func(base uint32) []byte {
-		return push(uint32(headDim), uint32(nHead), uint32(nTok), uint32(nDims), float32(theta), base)
+		return push(uint32(headDim), uint32(nHead), uint32(nTok), uint32(nDims), float32(theta), base,
+			mode, float32(factor), uint32(sc.OriginalContext), float32(betaFast), float32(betaSlow))
 	}); err != nil {
 		return nil, err
 	}
@@ -993,6 +1017,23 @@ func (b *Backend) WriteKV(cache compute.Buffer, byteOffset int, data []byte) err
 	return nil
 }
 
+func cachedSplitPlan(nKV, nQ int) (keysPerSplit, splits int, ok bool) {
+	if nQ > 4 || nKV < 8192 {
+		return 0, 0, false
+	}
+	const maxSplits = 64
+	keysPerSplit = 8192
+	splits = (nKV + keysPerSplit - 1) / keysPerSplit
+	if splits > maxSplits {
+		splits = maxSplits
+		keysPerSplit = (nKV + splits - 1) / splits
+	}
+	if splits < 2 {
+		return 0, 0, false
+	}
+	return keysPerSplit, splits, true
+}
+
 // AttentionCached reads a Q4_K or Q8_0 KV cache directly. q has dims
 // [headDim, nHead, nQ]; the cache has [headDim, nHeadKV, nKV]. The query block
 // starts at absolute position nKV-nQ.
@@ -1032,15 +1073,54 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 	default:
 		return nil, fmt.Errorf("vulkan: no cached attention shader for %s", kb.typ)
 	}
+	qStart := uint32(nKV - nQ)
+	const maxPerDispatch = 65535
+	total := nHead * nQ
+
+	if keysPerSplit, splits, ok := cachedSplitPlan(nKV, nQ); ok {
+		stage1 := shader + "_split"
+		part, err := b.newF32Buffer(total*splits*(hd+2), 1)
+		if err != nil {
+			return nil, err
+		}
+		p1 := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
+			uint32(nKV), qStart, scale, uint32(splits), uint32(keysPerSplit))
+		if err := b.dispatch(stage1, []*buffer{qb, kb, vb, b.dummy, part}, p1,
+			[3]uint32{uint32(total), uint32(splits), 1}); err != nil {
+			b.Free(part)
+			return nil, err
+		}
+		out, err := b.newF32Buffer(qb.dims...)
+		if err != nil {
+			b.Free(part)
+			return nil, err
+		}
+		utotal := uint32(total)
+		for start := uint32(0); start < utotal; start += maxPerDispatch {
+			chunk := utotal - start
+			if chunk > maxPerDispatch {
+				chunk = maxPerDispatch
+			}
+			p2 := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
+				uint32(nKV), uint32(splits), start)
+			if err := b.dispatch("attention_cached_reduce", []*buffer{part, out}, p2,
+				[3]uint32{chunk, 1, 1}); err != nil {
+				b.Free(part)
+				b.Free(out)
+				return nil, err
+			}
+		}
+		b.Free(part)
+		return out, nil
+	}
+
 	out, err := b.newF32Buffer(qb.dims...)
 	if err != nil {
 		return nil, err
 	}
-	qStart := uint32(nKV - nQ)
-	const maxPerDispatch = 65535
-	total := uint32(nHead * nQ)
-	for start := uint32(0); start < total; start += maxPerDispatch {
-		chunk := total - start
+	utotal := uint32(total)
+	for start := uint32(0); start < utotal; start += maxPerDispatch {
+		chunk := utotal - start
 		if chunk > maxPerDispatch {
 			chunk = maxPerDispatch
 		}

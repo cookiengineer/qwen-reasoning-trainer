@@ -24,10 +24,35 @@ func GetRows(table *Tensor, indices []int32) (*Tensor, error) {
 	return out, nil
 }
 
+// RoPEScaling configures long-context rotary scaling. Mode is "", "none",
+// "linear", or "yarn". Factor is the context extension factor. OriginalContext
+// is the model's native training context. BetaFast/BetaSlow are YaRN ramp
+// parameters; zero values select the standard 32/1.
+type RoPEScaling struct {
+	Mode            string
+	Factor          float64
+	OriginalContext int
+	BetaFast        float64
+	BetaSlow        float64
+}
+
+// AttentionScale returns the YaRN query scaling factor (1 when disabled).
+func (s RoPEScaling) AttentionScale() float32 {
+	if s.Mode != "yarn" || s.Factor <= 1 {
+		return 1
+	}
+	return float32(0.1*math.Log(s.Factor) + 1)
+}
+
 // RoPENeoX applies rotary position embeddings in the GPT-NeoX layout (pairs
 // i and i+nDims/2) over the first nDims elements of each head. x has Dims
 // [headDim, nHead, nTokens]; positions has length nTokens.
 func RoPENeoX(x *Tensor, positions []int32, theta float64, nDims int) (*Tensor, error) {
+	return RoPENeoXScaled(x, positions, theta, nDims, RoPEScaling{})
+}
+
+// RoPENeoXScaled is RoPENeoX with optional linear or YaRN frequency scaling.
+func RoPENeoXScaled(x *Tensor, positions []int32, theta float64, nDims int, sc RoPEScaling) (*Tensor, error) {
 	headDim := x.Ne(0)
 	nHead := x.Ne(1)
 	nTok := x.Ne(2)
@@ -41,6 +66,25 @@ func RoPENeoX(x *Tensor, positions []int32, theta float64, nDims int) (*Tensor, 
 		return nil, ErrShape
 	}
 	half := nDims / 2
+	mode := sc.Mode
+	if mode == "" {
+		mode = "none"
+	}
+	factor := sc.Factor
+	if factor <= 0 {
+		factor = 1
+	}
+	betaFast, betaSlow := sc.BetaFast, sc.BetaSlow
+	if betaFast <= 0 {
+		betaFast = 32
+	}
+	if betaSlow <= 0 {
+		betaSlow = 1
+	}
+	low, high := 0, 0
+	if mode == "yarn" && sc.OriginalContext > 0 && factor > 1 {
+		low, high = yarnCorrectionRange(betaFast, betaSlow, nDims, theta, float64(sc.OriginalContext))
+	}
 	out := x.Clone()
 	for t := 0; t < nTok; t++ {
 		pos := float64(positions[t])
@@ -48,6 +92,15 @@ func RoPENeoX(x *Tensor, positions []int32, theta float64, nDims int) (*Tensor, 
 			base := (t*nHead + h) * headDim
 			for i := 0; i < half; i++ {
 				freq := math.Pow(theta, -2*float64(i)/float64(nDims))
+				switch mode {
+				case "linear":
+					freq /= factor
+				case "yarn":
+					if factor > 1 && sc.OriginalContext > 0 {
+						ramp := yarnRamp(i, low, high)
+						freq = (1-ramp)*(freq/factor) + ramp*freq
+					}
+				}
 				ang := pos * freq
 				c, s := math.Cos(ang), math.Sin(ang)
 				x0 := float64(out.F32[base+i])
@@ -58,6 +111,42 @@ func RoPENeoX(x *Tensor, positions []int32, theta float64, nDims int) (*Tensor, 
 		}
 	}
 	return out, nil
+}
+
+func yarnCorrectionDim(numRotations, dim int, base, maxPos float64) float64 {
+	return float64(dim) * math.Log(maxPos/(float64(numRotations)*2*math.Pi)) / (2 * math.Log(base))
+}
+
+func yarnCorrectionRange(betaFast, betaSlow float64, dim int, base, maxPos float64) (int, int) {
+	low := int(math.Floor(yarnCorrectionDim(int(betaFast), dim, base, maxPos)))
+	high := int(math.Ceil(yarnCorrectionDim(int(betaSlow), dim, base, maxPos)))
+	if low < 0 {
+		low = 0
+	}
+	if high < 0 {
+		high = 0
+	}
+	if low > dim-1 {
+		low = dim - 1
+	}
+	if high > dim-1 {
+		high = dim - 1
+	}
+	return low, high
+}
+
+func yarnRamp(i, low, high int) float64 {
+	if low == high {
+		high++
+	}
+	t := float64(i-low) / float64(high-low)
+	if t < 0 {
+		return 0
+	}
+	if t > 1 {
+		return 1
+	}
+	return t
 }
 
 // L2Norm normalizes each contiguous row of length Dims[0] to unit L2 norm

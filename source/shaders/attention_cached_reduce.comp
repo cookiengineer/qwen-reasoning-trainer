@@ -1,0 +1,59 @@
+#version 450
+
+// Stage 2 of split-context cached attention: combine partial softmax stats.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer PART { float part[]; };
+layout(binding = 1) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint headDim;
+    uint nQ;
+    uint nHead;
+    uint nHeadKV;
+    uint nKV;
+    uint nSplit;
+    uint base;
+} p;
+
+#define LS 64
+
+void main() {
+    uint qid = p.base + gl_WorkGroupID.x;
+    if (qid >= p.nHead * p.nQ) {
+        return;
+    }
+    uint hd = p.headDim;
+    uint i = qid % p.nQ;
+    uint h = qid / p.nQ;
+    uint lane = gl_LocalInvocationID.x;
+    uint stride = hd + 2u;
+
+    float M = -1e30;
+    for (uint s = 0u; s < p.nSplit; s++) {
+        M = max(M, part[(qid * p.nSplit + s) * stride]);
+    }
+
+    float L = 0.0;
+    for (uint s = 0u; s < p.nSplit; s++) {
+        uint off = (qid * p.nSplit + s) * stride;
+        float l = part[off + 1u];
+        if (l > 0.0) {
+            L += l * exp(part[off] - M);
+        }
+    }
+
+    uint oOff = (i * p.nHead + h) * hd;
+    for (uint d = lane; d < hd; d += LS) {
+        float acc = 0.0;
+        for (uint s = 0u; s < p.nSplit; s++) {
+            uint off = (qid * p.nSplit + s) * stride;
+            float l = part[off + 1u];
+            if (l > 0.0) {
+                acc += part[off + 2u + d] * exp(part[off] - M);
+            }
+        }
+        o[oOff + d] = L > 0.0 ? acc / L : 0.0;
+    }
+}

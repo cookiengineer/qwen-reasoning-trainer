@@ -19,6 +19,19 @@ var (
 	AlternativeKVCacheType = quant.TypeQ8_0
 )
 
+// ParseKVCacheType parses the supported KV cache types. Q4_K is the default;
+// Q8_0 is the alternative.
+func ParseKVCacheType(s string) (quant.Type, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "q4_k", "q4k":
+		return DefaultKVCacheType, nil
+	case "q8_0", "q80":
+		return AlternativeKVCacheType, nil
+	default:
+		return 0, fmt.Errorf("invalid KV cache type %q (want q4_k or q8_0)", s)
+	}
+}
+
 // ParseContextLength parses a context length such as "128k", "512K", or
 // "524288". A k/K suffix means 1024 tokens.
 func ParseContextLength(s string) (int, error) {
@@ -125,6 +138,42 @@ func AutoPrefillChunk(context int, caps compute.Capabilities) int {
 		chunk = context
 	}
 	return chunk
+}
+
+// ResolveRopeScaling turns the server's auto/none/linear/yarn setting into a
+// concrete mode and factor. Auto selects YaRN for contexts above native.
+func ResolveRopeScaling(context, native int, mode string, factor float64) (string, float64, error) {
+	if mode == "" {
+		mode = "auto"
+	}
+	if native <= 0 {
+		native = context
+	}
+	switch mode {
+	case "auto":
+		if context > native {
+			mode = "yarn"
+			if factor <= 0 {
+				factor = float64(context) / float64(native)
+			}
+		} else {
+			mode = "none"
+			factor = 1
+		}
+	case "none":
+		factor = 1
+	case "linear", "yarn":
+		if factor <= 0 {
+			if context > native {
+				factor = float64(context) / float64(native)
+			} else {
+				factor = 1
+			}
+		}
+	default:
+		return "", 0, fmt.Errorf("unknown rope scaling %q (want auto, none, linear, or yarn)", mode)
+	}
+	return mode, factor, nil
 }
 
 // FormatTokens renders a token count compactly (e.g. 512k).

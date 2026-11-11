@@ -143,3 +143,60 @@ func TestGatedDeltaNetDecay(t *testing.T) {
 		t.Fatal("NaN output with strong decay")
 	}
 }
+
+func TestRoPELinearScaling(t *testing.T) {
+	x := &Tensor{Dims: []int{8, 2, 1}, F32: make([]float32, 16)}
+	for i := range x.F32 {
+		x.F32[i] = float32(i+1) * 0.1
+	}
+	base, err := RoPENeoX(x, []int32{2}, 10000, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scaled, err := RoPENeoXScaled(x, []int32{4}, 10000, 8, RoPEScaling{Mode: "linear", Factor: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range base.F32 {
+		if diff := math.Abs(float64(base.F32[i] - scaled.F32[i])); diff > 1e-5 {
+			t.Fatalf("linear[%d] = %v, want %v", i, scaled.F32[i], base.F32[i])
+		}
+	}
+}
+
+func TestRoPEYarnIdentityAtFactorOne(t *testing.T) {
+	x := &Tensor{Dims: []int{8, 1, 1}, F32: []float32{1, 2, 3, 4, 5, 6, 7, 8}}
+	base, err := RoPENeoX(x, []int32{3}, 10000, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scaled, err := RoPENeoXScaled(x, []int32{3}, 10000, 8, RoPEScaling{
+		Mode: "yarn", Factor: 1, OriginalContext: 262144,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range base.F32 {
+		if base.F32[i] != scaled.F32[i] {
+			t.Fatalf("yarn factor 1 changed [%d]: %v != %v", i, scaled.F32[i], base.F32[i])
+		}
+	}
+	if got := (RoPEScaling{Mode: "yarn", Factor: 2}).AttentionScale(); math.Abs(float64(got)-(0.1*math.Log(2)+1)) > 1e-6 {
+		t.Fatalf("AttentionScale = %v", got)
+	}
+}
+
+func TestRoPEYarnPreservesPairNorm(t *testing.T) {
+	x := &Tensor{Dims: []int{8, 1, 1}, F32: []float32{3, 4, 1, -2, 5, 0, -1, 2}}
+	out, err := RoPENeoXScaled(x, []int32{100000}, 1e7, 8, RoPEScaling{
+		Mode: "yarn", Factor: 2, OriginalContext: 262144,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		got := out.F32[i]*out.F32[i] + out.F32[i+4]*out.F32[i+4]
+		want := x.F32[i]*x.F32[i] + x.F32[i+4]*x.F32[i+4]
+		approx(t, got, want, 1e-4, "pair norm")
+	}
+}

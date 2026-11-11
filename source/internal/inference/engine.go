@@ -30,6 +30,8 @@ type LoadOptions struct {
 	ContextLength int
 	// MaxConcurrent bounds the number of in-flight generation requests.
 	MaxConcurrent int
+	// KVCacheType is "q4_k" (default) or "q8_0".
+	KVCacheType string
 	// Log receives backend selection diagnostics. Nil discards them.
 	Log io.Writer
 	// LogLevel is "quiet", "info", or "debug"; quiet silences backend logging.
@@ -72,6 +74,10 @@ func Load(opt LoadOptions) (*Engine, error) {
 	if opt.Path == "" {
 		return nil, fmt.Errorf("inference: model path is required")
 	}
+	kvType, err := ParseKVCacheType(opt.KVCacheType)
+	if err != nil {
+		return nil, err
+	}
 	g, err := gguf.Open(opt.Path)
 	if err != nil {
 		return nil, err
@@ -107,6 +113,12 @@ func Load(opt LoadOptions) (*Engine, error) {
 	if ctx <= 0 {
 		ctx = 32768
 	}
+	native := mc.ContextLength
+	if native <= 0 {
+		native = ctx
+	}
+	mode, factor, _ := ResolveRopeScaling(ctx, native, "auto", 0)
+	m.Cfg.SetRopeScaling(mode, factor, native)
 	concurrent := opt.MaxConcurrent
 	if concurrent <= 0 {
 		concurrent = 1
@@ -124,7 +136,7 @@ func Load(opt LoadOptions) (*Engine, error) {
 		file:         g,
 		contextLen:   ctx,
 		modelBytes:   mb,
-		kvType:       DefaultKVCacheType,
+		kvType:       kvType,
 		prefillChunk: AutoPrefillChunk(ctx, caps),
 		sem:          make(chan struct{}, concurrent),
 	}

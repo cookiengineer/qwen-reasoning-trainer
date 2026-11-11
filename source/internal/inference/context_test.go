@@ -5,6 +5,7 @@ import (
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
 )
 
 func real27BConfig() *modelcfg.Config {
@@ -107,5 +108,59 @@ func TestKVBudgetReservation(t *testing.T) {
 	e.releaseKV(6)
 	if e.kvUsed != 0 {
 		t.Fatalf("kvUsed = %d, want 0", e.kvUsed)
+	}
+}
+func TestResolveRopeScaling(t *testing.T) {
+	cases := []struct {
+		context, native int
+		mode            string
+		factor          float64
+		wantMode        string
+		wantFactor      float64
+	}{
+		{128 << 10, 256 << 10, "auto", 0, "none", 1},
+		{512 << 10, 256 << 10, "auto", 0, "yarn", 2},
+		{384 << 10, 256 << 10, "auto", 0, "yarn", 1.5},
+		{512 << 10, 256 << 10, "none", 0, "none", 1},
+		{512 << 10, 256 << 10, "yarn", 4, "yarn", 4},
+		{128 << 10, 256 << 10, "linear", 0, "linear", 1},
+	}
+	for _, tc := range cases {
+		mode, factor, err := ResolveRopeScaling(tc.context, tc.native, tc.mode, tc.factor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode != tc.wantMode || factor != tc.wantFactor {
+			t.Fatalf("ctx=%d mode=%s: got (%s,%v) want (%s,%v)",
+				tc.context, tc.mode, mode, factor, tc.wantMode, tc.wantFactor)
+		}
+	}
+	if _, _, err := ResolveRopeScaling(1, 1, "bogus", 0); err == nil {
+		t.Fatal("expected error for unknown mode")
+	}
+}
+
+func TestParseKVCacheType(t *testing.T) {
+	cases := []struct {
+		in   string
+		want quant.Type
+	}{
+		{"", quant.TypeQ4_K},
+		{"q4_k", quant.TypeQ4_K},
+		{"Q4K", quant.TypeQ4_K},
+		{"q8_0", quant.TypeQ8_0},
+		{" Q8_0 ", quant.TypeQ8_0},
+	}
+	for _, tc := range cases {
+		got, err := ParseKVCacheType(tc.in)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%q = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+	if _, err := ParseKVCacheType("f16"); err == nil {
+		t.Fatal("expected error for f16")
 	}
 }

@@ -18,7 +18,24 @@ layout(push_constant) uniform P {
     uint  nDims;
     float theta;
     uint  base;
+    uint  mode;
+    float factor;
+    uint  origContext;
+    float betaFast;
+    float betaSlow;
 } p;
+
+float yarnCorrectionDim(uint numRotations) {
+    return float(p.nDims) * log(float(p.origContext) / (float(numRotations) * 2.0 * 3.141592653589793)) /
+        (2.0 * log(p.theta));
+}
+
+float yarnRamp(uint i, float low, float high) {
+    if (low == high) {
+        high += 1.0;
+    }
+    return clamp((float(i) - low) / (high - low), 0.0, 1.0);
+}
 
 void main() {
     uint hd = p.nDims / 2u;
@@ -33,6 +50,14 @@ void main() {
     uint base = (t * p.nHead + h) * p.headDim;
     if (e < hd) {
         float freq = pow(p.theta, -2.0 * float(e) / float(p.nDims));
+        if (p.mode == 1u) {
+            freq /= p.factor;
+        } else if (p.mode == 2u && p.factor > 1.0 && p.origContext > 0u) {
+            float low = floor(yarnCorrectionDim(uint(p.betaFast)));
+            float high = ceil(yarnCorrectionDim(uint(p.betaSlow)));
+            float ramp = yarnRamp(e, low, high);
+            freq = (1.0 - ramp) * (freq / p.factor) + ramp * freq;
+        }
         float ang = float(pos[t]) * freq;
         float c = cos(ang);
         float s = sin(ang);

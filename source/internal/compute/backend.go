@@ -205,6 +205,12 @@ type Backend interface {
 	SumSquares(dst, src Buffer) error
 }
 
+// RopeScaledBackend is implemented by backends that support linear/YaRN rope
+// scaling. Callers can fall back to the host reference when absent.
+type RopeScaledBackend interface {
+	RoPEScaled(a Buffer, positions []int32, theta float64, nDims int, sc RoPEScaling) (Buffer, error)
+}
+
 // Runner is implemented by backends that need coarse-grained serialization of
 // complete operation groups. Callers should wrap a whole forward pass (or any
 // other sequence that relies on backend-scoped command state) in Run.

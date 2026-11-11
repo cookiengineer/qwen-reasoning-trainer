@@ -328,11 +328,12 @@ func (m *Model) fullAttn(lw *LayerWeights, h *compute.Tensor, positions []int32,
 		return nil, err
 	}
 
-	qn, err = compute.RoPENeoX(qn, positions, cfg.RopeTheta, cfg.NRot)
+	rope := cfg.RopeScalingOptions()
+	qn, err = compute.RoPENeoXScaled(qn, positions, cfg.RopeTheta, cfg.NRot, rope)
 	if err != nil {
 		return nil, err
 	}
-	kn, err = compute.RoPENeoX(kn, positions, cfg.RopeTheta, cfg.NRot)
+	kn, err = compute.RoPENeoXScaled(kn, positions, cfg.RopeTheta, cfg.NRot, rope)
 	if err != nil {
 		return nil, err
 	}
@@ -340,6 +341,9 @@ func (m *Model) fullAttn(lw *LayerWeights, h *compute.Tensor, positions []int32,
 	scale := float32(1.0)
 	if hd > 0 {
 		scale = float32(1.0 / math.Sqrt(float64(hd)))
+	}
+	if cfg.AttnScale > 0 {
+		scale *= cfg.AttnScale
 	}
 	var attn *compute.Tensor
 	if dc := deviceCache(st, il); dc != nil {

@@ -363,6 +363,19 @@ func (b *Backend) RoPE(a compute.Buffer, positions []int32, theta float64, nDims
 	return wrap(out), nil
 }
 
+// RoPEScaled implements optional scaled rope.
+func (b *Backend) RoPEScaled(a compute.Buffer, positions []int32, theta float64, nDims int, sc compute.RoPEScaling) (compute.Buffer, error) {
+	ta, err := tensor(a)
+	if err != nil {
+		return nil, err
+	}
+	out, err := compute.RoPENeoXScaled(ta, positions, theta, nDims, sc)
+	if err != nil {
+		return nil, err
+	}
+	return wrap(out), nil
+}
+
 // Attention implements compute.Backend.
 func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale float32, causal bool) (compute.Buffer, error) {
 	tq, err := tensor(q)

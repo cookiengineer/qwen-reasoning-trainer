@@ -37,6 +37,7 @@ func run() error {
 	contextFlag := flag.String("context-length", "", "context length: 128k|256k|384k|512k or raw tokens (default: GGUF)")
 	flag.StringVar(contextFlag, "context", "", "alias for --context-length")
 	maxConcurrent := flag.Int("max-concurrent", 1, "maximum in-flight generation requests")
+	kvCacheType := flag.String("kv-cache-type", "q4_k", "KV cache type: q4_k|q8_0")
 	maxTokens := flag.Int("default-max-tokens", 1024, "default max_tokens when the request omits it")
 	temperature := flag.Float64("default-temperature", 1.0, "default temperature")
 	topP := flag.Float64("default-top-p", 1.0, "default top_p")
@@ -66,6 +67,7 @@ func run() error {
 		Device:        *device,
 		ContextLength: contextLen,
 		MaxConcurrent: *maxConcurrent,
+		KVCacheType:   *kvCacheType,
 		Log:           os.Stderr,
 		LogLevel:      *logLevel,
 	})
@@ -113,10 +115,8 @@ func run() error {
 	if engine.KVLimited() {
 		logger.Printf("device KV budget: %s", inference.FormatBytes(engine.KVBudgetBytes()))
 	}
-	if contextLen > engine.Cfg.ContextLength {
-		logger.Printf("warning: context %s exceeds the native GGUF context %s; YaRN scaling is not implemented yet",
-			inference.FormatTokens(contextLen), inference.FormatTokens(engine.Cfg.ContextLength))
-	}
+	logger.Printf("rope-scaling=%s factor=%.3f attn-scale=%.3f",
+		engine.Model.Cfg.RopeScaling, engine.Model.Cfg.RopeScaleFactor, engine.Model.Cfg.AttnScale)
 	logger.Printf("listening on http://%s (model=%s, context=%d)", addr, id, engine.ContextLength())
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err

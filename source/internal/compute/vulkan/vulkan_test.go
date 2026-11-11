@@ -171,6 +171,34 @@ func TestVulkanGetRowsRoPE(t *testing.T) {
 	}
 }
 
+func TestVulkanRoPEScaled(t *testing.T) {
+	c, v := newBackends(t)
+	n := 8 * 2 * 3
+	rx := make([]float32, n)
+	for i := range rx {
+		rx[i] = float32(math.Sin(float64(i)*0.37)) * 2
+	}
+	pos := []int32{0, 1000, 100000}
+	for _, sc := range []compute.RoPEScaling{
+		{Mode: "linear", Factor: 2},
+		{Mode: "yarn", Factor: 2, OriginalContext: 262144},
+	} {
+		cf := func(b compute.Backend) (compute.Buffer, error) {
+			return b.(compute.RopeScaledBackend).RoPEScaled(
+				up(t, b, []int{8, 2, 3}, append([]float32(nil), rx...)), pos, 1e7, 8, sc)
+		}
+		co, err := cf(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vo, err := cf(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		compare(t, "rope-scaled:"+sc.Mode, down(t, v, vo), down(t, c, co))
+	}
+}
+
 func TestVulkanAttention(t *testing.T) {
 	c, v := newBackends(t)
 	q := []float32{1, 1}
