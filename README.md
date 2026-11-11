@@ -67,6 +67,46 @@ reference runs. `gpu-info` reports the detected device and memory.
 See [Abliteration](#abliteration) for removing refusal directions and for the
 parameter search.
 
+## Inference server
+
+`qwen-server` exposes the same Vulkan/CPU inference pipeline through a minimal
+OpenAI-compatible API. Build it with `make server`:
+
+```sh
+make server;
+./build/qwen-server --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --port 8080;
+```
+
+It serves `GET /v1/models`, `POST /v1/chat/completions`, and `GET /health`.
+Requests are serialized because the model's device weight cache and Vulkan
+backend are not concurrency-safe.
+
+```sh
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.8-27B-UD-Q4_K_M",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "stream": true
+  }';
+```
+
+Supported request features include `stream` (SSE), `reasoning_content` deltas,
+`tools`/`tool_calls`, `temperature`, `top_p`, `top_k`, `seed`, `stop`,
+`max_tokens`/`max_completion_tokens`, `reasoning_effort`, and
+`chat_template_kwargs` (`enable_thinking`, `preserve_thinking`). Thinking is
+enabled by default. Tool calls use the Qwen XML format and are returned as
+OpenAI `tool_calls` with JSON arguments.
+
+Useful flags: `--device auto|cpu|vulkan`, `--context N`,
+`--default-max-tokens N`, `--model-id ID`, and `--api-key KEY` (Bearer auth).
+Streaming usage is included when `stream_options.include_usage` is true.
+
+Limitations: only `n=1`; `logprobs`, `response_format`, and multimodal inputs
+are unsupported; `tool_choice: "none"` disables tools but forced tool selection
+is not enforced. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
+underlying pipeline.
+
 ## Abliteration
 
 Remove the refusal/safety direction from the weights with Heretic-style

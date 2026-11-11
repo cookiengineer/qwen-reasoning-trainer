@@ -4,6 +4,8 @@
 #
 # Common targets:
 #   make            build the CLI (compiles shaders first)
+#   make server     build the OpenAI-compatible inference server
+#   make build-all  build both binaries
 #   make shaders    compile GLSL compute shaders to embedded SPIR-V
 #   make test       run the full test suite
 #   make check      fmt-check + vet + test
@@ -24,6 +26,8 @@ BIN_DIR := build
 BIN     := $(BIN_DIR)/qwen-trainer
 # Command path relative to $(SRC).
 CMD     := ./cmds/qwen-trainer
+BIN_SERVER := $(BIN_DIR)/qwen-server
+CMD_SERVER := ./cmds/qwen-server
 
 SHADER_DIR := $(SRC)/shaders
 SPIRV_DIR  := $(SRC)/internal/compute/vulkan/spirv
@@ -46,7 +50,7 @@ E2E_VENV      := $(E2E_DIR)/.venv
 E2E_PYTHON ?= $(CURDIR)/$(E2E_VENV)/bin/python
 E2E_STAMP  := $(E2E_VENV)/.deps-ok
 
-.PHONY: all build shaders test vet fmt fmt-check tidy clean check \
+.PHONY: all build build-all server shaders test vet fmt fmt-check tidy clean check \
         verify-ref verify-data verify-quants e2e-venv inspect gpu-info
 
 all: build
@@ -55,6 +59,12 @@ all: build
 # present before compiling.
 build: shaders
 	$(GO) -C $(SRC) build -o $(CURDIR)/$(BIN) $(CMD)
+
+# Build the OpenAI-compatible inference server.
+server: shaders
+	$(GO) -C $(SRC) build -o $(CURDIR)/$(BIN_SERVER) $(CMD_SERVER)
+
+build-all: build server
 
 # Compile and validate each GLSL shader to SPIR-V.
 $(SPIRV_DIR)/%.spv: $(SHADER_DIR)/%.comp $(SHADER_INC)
