@@ -78,8 +78,10 @@ make server;
 ```
 
 It serves `GET /v1/models`, `POST /v1/chat/completions`, and `GET /health`.
-Requests are serialized because the model's device weight cache and Vulkan
-backend are not concurrency-safe.
+Up to `--max-concurrent` requests are admitted at once. Complete forward passes
+are serialized by the Vulkan execution guard, so requests interleave between
+decode steps without corrupting shared command/descriptor state. GPU kernels
+from different requests do not execute in parallel.
 
 ```sh
 curl -N http://127.0.0.1:8080/v1/chat/completions \
@@ -100,13 +102,14 @@ OpenAI `tool_calls` with JSON arguments.
 
 Useful flags: `--device auto|cpu|vulkan`, `--context-length 128k|256k|384k|512k`
 (or raw tokens; `--context` is an alias), `--kv-cache-type q4_k|q8_0`,
-`--max-concurrent N`, `--default-max-tokens N`, `--model-id ID`, and
-`--api-key KEY` (Bearer auth). Q4_K is the default KV cache type; Q8_0 is the
-higher-quality alternative.
-On Vulkan, K/V are stored device-resident in that quantized format and decode
-attention reads the cache directly. The prefill chunk size is selected
-automatically from the context length and device memory. Streaming usage is
-included when `stream_options.include_usage` is true.
+`--max-concurrent N` (default 1), `--default-max-tokens N`, `--model-id ID`,
+and `--api-key KEY` (Bearer auth). Q4_K is the default KV cache type; Q8_0 is
+the higher-quality alternative.
+On Vulkan the full inference forward (norms, attention, GatedDeltaNet, FFN, and
+LM head) runs device-resident, and K/V are stored in the quantized cache and
+appended with GPU shaders. The prefill chunk size is selected automatically from
+the context length and device memory. Streaming usage is included when
+`stream_options.include_usage` is true.
 
 Limitations: only `n=1`; `logprobs`, `response_format`, and multimodal inputs
 are unsupported; `tool_choice: "none"` disables tools but forced tool selection

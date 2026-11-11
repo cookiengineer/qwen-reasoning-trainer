@@ -119,6 +119,13 @@ func Load(opt LoadOptions) (*Engine, error) {
 	}
 	mode, factor, _ := ResolveRopeScaling(ctx, native, "auto", 0)
 	m.Cfg.SetRopeScaling(mode, factor, native)
+	if be != nil {
+		if err := m.EnableDeviceForward(); err != nil {
+			be.Close()
+			g.Close()
+			return nil, err
+		}
+	}
 	concurrent := opt.MaxConcurrent
 	if concurrent <= 0 {
 		concurrent = 1

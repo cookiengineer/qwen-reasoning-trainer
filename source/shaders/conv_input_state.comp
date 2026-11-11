@@ -1,0 +1,24 @@
+#version 450
+
+// Builds the causal-conv input from a persistent history buffer and a new qkv
+// chunk. hist is [dConv-1, convDim]; out is [dConv-1+T, convDim].
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer QKV  { float qkv[];  };
+layout(binding = 1) readonly  buffer HIST { float hist[]; };
+layout(binding = 2) writeonly buffer OBUF { float o[];  };
+layout(push_constant) uniform P {
+    uint dConv; uint convDim; uint T; uint ncs; uint base;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x + p.base;
+    if (gid >= p.ncs * p.convDim) { return; }
+    uint ch = gid % p.convDim;
+    uint row = gid / p.convDim;
+    if (row < p.dConv - 1u) {
+        o[row + ch * p.ncs] = hist[row + ch * (p.dConv - 1u)];
+    } else {
+        uint t = row - (p.dConv - 1u);
+        o[row + ch * p.ncs] = qkv[ch + t * p.convDim];
+    }
+}

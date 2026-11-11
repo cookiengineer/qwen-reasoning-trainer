@@ -675,6 +675,64 @@ func (b *Backend) ConvInput(qkv compute.Buffer, dConv, convDim, T int) (compute.
 	return out, nil
 }
 
+// ConvInputState builds the causal-conv input from a persistent history buffer
+// and a new qkv chunk, then updates the history to the tail of the combined
+// input.
+func (b *Backend) ConvInputState(qkv, hist compute.Buffer, dConv, convDim, T int) (compute.Buffer, error) {
+	t, err := asBuffer(qkv)
+	if err != nil {
+		return nil, err
+	}
+	h, err := asBuffer(hist)
+	if err != nil {
+		return nil, err
+	}
+	ncs := dConv - 1 + T
+	out, err := b.newF32Buffer(ncs, convDim, 1)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(ncs * convDim)
+	if err := b.dispatch1D("conv_input_state", []*buffer{t, h, out}, total, func(base uint32) []byte {
+		return push(uint32(dConv), uint32(convDim), uint32(T), uint32(ncs), base)
+	}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	htotal := uint32((dConv - 1) * convDim)
+	if err := b.dispatch1D("conv_state_update", []*buffer{out, h}, htotal, func(base uint32) []byte {
+		return push(uint32(dConv), uint32(convDim), uint32(ncs), base)
+	}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// LastToken copies the last token column of x [N,T] into [N,1].
+func (b *Backend) LastToken(x compute.Buffer) (compute.Buffer, error) {
+	xb, err := asBuffer(x)
+	if err != nil {
+		return nil, err
+	}
+	n := xb.Ne0()
+	t := dimOr1(xb.dims, 1)
+	if t <= 0 {
+		return nil, compute.ErrShape
+	}
+	out, err := b.newF32Buffer(n, 1)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.dispatch1D("last_token", []*buffer{xb, out}, uint32(n), func(base uint32) []byte {
+		return push(uint32(n), uint32(t), base)
+	}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
 // ConvInputBack implements compute.Backend.
 func (b *Backend) ConvInputBack(dConvIn compute.Buffer, dConv, convDim, T int) (compute.Buffer, error) {
 	t, err := asBuffer(dConvIn)
@@ -1032,6 +1090,77 @@ func cachedSplitPlan(nKV, nQ int) (keysPerSplit, splits int, ok bool) {
 		return 0, 0, false
 	}
 	return keysPerSplit, splits, true
+}
+
+// AppendKV quantizes a K/V chunk and writes it into a Q4_K or Q8_0 cache.
+// headDim must be 256; pos is the absolute start token.
+func (b *Backend) AppendKV(k, v, kcache, vcache compute.Buffer, pos int) error {
+	kb, err := asBuffer(k)
+	if err != nil {
+		return err
+	}
+	vb, err := asBuffer(v)
+	if err != nil {
+		return err
+	}
+	kc, err := asBuffer(kcache)
+	if err != nil {
+		return err
+	}
+	vc, err := asBuffer(vcache)
+	if err != nil {
+		return err
+	}
+	hd := kb.Ne0()
+	nKV := dimOr1(kb.dims, 1)
+	T := dimOr1(kb.dims, 2)
+	if hd != 256 || T <= 0 || pos < 0 || kc.typ != vc.typ {
+		return compute.ErrShape
+	}
+	var shader string
+	var blockBytes int
+	switch kc.typ {
+	case quant.TypeQ4_K:
+		shader, blockBytes = "kv_append_q4k", 144
+	case quant.TypeQ8_0:
+		shader, blockBytes = "kv_append_q8_0", 272
+	default:
+		return fmt.Errorf("vulkan: no KV append shader for %s", kc.typ)
+	}
+	need := uint64(pos+T) * uint64(nKV) * uint64(blockBytes)
+	if need > kc.size || need > vc.size {
+		return compute.ErrShape
+	}
+	total := uint32(T * nKV)
+	const maxPerDispatch = 65535
+	for start := uint32(0); start < total; start += maxPerDispatch {
+		chunk := total - start
+		if chunk > maxPerDispatch {
+			chunk = maxPerDispatch
+		}
+		pc := push(uint32(hd), uint32(nKV), uint32(T), uint32(pos), start)
+		if err := b.dispatch(shader, []*buffer{kb, kc}, pc, [3]uint32{chunk, 1, 1}); err != nil {
+			return err
+		}
+		if err := b.dispatch(shader, []*buffer{vb, vc}, pc, [3]uint32{chunk, 1, 1}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReadRaw copies n bytes from a buffer to the host. It is used by tests and
+// diagnostics for quantized buffers, whose logical element count is not their
+// byte size.
+func (b *Backend) ReadRaw(buf compute.Buffer, n int) ([]byte, error) {
+	x, err := asBuffer(buf)
+	if err != nil {
+		return nil, err
+	}
+	if n < 0 || uint64(n) > x.size {
+		return nil, compute.ErrShape
+	}
+	return b.readBytes(x, n)
 }
 
 // AttentionCached reads a Q4_K or Q8_0 KV cache directly. q has dims

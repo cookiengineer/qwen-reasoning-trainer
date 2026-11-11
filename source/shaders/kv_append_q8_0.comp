@@ -1,0 +1,66 @@
+#version 450
+
+// Quantizes one 256-value K/V head block to Q8_0 and appends it to a KV cache.
+// One workgroup handles one (token, KV head); headDim must be 256.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer X     { float x[];    };
+layout(binding = 1)           buffer CACHE { uint data[]; } cache;
+
+layout(push_constant) uniform P {
+    uint headDim;
+    uint nHeadKV;
+    uint T;
+    uint pos;
+    uint base;
+} p;
+
+shared float vals[256];
+shared uint sb[272];
+
+float rnd(float v) { return floor(v + 0.5); }
+
+void main() {
+    uint qid = p.base + gl_WorkGroupID.x;
+    if (qid >= p.T * p.nHeadKV) { return; }
+    uint t = qid / p.nHeadKV;
+    uint h = qid % p.nHeadKV;
+    uint lane = gl_LocalInvocationID.x;
+    uint tbase = t * p.headDim * p.nHeadKV;
+    uint xbase = tbase + h * p.headDim;
+    uint blk = (p.pos + t) * p.nHeadKV + h;
+    uint wordBase = blk * 68u;
+
+    for (uint k = 0u; k < 4u; k++) {
+        uint idx = lane * 4u + k;
+        vals[idx] = x[xbase + idx];
+    }
+    barrier();
+
+    if (lane < 8u) {
+        uint b = lane;
+        uint off = b * 32u;
+        float amax = 0.0;
+        for (uint i = 0u; i < 32u; i++) {
+            amax = max(amax, abs(vals[off + i]));
+        }
+        float d = amax / 127.0;
+        float id = d != 0.0 ? 1.0 / d : 0.0;
+        uint hd = packHalf2x16(vec2(d, 0.0));
+        uint bb = b * 34u;
+        sb[bb] = hd & 0xFFu;
+        sb[bb + 1u] = (hd >> 8u) & 0xFFu;
+        for (uint i = 0u; i < 32u; i++) {
+            int q = int(clamp(rnd(vals[off + i] * id), -128.0, 127.0));
+            sb[bb + 2u + i] = uint(q) & 0xFFu;
+        }
+    }
+    barrier();
+
+    for (uint i = lane; i < 68u; i += 64u) {
+        uint w = sb[i * 4u] | (sb[i * 4u + 1u] << 8u) |
+                 (sb[i * 4u + 2u] << 16u) | (sb[i * 4u + 3u] << 24u);
+        cache.data[wordBase + i] = w;
+    }
+}

@@ -20,9 +20,15 @@ type State struct {
 	// DeviceKV holds the quantized device cache when enabled. Recurrent layers
 	// have a nil entry.
 	DeviceKV []*DeviceKVCache
+	// DeviceConv and DeviceSSM hold recurrent-layer state when device forward
+	// is enabled. Full-attention layers have nil entries.
+	DeviceConv []compute.Buffer
+	DeviceSSM  []compute.Buffer
 
-	kvBackend KVCacheBackend
-	kvType    quant.Type
+	backend       compute.Backend
+	kvBackend     KVCacheBackend
+	kvType        quant.Type
+	deviceForward bool
 }
 
 // kvCache stores the keys and values of a full-attention layer, laid out as
@@ -38,6 +44,7 @@ type KVCacheBackend interface {
 	compute.Backend
 	AllocKV(headDim, nKVHeads, capacity int, typ quant.Type) (compute.Buffer, error)
 	WriteKV(cache compute.Buffer, byteOffset int, data []byte) error
+	AppendKV(k, v, kcache, vcache compute.Buffer, pos int) error
 	AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHeadKV, nKV int, scale float32) (compute.Buffer, error)
 }
 
@@ -50,9 +57,10 @@ type DeviceKVCache struct {
 
 // StateOptions configures optional device-resident KV state.
 type StateOptions struct {
-	Backend  compute.Backend
-	KVType   quant.Type
-	Capacity int
+	Backend       compute.Backend
+	KVType        quant.Type
+	Capacity      int
+	DeviceForward bool
 }
 
 // NewState allocates a zeroed state for cfg.
@@ -62,6 +70,30 @@ func NewState(cfg *Config) *State { return NewStateWithCapacity(cfg, 0) }
 // reserves quantized device KV buffers for the full-attention layers.
 func NewStateWithOptions(cfg *Config, opt StateOptions) (*State, error) {
 	s := NewStateWithCapacity(cfg, 0)
+	s.backend = opt.Backend
+	if opt.DeviceForward && opt.Backend != nil {
+		s.deviceForward = true
+		s.DeviceConv = make([]compute.Buffer, cfg.TrunkLayers())
+		s.DeviceSSM = make([]compute.Buffer, cfg.TrunkLayers())
+		for il := 0; il < cfg.TrunkLayers(); il++ {
+			if !cfg.IsRecurrent(il) {
+				continue
+			}
+			conv, err := uploadDeviceZeros(opt.Backend, cfg.DConv-1, cfg.ConvDim())
+			if err != nil {
+				s.Free()
+				return nil, err
+			}
+			ssm, err := uploadDeviceZeros(opt.Backend, cfg.HeadVDim(), cfg.HeadVDim(), cfg.DtRank)
+			if err != nil {
+				opt.Backend.Free(conv)
+				s.Free()
+				return nil, err
+			}
+			s.DeviceConv[il] = conv
+			s.DeviceSSM[il] = ssm
+		}
+	}
 	kb, ok := opt.Backend.(KVCacheBackend)
 	if !ok || opt.Capacity <= 0 || !opt.KVType.IsQuantized() {
 		return s, nil
@@ -89,25 +121,50 @@ func NewStateWithOptions(cfg *Config, opt StateOptions) (*State, error) {
 	return s, nil
 }
 
+func uploadDeviceZeros(be compute.Backend, dims ...int) (compute.Buffer, error) {
+	n := 1
+	for _, d := range dims {
+		n *= d
+	}
+	return be.Upload(&compute.Tensor{Dims: append([]int(nil), dims...), F32: make([]float32, n)})
+}
+
 // Free releases device KV buffers. The host caches are garbage-collected.
 func (s *State) Free() {
-	if s == nil || s.kvBackend == nil {
+	if s == nil {
 		return
 	}
-	for _, c := range s.DeviceKV {
-		if c == nil {
-			continue
+	if s.kvBackend != nil {
+		for _, c := range s.DeviceKV {
+			if c == nil {
+				continue
+			}
+			if c.K != nil {
+				s.kvBackend.Free(c.K)
+				c.K = nil
+			}
+			if c.V != nil {
+				s.kvBackend.Free(c.V)
+				c.V = nil
+			}
 		}
-		if c.K != nil {
-			s.kvBackend.Free(c.K)
-			c.K = nil
+		s.DeviceKV = nil
+	}
+	if s.backend != nil {
+		for _, b := range s.DeviceConv {
+			if b != nil {
+				s.backend.Free(b)
+			}
 		}
-		if c.V != nil {
-			s.kvBackend.Free(c.V)
-			c.V = nil
+		for _, b := range s.DeviceSSM {
+			if b != nil {
+				s.backend.Free(b)
+			}
 		}
 	}
-	s.DeviceKV = nil
+	s.DeviceConv = nil
+	s.DeviceSSM = nil
+	s.backend = nil
 	s.kvBackend = nil
 }
 
@@ -174,7 +231,13 @@ func (m *Model) Forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 	defer m.mu.Unlock()
 	var res *ForwardResult
 	err := compute.Run(m.Backend, func() error {
-		r, err := m.forward(tokens, opts)
+		var r *ForwardResult
+		var err error
+		if m.device != nil && opts.State != nil && opts.State.deviceForward {
+			r, err = m.forwardDevice(tokens, opts)
+		} else {
+			r, err = m.forward(tokens, opts)
+		}
 		res = r
 		return err
 	})

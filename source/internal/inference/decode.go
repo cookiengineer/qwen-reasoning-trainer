@@ -72,9 +72,10 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 	err = compute.Run(e.Backend, func() error {
 		var stateErr error
 		st, stateErr = qwen38.NewStateWithOptions(e.Model.Cfg, qwen38.StateOptions{
-			Backend:  e.Backend,
-			KVType:   e.kvType,
-			Capacity: capacity,
+			Backend:       e.Backend,
+			KVType:        e.kvType,
+			Capacity:      capacity,
+			DeviceForward: e.Model.DeviceForwardEnabled(),
 		})
 		return stateErr
 	})

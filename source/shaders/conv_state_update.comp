@@ -1,0 +1,18 @@
+#version 450
+
+// Updates hist [dConv-1, convDim] from the tail of convIn [ncs, convDim].
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly  buffer IBUF { float inx[];  };
+layout(binding = 1) writeonly buffer HIST { float hist[]; };
+layout(push_constant) uniform P {
+    uint dConv; uint convDim; uint ncs; uint base;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x + p.base;
+    if (gid >= (p.dConv - 1u) * p.convDim) { return; }
+    uint ch = gid % p.convDim;
+    uint row = gid / p.convDim;
+    uint src = p.ncs - (p.dConv - 1u) + row;
+    hist[row + ch * (p.dConv - 1u)] = inx[src + ch * p.ncs];
+}

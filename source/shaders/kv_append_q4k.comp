@@ -1,0 +1,129 @@
+#version 450
+
+// Quantizes one 256-value K/V head block to Q4_K and appends it to a KV cache.
+// One workgroup handles one (token, KV head); headDim must be 256.
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer X     { float x[];    };
+layout(binding = 1)           buffer CACHE { uint data[]; } cache;
+
+layout(push_constant) uniform P {
+    uint headDim;
+    uint nHeadKV;
+    uint T;
+    uint pos;
+    uint base;
+} p;
+
+shared float vals[256];
+shared float sbMin[8];
+shared float sbMax[8];
+shared float sbScale[8];
+shared float sbMinQ[8];
+shared float qd;
+shared float qdmin;
+shared uint scArr[8];
+shared uint mArr[8];
+shared uint sb[144];
+
+float rnd(float v) { return floor(v + 0.5); }
+
+void main() {
+    uint qid = p.base + gl_WorkGroupID.x;
+    if (qid >= p.T * p.nHeadKV) { return; }
+    uint t = qid / p.nHeadKV;
+    uint h = qid % p.nHeadKV;
+    uint lane = gl_LocalInvocationID.x;
+    uint tbase = t * p.headDim * p.nHeadKV;
+    uint xbase = tbase + h * p.headDim;
+    uint blk = (p.pos + t) * p.nHeadKV + h;
+    uint wordBase = blk * 36u;
+
+    for (uint k = 0u; k < 4u; k++) {
+        uint idx = lane * 4u + k;
+        vals[idx] = x[xbase + idx];
+    }
+    barrier();
+
+    if (lane < 8u) {
+        float lo = vals[lane * 32u];
+        float hi = lo;
+        for (uint i = 1u; i < 32u; i++) {
+            float v = vals[lane * 32u + i];
+            lo = min(lo, v);
+            hi = max(hi, v);
+        }
+        if (lo > 0.0) lo = 0.0;
+        sbMin[lane] = lo;
+        sbMax[lane] = hi;
+        sbScale[lane] = hi > lo ? (hi - lo) / 15.0 : 0.0;
+        sbMinQ[lane] = -lo;
+    }
+    barrier();
+
+    if (lane == 0u) {
+        float maxScale = 0.0;
+        float maxMin = 0.0;
+        for (uint i = 0u; i < 8u; i++) {
+            maxScale = max(maxScale, sbScale[i]);
+            maxMin = max(maxMin, sbMinQ[i]);
+        }
+        qd = maxScale / 63.0;
+        qdmin = maxMin / 63.0;
+        for (uint i = 0u; i < 8u; i++) {
+            scArr[i] = qd > 0.0 ? uint(clamp(rnd(sbScale[i] / qd), 0.0, 63.0)) : 0u;
+            mArr[i] = qdmin > 0.0 ? uint(clamp(rnd(sbMinQ[i] / qdmin), 0.0, 63.0)) : 0u;
+        }
+        uint hd = packHalf2x16(vec2(qd, 0.0));
+        uint hm = packHalf2x16(vec2(qdmin, 0.0));
+        sb[0] = hd & 0xFFu;
+        sb[1] = (hd >> 8u) & 0xFFu;
+        sb[2] = hm & 0xFFu;
+        sb[3] = (hm >> 8u) & 0xFFu;
+        uint packed[12];
+        for (uint i = 0u; i < 12u; i++) { packed[i] = 0u; }
+        for (uint j = 0u; j < 8u; j++) {
+            uint l = scArr[j];
+            uint m = mArr[j];
+            if (j < 4u) {
+                packed[j] = l;
+                packed[j + 4u] = m;
+            } else {
+                packed[j + 4u] = (l & 0xFu) | ((m & 0xFu) << 4u);
+                packed[j - 4u] |= (l >> 4u) << 6u;
+                packed[j] |= (m >> 4u) << 6u;
+            }
+        }
+        for (uint i = 0u; i < 12u; i++) {
+            sb[4u + i] = packed[i];
+        }
+    }
+    barrier();
+
+    float dsc = qd;
+    float dmin = qdmin;
+    for (uint pass = 0u; pass < 2u; pass++) {
+        uint b = lane + pass * 64u;
+        uint g = b / 32u;
+        uint within = b % 32u;
+        uint i0 = g * 64u + within;
+        uint i1 = g * 64u + 32u + within;
+        uint s0 = i0 / 32u;
+        uint s1 = i1 / 32u;
+        float d0 = dsc * float(scArr[s0]);
+        float d1 = dsc * float(scArr[s1]);
+        float q0 = d0 != 0.0 ? rnd((vals[i0] + dmin * float(mArr[s0])) / d0) : 0.0;
+        float q1 = d1 != 0.0 ? rnd((vals[i1] + dmin * float(mArr[s1])) / d1) : 0.0;
+        uint u0 = uint(clamp(q0, 0.0, 15.0));
+        uint u1 = uint(clamp(q1, 0.0, 15.0));
+        sb[16u + b] = u0 | (u1 << 4u);
+    }
+    barrier();
+
+    for (uint i = lane; i < 36u; i += 64u) {
+        uint w = sb[i * 4u] | (sb[i * 4u + 1u] << 8u) |
+                 (sb[i * 4u + 2u] << 16u) | (sb[i * 4u + 3u] << 24u);
+        cache.data[wordBase + i] = w;
+    }
+}

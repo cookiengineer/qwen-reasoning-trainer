@@ -158,6 +158,7 @@ type Model struct {
 	W          *Weights
 	Backend    compute.Backend
 	devWeights map[*Weight]compute.Buffer
+	device     *deviceModel
 
 	// mu serializes forward passes and device-cache invalidation. The backend
 	// guard below serializes command recording; this guard also protects the
@@ -205,8 +206,12 @@ func (m *Model) mm(w *Weight, x *compute.Tensor) (*compute.Tensor, error) {
 func (m *Model) FreeDevice() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.Backend == nil || m.devWeights == nil {
+	if m.Backend == nil {
 		return
+	}
+	if m.device != nil {
+		m.device.free(m.Backend)
+		m.device = nil
 	}
 	for _, b := range m.devWeights {
 		m.Backend.Free(b)
