@@ -400,8 +400,8 @@ Prompt sets are bundled pre-converted in `source/prompts/`, embedded with
 (`--limit 400`, `--eval-limit 100`). Two catalogs are registered in
 `internal/cli/prompts.go` and selected with `--catalog`:
 
-- `heretic` (default) - `harmless_alpaca_{train,test}.jsonl` +
-  `harmful_behaviors_{train,test}.jsonl`.
+- `heretic` (default) - `heretic_harmless_{train,test}.jsonl` +
+  `heretic_harmful_{train,test}.jsonl`.
 - `cybersecurity` - `cybersecurity_defensive_{train,test}.jsonl` (good) +
   `cybersecurity_offensive_{train,test}.jsonl` (bad), `2000/400` rows per split,
   including malware, software, and hardware/firmware reverse-engineering topics.

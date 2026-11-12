@@ -223,7 +223,7 @@ optimizes the ablation hyperparameters.
 # 3. Score the abliteration result via measuring refusal-keyword rate and KL divergence from base model
 ./build/qwen-trainer evaluate \
   --model models/abliterated.gguf \
-  --prompts source/prompts/harmful_behaviors_test.jsonl \
+  --prompts source/prompts/heretic_harmful_test.jsonl \
   --max-tokens 32;
 ```
 
@@ -243,6 +243,8 @@ Two bundled catalogs are selectable with `--catalog`:
 | `heretic` (default) | general harmless instructions | general harmful behaviors    |
 | `cybersecurity`     | defensive security questions  | offensive/dual-use questions |
 
+`heretic` is the default; pass `--catalog heretic` to select it explicitly.
+
 ```sh
 # Use the cybersecurity catalog instead of the default Heretic set
 ./build/qwen-trainer abliterate \
@@ -261,10 +263,10 @@ or JSONL files. The `--prompt-col` CLI parameter selects the column, default `te
 
 | File                                  | Rows  | Role (default)                                 |
 |---------------------------------------|-------|------------------------------------------------|
-| `harmless_alpaca_train.jsonl`         | 25058 | good prompts / residual directions (`--good`)  |
-| `harmful_behaviors_train.jsonl`       | 416   | bad prompts / residual directions (`--bad`)    |
-| `harmless_alpaca_test.jsonl`          | 6265  | KL divergence evaluation (`--eval-good`)       |
-| `harmful_behaviors_test.jsonl`        | 104   | refusal evaluation (`--eval-bad`)              |
+| `heretic_harmless_train.jsonl`        | 25058 | good prompts / residual directions (`--good`)  |
+| `heretic_harmful_train.jsonl`         | 416   | bad prompts / residual directions (`--bad`)    |
+| `heretic_harmless_test.jsonl`         | 6265  | KL divergence evaluation (`--eval-good`)       |
+| `heretic_harmful_test.jsonl`          | 104   | refusal evaluation (`--eval-bad`)              |
 | `cybersecurity_defensive_train.jsonl` | 2000  | good prompts (`--catalog cybersecurity`)       |
 | `cybersecurity_offensive_train.jsonl` | 2000  | bad prompts (`--catalog cybersecurity`)        |
 | `cybersecurity_defensive_test.jsonl`  | 400   | KL evaluation (`--catalog cybersecurity`)      |
@@ -302,7 +304,7 @@ required.
 # Evaluates Refusal keyword rate and KL divergence from a base model
 ./build/qwen-trainer evaluate \
   --model models/abliterated.gguf \
-  --prompts source/prompts/harmful_behaviors_test.jsonl \
+  --prompts source/prompts/heretic_harmful_test.jsonl \
   --max-tokens 32 \
   --base models/Qwen3.8-27B-UD-Q4_K_M.gguf;
 

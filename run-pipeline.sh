@@ -87,6 +87,8 @@ mkdir -p "$(dirname "$EXTRACTOR")";
 # type-preserving GGUF: every tensor keeps its original quantization type.
 "$TRAINER" abliterate \
 	--model "$MODELS_BASE" \
+	--catalog heretic \
+	--limit 0 \
 	--out "$MODELS_ABLATED";
 
 # --- 4. abliterate the base with the cybersecurity catalog ------------------

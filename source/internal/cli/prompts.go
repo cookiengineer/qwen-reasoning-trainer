@@ -16,10 +16,10 @@ import (
 // Bundled prompt sets embedded from source/prompts, mirroring Heretic's
 // defaults (the mlabonne datasets published under heretic-org on Hugging Face).
 const (
-	BundledGoodPrompts     = "harmless_alpaca_train.jsonl"
-	BundledBadPrompts      = "harmful_behaviors_train.jsonl"
-	BundledEvalGoodPrompts = "harmless_alpaca_test.jsonl"
-	BundledEvalBadPrompts  = "harmful_behaviors_test.jsonl"
+	BundledHereticHarmlessTrain = "heretic_harmless_train.jsonl"
+	BundledHereticHarmfulTrain  = "heretic_harmful_train.jsonl"
+	BundledHereticHarmlessTest  = "heretic_harmless_test.jsonl"
+	BundledHereticHarmfulTest   = "heretic_harmful_test.jsonl"
 
 	BundledCybersecurityGoodTrain = "cybersecurity_defensive_train.jsonl"
 	BundledCybersecurityBadTrain  = "cybersecurity_offensive_train.jsonl"
@@ -53,10 +53,10 @@ var BundledCatalogs = map[string]Catalog{
 	CatalogHeretic: {
 		Name:        CatalogHeretic,
 		Description: "Heretic's general-purpose harmless/harmful prompt sets",
-		GoodTrain:   BundledGoodPrompts,
-		BadTrain:    BundledBadPrompts,
-		GoodTest:    BundledEvalGoodPrompts,
-		BadTest:     BundledEvalBadPrompts,
+		GoodTrain:   BundledHereticHarmlessTrain,
+		BadTrain:    BundledHereticHarmfulTrain,
+		GoodTest:    BundledHereticHarmlessTest,
+		BadTest:     BundledHereticHarmfulTest,
 	},
 	CatalogCybersecurity: {
 		Name:        CatalogCybersecurity,
@@ -101,8 +101,9 @@ func promptSource(path, bundled string) string {
 }
 
 // loadPrompts reads a prompt set. When path is empty, bundled selects one of
-// the embedded sets (see BundledGoodPrompts and friends); otherwise path is
-// read from disk. It returns a helpful error when the set is missing or empty.
+// the embedded sets (see BundledHereticHarmlessTrain and friends); otherwise
+// path is read from disk. It returns a helpful error when the set is missing or
+// empty.
 func loadPrompts(path, bundled, column string, limit int) ([]string, error) {
 	var (
 		rows []string

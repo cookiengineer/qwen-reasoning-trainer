@@ -149,7 +149,7 @@ required.
 ```sh
 # refusal keyword rate (+ KL vs a base with --base)
 ./build/qwen-trainer evaluate --model models/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf \
-  --prompts source/prompts/harmful_behaviors_test.jsonl --max-tokens 32 \
+  --prompts source/prompts/heretic_harmful_test.jsonl --max-tokens 32 \
   --base models/Qwen3.8-27B-UD-Q4_K_M.gguf
 
 # corpus perplexity, scored in windows of N tokens
@@ -315,6 +315,6 @@ make check                                       # fmt-check + vet + test
 ./build/qwen-trainer search   --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --trials 25 --sampler tpe --study models/search.jsonl --out models/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf
 ./build/qwen-trainer train    --model models/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf --device --dataset datasets/reasoning-hydraone --seq-len 1024 --steps 1002 --resume models/sft-abliterated.ckpt --save-every 25 --out models/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf
 ./build/qwen-trainer status
-./build/qwen-trainer evaluate --model models/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf --prompts source/prompts/harmful_behaviors_test.jsonl --max-tokens 32
+./build/qwen-trainer evaluate --model models/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf --prompts source/prompts/heretic_harmful_test.jsonl --max-tokens 32
 ./build/qwen-trainer run      --model models/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf --prompt "The capital of France is" --generate 8
 ```

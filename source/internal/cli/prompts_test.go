@@ -85,10 +85,10 @@ func TestBundledHereticPrompts(t *testing.T) {
 		file string
 		want int
 	}{
-		{"harmful_behaviors_train.jsonl", 416},
-		{"harmful_behaviors_test.jsonl", 104},
-		{"harmless_alpaca_train.jsonl", 25058},
-		{"harmless_alpaca_test.jsonl", 6265},
+		{"heretic_harmful_train.jsonl", 416},
+		{"heretic_harmful_test.jsonl", 104},
+		{"heretic_harmless_train.jsonl", 25058},
+		{"heretic_harmless_test.jsonl", 6265},
 	}
 	for _, c := range cases {
 		path := filepath.Join("..", "..", "prompts", c.file)
@@ -142,10 +142,10 @@ func TestLookupCatalog(t *testing.T) {
 // filesystem: expected row counts, no empty rows, and no duplicate prompts.
 func TestBundledCatalogPrompts(t *testing.T) {
 	want := map[string]int{
-		BundledGoodPrompts:            25058,
-		BundledBadPrompts:             416,
-		BundledEvalGoodPrompts:        6265,
-		BundledEvalBadPrompts:         104,
+		BundledHereticHarmlessTrain:   25058,
+		BundledHereticHarmfulTrain:    416,
+		BundledHereticHarmlessTest:    6265,
+		BundledHereticHarmfulTest:     104,
 		BundledCybersecurityGoodTrain: 2000,
 		BundledCybersecurityBadTrain:  2000,
 		BundledCybersecurityGoodTest:  400,
@@ -184,16 +184,16 @@ func TestBundledCatalogPrompts(t *testing.T) {
 }
 
 func TestLoadPrompts(t *testing.T) {
-	if _, err := loadPrompts(filepath.Join(t.TempDir(), "missing.jsonl"), BundledGoodPrompts, "", 0); err == nil {
+	if _, err := loadPrompts(filepath.Join(t.TempDir(), "missing.jsonl"), BundledHereticHarmlessTrain, "", 0); err == nil {
 		t.Fatal("expected error for missing file")
 	}
 	ok := writeTemp(t, "p.txt", "a\nb\n")
-	rows, err := loadPrompts(ok, BundledGoodPrompts, "", 0)
+	rows, err := loadPrompts(ok, BundledHereticHarmlessTrain, "", 0)
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("loadPrompts = %v, %v", rows, err)
 	}
 	empty := writeTemp(t, "e.txt", "\n# comment\n")
-	if _, err := loadPrompts(empty, BundledGoodPrompts, "", 0); err == nil {
+	if _, err := loadPrompts(empty, BundledHereticHarmlessTrain, "", 0); err == nil {
 		t.Fatal("expected error for empty file")
 	}
 }
@@ -201,7 +201,7 @@ func TestLoadPrompts(t *testing.T) {
 // TestLoadBundledPrompts checks that the embedded prompt sets load without a
 // working directory or any files on disk.
 func TestLoadBundledPrompts(t *testing.T) {
-	rows, err := loadPrompts("", BundledBadPrompts, "", 0)
+	rows, err := loadPrompts("", BundledHereticHarmfulTrain, "", 0)
 	if err != nil {
 		t.Fatalf("loadPrompts(bundled) = %v", err)
 	}
