@@ -15,6 +15,7 @@ func (m *Model) forwardDevice(tokens []int32, opts ForwardOptions) (*ForwardResu
 	if st == nil || !st.deviceForward || st.backend != be {
 		return nil, fmt.Errorf("qwen38: device forward requires a matching device state")
 	}
+	stBackend, hasLastToken := be.(DeviceForwardBackend)
 	T := len(tokens)
 	if T == 0 {
 		return nil, fmt.Errorf("qwen38: empty prompt")
@@ -27,6 +28,30 @@ func (m *Model) forwardDevice(tokens []int32, opts ForwardOptions) (*ForwardResu
 		// Hidden capture is only used by the host diagnostic path.
 		be.Free(x)
 		return nil, fmt.Errorf("qwen38: RecordHidden is not supported on the device path")
+	}
+	var lastHidden []*compute.Tensor
+	captureLast := func(buf compute.Buffer) error {
+		if !opts.RecordLastHidden {
+			return nil
+		}
+		if !hasLastToken {
+			return fmt.Errorf("qwen38: backend lacks LastToken")
+		}
+		lt, err := stBackend.LastToken(buf)
+		if err != nil {
+			return err
+		}
+		t, err := be.Download(lt)
+		be.Free(lt)
+		if err != nil {
+			return err
+		}
+		lastHidden = append(lastHidden, t)
+		return nil
+	}
+	if err := captureLast(x); err != nil {
+		be.Free(x)
+		return nil, err
 	}
 
 	positions := opts.Positions
@@ -83,19 +108,23 @@ func (m *Model) forwardDevice(tokens []int32, opts ForwardOptions) (*ForwardResu
 				return nil, fmt.Errorf("qwen38: layer %d sync: %w", il, err)
 			}
 		}
+		if err := captureLast(x); err != nil {
+			be.Free(x)
+			be.Free(h)
+			return nil, err
+		}
 	}
 
 	be.BeginScope()
 	xn := h
 	if opts.LastTokenOnly && T > 1 {
-		rb, ok := be.(DeviceForwardBackend)
-		if !ok {
+		if !hasLastToken {
 			be.EndScope()
 			be.Free(x)
 			be.Free(h)
 			return nil, fmt.Errorf("qwen38: backend lacks LastToken")
 		}
-		xn, err = rb.LastToken(xn)
+		xn, err = stBackend.LastToken(xn)
 		if err != nil {
 			be.EndScope()
 			be.Free(x)
@@ -117,7 +146,7 @@ func (m *Model) forwardDevice(tokens []int32, opts ForwardOptions) (*ForwardResu
 		be.Free(h)
 		return nil, err
 	}
-	res := &ForwardResult{Logits: logits, State: st}
+	res := &ForwardResult{Logits: logits, State: st, LastHidden: lastHidden}
 	if opts.CaptureHidden {
 		res.DeviceHidden = h
 	} else {

@@ -80,6 +80,60 @@ func TestDeviceForwardMatchesHost(t *testing.T) {
 	}
 }
 
+func TestDeviceForwardLastHiddenMatchesHost(t *testing.T) {
+	be, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer be.Close()
+
+	cfg := deviceForwardConfig()
+	w := NewRandom(cfg, 999)
+	host := NewModel(w)
+	device := NewModel(w)
+	device.Backend = be
+	if err := device.EnableDeviceForward(); err != nil {
+		t.Fatal(err)
+	}
+	defer device.FreeDevice()
+
+	tokens := []int32{1, 2, 3, 4, 5, 6}
+	want, err := host.Forward(tokens, ForwardOptions{RecordLastHidden: true, LastTokenOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	devState, err := NewStateWithOptions(cfg, StateOptions{
+		Backend: be, KVType: quant.TypeQ8_0, Capacity: len(tokens), DeviceForward: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devState.Free()
+
+	got, err := device.Forward(tokens, ForwardOptions{
+		State: devState, RecordLastHidden: true, LastTokenOnly: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.LastHidden) != len(want.LastHidden) {
+		t.Fatalf("last hidden count = %d, want %d", len(got.LastHidden), len(want.LastHidden))
+	}
+	for k := range want.LastHidden {
+		if got.LastHidden[k].Ne(0) != cfg.NEmbd || got.LastHidden[k].Ne(1) != 1 {
+			t.Fatalf("last hidden[%d] dims = %v, want [%d 1]", k, got.LastHidden[k].Dims, cfg.NEmbd)
+		}
+		for j := 0; j < cfg.NEmbd; j++ {
+			wantV := want.LastHidden[k].F32[j]
+			gotV := got.LastHidden[k].F32[j]
+			tol := float32(1e-1 + 1e-1*math.Abs(float64(wantV)))
+			if d := float32(math.Abs(float64(gotV - wantV))); d > tol {
+				t.Fatalf("layer %d[%d]: device %v host %v (diff %v > %v)", k, j, gotV, wantV, d, tol)
+			}
+		}
+	}
+}
+
 func TestDeviceForwardChunkedPrefillMatchesHost(t *testing.T) {
 	be, err := vulkan.New()
 	if err != nil {

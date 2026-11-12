@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
+	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute/vulkan"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/modelcfg"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/quant"
@@ -178,5 +179,61 @@ func TestAblateWeights(t *testing.T) {
 	// MLP max weight 0 -> ffn_down untouched (byte identical).
 	if !bytes.Equal(ffnRaw, w.Layers[3].FfnDown.Raw) {
 		t.Fatal("ffn_down should not have been ablated")
+	}
+}
+
+func deviceResidualConfig() *qwen38.Config {
+	return &qwen38.Config{
+		NEmbd: 512, NHead: 2, NHeadKV: 1, HeadDim: 256, NRot: 256,
+		NFf: 256, NLayer: 4, NVocab: 32,
+		RopeTheta: 10000, RmsEps: 1e-6,
+		DConv: 4, DState: 4, DInner: 16, DtRank: 4, GroupCount: 2,
+		FullAttnInterval: 4,
+		LayerTypes: []modelcfg.LayerType{
+			modelcfg.LayerLinearAttention, modelcfg.LayerLinearAttention,
+			modelcfg.LayerLinearAttention, modelcfg.LayerFullAttention,
+		},
+	}
+}
+
+func TestCollectResidualsDeviceMatchesHost(t *testing.T) {
+	be, err := vulkan.New()
+	if err != nil {
+		t.Skipf("vulkan unavailable: %v", err)
+	}
+	defer be.Close()
+
+	cfg := deviceResidualConfig()
+	w := qwen38.NewRandom(cfg, 11)
+	host := qwen38.NewModel(w)
+	device := qwen38.NewModel(w)
+	device.Backend = be
+	if err := device.EnableDeviceForward(); err != nil {
+		t.Fatal(err)
+	}
+	defer device.FreeDevice()
+
+	prompts := [][]int32{{1, 2, 3, 4}, {5, 6, 7}}
+	want, err := CollectResiduals(host, prompts, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := CollectResiduals(device, prompts, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("layers = %d, want %d", len(got), len(want))
+	}
+	for k := range want {
+		if len(got[k]) != len(want[k]) {
+			t.Fatalf("layer %d width = %d, want %d", k, len(got[k]), len(want[k]))
+		}
+		for j := range want[k] {
+			tol := 1e-1 + 1e-1*math.Abs(want[k][j])
+			if d := math.Abs(got[k][j] - want[k][j]); d > tol {
+				t.Fatalf("layer %d[%d]: device %v host %v (diff %v > %v)", k, j, got[k][j], want[k][j], d, tol)
+			}
+		}
 	}
 }

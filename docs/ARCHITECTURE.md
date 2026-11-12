@@ -373,7 +373,10 @@ Notes:
 A clean-room port of Heretic's technique (AGPL-3.0; do not copy its code):
 
 1. **`CollectResiduals`** - capture the last-token residual stream for every
-   captured hidden state; mean over prompts; optional winsorization.
+   captured hidden state; mean over prompts; optional winsorization. It uses the
+   device-resident forward path (`RecordLastHidden` + `LastTokenOnly`) when the
+   model has one, falling back to the host path on errors; this avoids the far
+   slower host orchestration path used by the old `RecordHidden` capture.
 2. **`Directions`** - `bad_means - good_means`, per-layer normalized, optionally
    orthogonalized against the good direction and renormalized. `pickDirection`
    supports per-layer or a global index with interpolation.

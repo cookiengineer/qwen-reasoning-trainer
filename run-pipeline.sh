@@ -92,8 +92,9 @@ mkdir -p "$(dirname "$EXTRACTOR")";
 # --- 4. abliterate the base with the cybersecurity catalog ------------------
 # Second ablation pass using the full offensive/defensive cybersecurity prompt
 # catalog (2000 bad + 2000 good train prompts; --limit 0 disables the default
-# 400-row cap). Runtime scales linearly with the prompt count, so this is much
-# slower than the Heretic step above. The SFT step below trains on this artifact.
+# 400-row cap). Residual collection uses the device path when available; runtime
+# still scales linearly with the prompt count. The SFT step below trains on this
+# artifact.
 "$TRAINER" abliterate \
 	--model "$MODELS_BASE" \
 	--catalog cybersecurity \

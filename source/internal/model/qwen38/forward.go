@@ -257,6 +257,10 @@ func NewStateWithCapacity(cfg *Config, capacity int) *State {
 type ForwardOptions struct {
 	// RecordHidden captures the residual stream after every block.
 	RecordHidden bool
+	// RecordLastHidden captures only the last-token residual after the
+	// embedding and after every block. Unlike RecordHidden it is supported by
+	// the device-resident path.
+	RecordLastHidden bool
 	// State is the recurrent state to use; nil starts from zero and does not
 	// update caller state.
 	State *State
@@ -277,6 +281,9 @@ type ForwardResult struct {
 	// Hidden, when requested, holds TrunkLayers+1 residual-stream tensors:
 	// index 0 is the embedding output, index k+1 the output of block k.
 	Hidden []*compute.Tensor
+	// LastHidden, when requested, holds the last-token residual after the
+	// embedding and after every block, each shaped [NEmbd, 1].
+	LastHidden []*compute.Tensor
 	// FinalHidden is the post-final-norm hidden state [NEmbd, T] when
 	// ForwardOptions.CaptureHidden is set (host path).
 	FinalHidden *compute.Tensor
@@ -321,6 +328,9 @@ func (m *Model) forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 	res := &ForwardResult{}
 	if opts.RecordHidden {
 		res.Hidden = append(res.Hidden, x.Clone())
+	}
+	if opts.RecordLastHidden {
+		res.LastHidden = append(res.LastHidden, lastTokenTensor(x))
 	}
 
 	st := opts.State
@@ -369,6 +379,9 @@ func (m *Model) forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 		if opts.RecordHidden {
 			res.Hidden = append(res.Hidden, x.Clone())
 		}
+		if opts.RecordLastHidden {
+			res.LastHidden = append(res.LastHidden, lastTokenTensor(x))
+		}
 	}
 
 	xn := rms(x, m.W.OutputNorm, cfg.RmsEps)
@@ -389,6 +402,19 @@ func (m *Model) forward(tokens []int32, opts ForwardOptions) (*ForwardResult, er
 	res.Logits = logits
 	res.State = st
 	return res, nil
+}
+
+// lastTokenTensor copies the last column of x into a standalone [NEmbd, 1]
+// tensor. It is used by RecordLastHidden on the host path.
+func lastTokenTensor(x *compute.Tensor) *compute.Tensor {
+	n := x.Ne(0)
+	t := x.Ne(1)
+	if t < 1 {
+		t = 1
+	}
+	row := make([]float32, n)
+	copy(row, x.F32[(t-1)*n:t*n])
+	return &compute.Tensor{Dims: []int{n, 1}, Type: x.Type, F32: row}
 }
 
 // ffn applies the SwiGLU feed-forward network to a normalized activation.

@@ -179,6 +179,7 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	winsorize := fs.Float64("winsorize", 0, "winsorization quantile in [0,1) (0 = off)")
 	promptCol := fs.String("prompt-col", "", "JSONL prompt column (default: text)")
 	catalog := fs.String("catalog", DefaultCatalog, "bundled prompt catalog: "+strings.Join(CatalogNames(), "|"))
+	noDeviceResiduals := fs.Bool("no-device-residuals", false, "force host residual collection (debugging/parity)")
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
@@ -241,6 +242,11 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	if be := resolveGPU(modelBytes(g)+gpuHeadroomBytes, cfg, stderr); be != nil {
 		defer func() { m.FreeDevice(); be.Close() }()
 		m.Backend = be
+		if !*noDeviceResiduals {
+			if err := m.EnableDeviceForward(); err != nil {
+				fmt.Fprintf(stderr, "warning: device residual capture unavailable, using host path: %v\n", err)
+			}
+		}
 	}
 
 	good := encodePrompts(vocab, *system, goodLines)
@@ -272,6 +278,7 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 		swa.Finish("failed")
 		return 1
 	}
+	m.FreeDevice()
 	ast.Done = len(good) + len(bad)
 	ast.Phase = "directions"
 	ast.Message = "computing directions"
@@ -331,6 +338,7 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 	evalBad := fs.String("eval-bad", "", "refusal evaluation prompts (default: bundled test set)")
 	promptCol := fs.String("prompt-col", "", "JSONL prompt column (default: text)")
 	catalog := fs.String("catalog", DefaultCatalog, "bundled prompt catalog: "+strings.Join(CatalogNames(), "|"))
+	noDeviceResiduals := fs.Bool("no-device-residuals", false, "force host residual collection (debugging/parity)")
 	out := fs.String("out", "", "output GGUF for the best trial (optional)")
 	system := fs.String("system", "You are a helpful assistant.", "system prompt")
 	rowNorm := fs.String("row-norm", "full", "row normalization: none|pre|full")
@@ -431,6 +439,11 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 	if be := resolveGPU(modelBytes(g)+gpuHeadroomBytes, cfg, stderr); be != nil {
 		defer func() { m.FreeDevice(); be.Close() }()
 		m.Backend = be
+		if !*noDeviceResiduals {
+			if err := m.EnableDeviceForward(); err != nil {
+				fmt.Fprintf(stderr, "warning: device residual capture unavailable, using host path: %v\n", err)
+			}
+		}
 	}
 
 	good := encodePrompts(vocab, *system, goodLines)
@@ -447,6 +460,7 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 		return 1
 	}
 	dirs := abliterate.Directions(gm, bm, *orthogonalize)
+	m.FreeDevice()
 
 	rfPrompts := encodePrompts(vocab, *system, rfLines)
 	klPrompts := encodePrompts(vocab, *system, klLines)

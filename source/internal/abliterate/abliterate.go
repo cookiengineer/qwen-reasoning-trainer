@@ -70,17 +70,18 @@ func CollectResiduals(m *qwen38.Model, prompts [][]int32, winsorize float64) ([]
 		if len(toks) == 0 {
 			continue
 		}
-		res, err := m.Forward(toks, qwen38.ForwardOptions{RecordHidden: true})
+		res, err := forwardLastHidden(m, toks)
 		if err != nil {
 			return nil, err
 		}
-		T := len(toks)
+		if len(res.LastHidden) != nHidden {
+			return nil, fmt.Errorf("abliterate: %d hidden states, want %d", len(res.LastHidden), nHidden)
+		}
 		for k := 0; k < nHidden; k++ {
-			h := res.Hidden[k]
-			base := (T - 1) * hidden
+			h := res.LastHidden[k]
 			row := make([]float64, hidden)
 			for j := 0; j < hidden; j++ {
-				row[j] = float64(h.F32[base+j])
+				row[j] = float64(h.F32[j])
 			}
 			if winsorize > 0 && winsorize < 1 {
 				winsorizeRow(row, winsorize)
@@ -97,6 +98,41 @@ func CollectResiduals(m *qwen38.Model, prompts [][]int32, winsorize float64) ([]
 		}
 	}
 	return sums, nil
+}
+
+// forwardLastHidden runs one prompt and returns the last-token residual after
+// the embedding and every block. It prefers the device-resident forward path
+// when the model has one, falling back to the host path on state/forward
+// errors. Only the last token is needed, so full LM-head logits are skipped.
+func forwardLastHidden(m *qwen38.Model, toks []int32) (*qwen38.ForwardResult, error) {
+	opts := qwen38.ForwardOptions{RecordLastHidden: true, LastTokenOnly: true}
+	if m.DeviceForwardEnabled() && m.Backend != nil {
+		var st *qwen38.State
+		err := compute.Run(m.Backend, func() error {
+			var stateErr error
+			st, stateErr = qwen38.NewStateWithOptions(m.Cfg, qwen38.StateOptions{
+				Backend:       m.Backend,
+				KVType:        quant.TypeQ8_0,
+				Capacity:      len(toks),
+				DeviceForward: true,
+			})
+			return stateErr
+		})
+		if err == nil {
+			opts.State = st
+			res, ferr := m.Forward(toks, opts)
+			_ = compute.Run(m.Backend, func() error {
+				st.Free()
+				return nil
+			})
+			if ferr == nil {
+				return res, nil
+			}
+		}
+		// Fall through to the host path on failure.
+		opts.State = nil
+	}
+	return m.Forward(toks, opts)
 }
 
 // winsorizeRow clamps each element to the q-quantile of the absolute values.

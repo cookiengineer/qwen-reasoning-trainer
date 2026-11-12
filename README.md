@@ -277,16 +277,17 @@ so abliteration time increases linearly.
 
 ### Abliteration Flags
 
-| Flag                | Values                    | (for) Commands            | Description                                                             |
-|---------------------|---------------------------|---------------------------|-------------------------------------------------------------------------|
-| `--catalog`         | `heretic`, `cybersecurity`| `abliterate`, `search`    | bundled prompt catalog (default `heretic`)                              |
-| `--row-norm`        | `none`, `pre`, `full`     | `abliterate`, `search`    | MPOA row normalization (default `full`)                                 |
-| `--orthogonalize`   |                           | `abliterate`, `search`    | project the direction orthogonal to the good direction (default `true`) |
-| `--direction-index` |                           | `abliterate`              | single global direction layer index (default `-1` per layer)            |
-| `--winsorize`       |                           | `abliterate`, `search`    | clamp residual components to a quantile in `[0,1)`                      |
-| `--sampler`         | `random`, `halton`, `tpe` | `search`                  | optimizer (default `random`)                                            |
-| `--lambda`          |                           | `search`                  | KL weight in the objective `refusal + lambda*KL` (default `1.0`)        |
-| `--seed`, `--study` |                           | `search`                  | reproducible seed and resumable JSON Lines checkpoint                   |
+| Flag                    | Values                    | (for) Commands            | Description                                                             |
+|-------------------------|---------------------------|---------------------------|-------------------------------------------------------------------------|
+| `--catalog`             | `heretic`, `cybersecurity`| `abliterate`, `search`    | bundled prompt catalog (default `heretic`)                              |
+| `--no-device-residuals` |                           | `abliterate`, `search`    | force host residual collection (debugging/parity)                       |
+| `--row-norm`            | `none`, `pre`, `full`     | `abliterate`, `search`    | MPOA row normalization (default `full`)                                 |
+| `--orthogonalize`       |                           | `abliterate`, `search`    | project the direction orthogonal to the good direction (default `true`) |
+| `--direction-index`     |                           | `abliterate`              | single global direction layer index (default `-1` per layer)            |
+| `--winsorize`           |                           | `abliterate`, `search`    | clamp residual components to a quantile in `[0,1)`                      |
+| `--sampler`             | `random`, `halton`, `tpe` | `search`                  | optimizer (default `random`)                                            |
+| `--lambda`              |                           | `search`                  | KL weight in the objective `refusal + lambda*KL` (default `1.0`)        |
+| `--seed`, `--study`     |                           | `search`                  | reproducible seed and resumable JSON Lines checkpoint                   |
 
 Note: the first-token for KL divergence measurement is a weak signal for a thinking model
 like this, because it emits `<think>` first. That's why small divergence scores are expected

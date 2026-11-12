@@ -47,6 +47,30 @@ func TestForwardShapes(t *testing.T) {
 	}
 }
 
+func TestForwardLastHidden(t *testing.T) {
+	cfg := tinyConfig()
+	m := NewModel(NewRandom(cfg, 1))
+	tokens := []int32{1, 2, 3, 4}
+	res, err := m.Forward(tokens, ForwardOptions{RecordHidden: true, RecordLastHidden: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.LastHidden) != cfg.TrunkLayers()+1 {
+		t.Fatalf("last hidden count = %d, want %d", len(res.LastHidden), cfg.TrunkLayers()+1)
+	}
+	base := (len(tokens) - 1) * cfg.NEmbd
+	for i, h := range res.LastHidden {
+		if h.Ne(0) != cfg.NEmbd || h.Ne(1) != 1 {
+			t.Fatalf("last hidden[%d] dims = %v, want [%d 1]", i, h.Dims, cfg.NEmbd)
+		}
+		for j := 0; j < cfg.NEmbd; j++ {
+			if h.F32[j] != res.Hidden[i].F32[base+j] {
+				t.Fatalf("last hidden[%d][%d] = %v, want %v", i, j, h.F32[j], res.Hidden[i].F32[base+j])
+			}
+		}
+	}
+}
+
 func TestForwardDeterministic(t *testing.T) {
 	cfg := tinyConfig()
 	a, err := NewModel(NewRandom(cfg, 7)).Forward([]int32{3, 1, 4, 1, 5}, ForwardOptions{})
