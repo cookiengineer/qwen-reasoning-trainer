@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/prompts"
@@ -19,7 +20,76 @@ const (
 	BundledBadPrompts      = "harmful_behaviors_train.jsonl"
 	BundledEvalGoodPrompts = "harmless_alpaca_test.jsonl"
 	BundledEvalBadPrompts  = "harmful_behaviors_test.jsonl"
+
+	BundledCybersecurityGoodTrain = "cybersecurity_defensive_train.jsonl"
+	BundledCybersecurityBadTrain  = "cybersecurity_offensive_train.jsonl"
+	BundledCybersecurityGoodTest  = "cybersecurity_defensive_test.jsonl"
+	BundledCybersecurityBadTest   = "cybersecurity_offensive_test.jsonl"
 )
+
+// Catalog names accepted by --catalog.
+const (
+	CatalogHeretic       = "heretic"
+	CatalogCybersecurity = "cybersecurity"
+)
+
+// DefaultCatalog is used when --catalog is not supplied.
+const DefaultCatalog = CatalogHeretic
+
+// Catalog is a named set of bundled abliteration prompt sets. Good prompts are
+// desirable/benign behaviour used to compute the direction; bad prompts are
+// undesirable/refusal-triggering prompts.
+type Catalog struct {
+	Name        string
+	Description string
+	GoodTrain   string
+	BadTrain    string
+	GoodTest    string
+	BadTest     string
+}
+
+// BundledCatalogs maps a catalog name to its embedded prompt files.
+var BundledCatalogs = map[string]Catalog{
+	CatalogHeretic: {
+		Name:        CatalogHeretic,
+		Description: "Heretic's general-purpose harmless/harmful prompt sets",
+		GoodTrain:   BundledGoodPrompts,
+		BadTrain:    BundledBadPrompts,
+		GoodTest:    BundledEvalGoodPrompts,
+		BadTest:     BundledEvalBadPrompts,
+	},
+	CatalogCybersecurity: {
+		Name:        CatalogCybersecurity,
+		Description: "cybersecurity questions: defensive good prompts and offensive/dual-use bad prompts",
+		GoodTrain:   BundledCybersecurityGoodTrain,
+		BadTrain:    BundledCybersecurityBadTrain,
+		GoodTest:    BundledCybersecurityGoodTest,
+		BadTest:     BundledCybersecurityBadTest,
+	},
+}
+
+// CatalogNames returns the sorted names of the bundled catalogs.
+func CatalogNames() []string {
+	names := make([]string, 0, len(BundledCatalogs))
+	for name := range BundledCatalogs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// LookupCatalog resolves a catalog name, treating the empty string as the
+// default catalog.
+func LookupCatalog(name string) (Catalog, error) {
+	if name == "" {
+		name = DefaultCatalog
+	}
+	c, ok := BundledCatalogs[name]
+	if !ok {
+		return Catalog{}, fmt.Errorf("unknown catalog %q (want %s)", name, strings.Join(CatalogNames(), ", "))
+	}
+	return c, nil
+}
 
 // promptSource returns a human-readable label for a prompt set: the file path
 // when one is given, otherwise the embedded bundled name.

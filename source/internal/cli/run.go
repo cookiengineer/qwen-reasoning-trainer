@@ -178,6 +178,7 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 	limit := fs.Int("limit", 400, "max prompts per set (0 = all; default matches Heretic)")
 	winsorize := fs.Float64("winsorize", 0, "winsorization quantile in [0,1) (0 = off)")
 	promptCol := fs.String("prompt-col", "", "JSONL prompt column (default: text)")
+	catalog := fs.String("catalog", DefaultCatalog, "bundled prompt catalog: "+strings.Join(CatalogNames(), "|"))
 	if err := fs.Parse(cfg.Args); err != nil {
 		return 2
 	}
@@ -189,19 +190,25 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error: --out is required")
 		return 2
 	}
-	goodLines, err := loadPrompts(*goodFile, BundledGoodPrompts, *promptCol, *limit)
+	cat, err := LookupCatalog(*catalog)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
+	goodLines, err := loadPrompts(*goodFile, cat.GoodTrain, *promptCol, *limit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	badLines, err := loadPrompts(*badFile, BundledBadPrompts, *promptCol, *limit)
+	badLines, err := loadPrompts(*badFile, cat.BadTrain, *promptCol, *limit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	fmt.Fprintf(stderr, "prompts: good=%s (%d) bad=%s (%d)\n",
-		promptSource(*goodFile, BundledGoodPrompts), len(goodLines),
-		promptSource(*badFile, BundledBadPrompts), len(badLines))
+	fmt.Fprintf(stderr, "prompts: catalog=%s good=%s (%d) bad=%s (%d)\n",
+		cat.Name,
+		promptSource(*goodFile, cat.GoodTrain), len(goodLines),
+		promptSource(*badFile, cat.BadTrain), len(badLines))
 
 	path, err := resolveModel(cfg, stderr)
 	if err != nil {
@@ -323,6 +330,7 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 	evalGood := fs.String("eval-good", "", "KL evaluation prompts (default: bundled test set)")
 	evalBad := fs.String("eval-bad", "", "refusal evaluation prompts (default: bundled test set)")
 	promptCol := fs.String("prompt-col", "", "JSONL prompt column (default: text)")
+	catalog := fs.String("catalog", DefaultCatalog, "bundled prompt catalog: "+strings.Join(CatalogNames(), "|"))
 	out := fs.String("out", "", "output GGUF for the best trial (optional)")
 	system := fs.String("system", "You are a helpful assistant.", "system prompt")
 	rowNorm := fs.String("row-norm", "full", "row normalization: none|pre|full")
@@ -349,41 +357,48 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error: --row-norm must be none, pre, or full")
 		return 2
 	}
-	goodLines, err := loadPrompts(*goodFile, BundledGoodPrompts, *promptCol, *limit)
+	cat, err := LookupCatalog(*catalog)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
+	goodLines, err := loadPrompts(*goodFile, cat.GoodTrain, *promptCol, *limit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	badLines, err := loadPrompts(*badFile, BundledBadPrompts, *promptCol, *limit)
+	badLines, err := loadPrompts(*badFile, cat.BadTrain, *promptCol, *limit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
 	// When --eval-good/--eval-bad are omitted, a custom residual set scores
-	// against itself; the bundled defaults use the heretic test splits.
+	// against itself; the bundled catalog uses its test splits. An explicit
+	// --catalog always keeps the catalog test splits.
 	klPath := *evalGood
-	if klPath == "" && setFlags["good"] {
+	if klPath == "" && setFlags["good"] && !setFlags["catalog"] {
 		klPath = *goodFile
 	}
 	rfPath := *evalBad
-	if rfPath == "" && setFlags["bad"] {
+	if rfPath == "" && setFlags["bad"] && !setFlags["catalog"] {
 		rfPath = *badFile
 	}
-	klLines, err := loadPrompts(klPath, BundledEvalGoodPrompts, *promptCol, *evalLimit)
+	klLines, err := loadPrompts(klPath, cat.GoodTest, *promptCol, *evalLimit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	rfLines, err := loadPrompts(rfPath, BundledEvalBadPrompts, *promptCol, *evalLimit)
+	rfLines, err := loadPrompts(rfPath, cat.BadTest, *promptCol, *evalLimit)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
-	fmt.Fprintf(stderr, "prompts: good=%s (%d) bad=%s (%d) eval-good=%s (%d) eval-bad=%s (%d)\n",
-		promptSource(*goodFile, BundledGoodPrompts), len(goodLines),
-		promptSource(*badFile, BundledBadPrompts), len(badLines),
-		promptSource(klPath, BundledEvalGoodPrompts), len(klLines),
-		promptSource(rfPath, BundledEvalBadPrompts), len(rfLines))
+	fmt.Fprintf(stderr, "prompts: catalog=%s good=%s (%d) bad=%s (%d) eval-good=%s (%d) eval-bad=%s (%d)\n",
+		cat.Name,
+		promptSource(*goodFile, cat.GoodTrain), len(goodLines),
+		promptSource(*badFile, cat.BadTrain), len(badLines),
+		promptSource(klPath, cat.GoodTest), len(klLines),
+		promptSource(rfPath, cat.BadTest), len(rfLines))
 
 	path, err := resolveModel(cfg, stderr)
 	if err != nil {

@@ -236,32 +236,56 @@ one object per line represents one question, essentially.
 These prompts are embedded into the binary with `go:embed`, so that `abliterate`
 and `search` use them by default with no external files being needed.
 
-You can override them with `--good` or `--bad` for `abliterate` and with `--eval-good`
-or `--eval-bad` for `search`. It would be heavily welcomed if you would contribute
-your custom abliteration questions catalog via Pull Request to this repository though!
+Two bundled catalogs are selectable with `--catalog`:
+
+| Catalog             | Good prompts                  | Bad prompts                  |
+|---------------------|-------------------------------|------------------------------|
+| `heretic` (default) | general harmless instructions | general harmful behaviors    |
+| `cybersecurity`     | defensive security questions  | offensive/dual-use questions |
+
+The `cybersecurity` catalog is a larger, topic-focused set covering exploit
+development, malware development and analysis, offensive tooling, pentest and
+red-team workflows, network/web/cloud attacks, anti-forensics, and their
+defensive counterparts such as threat modeling, detection engineering, incident
+response, and hardening. Its train/test splits are `500/100` rows per side.
+
+```sh
+# Use the cybersecurity catalog instead of the default Heretic set
+./build/qwen-trainer abliterate \
+  --model models/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --catalog cybersecurity \
+  --out models/Qwen3.8-27B-cyber-abliterated.gguf;
+```
+
+You can override individual sets with `--good` or `--bad` for `abliterate` and
+with `--eval-good` or `--eval-bad` for `search`. It would be heavily welcomed if
+you would contribute your custom abliteration questions catalog via Pull Request
+to this repository though!
 
 The abliteration catalog files may be either plain text files (one prompt per line)
 or JSONL files. The `--prompt-col` CLI parameter selects the column, default `text`.
 
-| File                            | Rows  | Role (default)                                |
-|---------------------------------|-------|-----------------------------------------------|
-| `harmless_alpaca_train.jsonl`   | 25058 | good prompts / residual directions (`--good`) |
-| `harmful_behaviors_train.jsonl` | 416   | bad prompts / residual directions (`--bad`)   |
-| `harmless_alpaca_test.jsonl`    | 6265  | KL divergence evaluation (`--eval-good`)      |
-| `harmful_behaviors_test.jsonl`  | 104   | refusal evaluation (`--eval-bad`)             |
+| File                                  | Rows  | Role (default)                                 |
+|---------------------------------------|-------|------------------------------------------------|
+| `harmless_alpaca_train.jsonl`         | 25058 | good prompts / residual directions (`--good`)  |
+| `harmful_behaviors_train.jsonl`       | 416   | bad prompts / residual directions (`--bad`)    |
+| `harmless_alpaca_test.jsonl`          | 6265  | KL divergence evaluation (`--eval-good`)       |
+| `harmful_behaviors_test.jsonl`        | 104   | refusal evaluation (`--eval-bad`)              |
+| `cybersecurity_defensive_train.jsonl` | 500   | good prompts (`--catalog cybersecurity`)       |
+| `cybersecurity_offensive_train.jsonl` | 500   | bad prompts (`--catalog cybersecurity`)        |
+| `cybersecurity_defensive_test.jsonl`  | 100   | KL evaluation (`--catalog cybersecurity`)      |
+| `cybersecurity_offensive_test.jsonl`  | 100   | refusal evaluation (`--catalog cybersecurity`) |
 
 The full files are quite large, so the limits are defaulted to Heretic's limits,
 with `--limit 400` and `--eval-limit 100`. Set `--limit 0` or `--eval-limit 0`
 to use an entire file. Note that more prompts will cost one complete model forward,
 so abliteration time increases linearly.
 
-The embedded datasets mirror `mlabonne/harmless_alpaca` and `mlabonne/harmful_behaviors`
-from the `heretic-org` organization on Hugging Face.
-
 ### Abliteration Flags
 
 | Flag                | Values                    | (for) Commands            | Description                                                             |
 |---------------------|---------------------------|---------------------------|-------------------------------------------------------------------------|
+| `--catalog`         | `heretic`, `cybersecurity`| `abliterate`, `search`    | bundled prompt catalog (default `heretic`)                              |
 | `--row-norm`        | `none`, `pre`, `full`     | `abliterate`, `search`    | MPOA row normalization (default `full`)                                 |
 | `--orthogonalize`   |                           | `abliterate`, `search`    | project the direction orthogonal to the good direction (default `true`) |
 | `--direction-index` |                           | `abliterate`              | single global direction layer index (default `-1` per layer)            |

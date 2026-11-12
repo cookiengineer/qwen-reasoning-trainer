@@ -2,17 +2,19 @@
 #
 # End-to-end pipeline for the Qwen3.8-27B reasoning trainer:
 #
-#   download -> abliterate -> extract reasoning traces -> SFT -> verify types
+#   download -> abliterate (heretic) -> abliterate (cybersecurity) ->
+#   extract reasoning traces -> SFT -> verify types
 #
 # Run from anywhere; it operates on the repository it lives in. Override any
 # variable from the environment, e.g.:
 #
 #   STEPS=300 LR=5e-5 ./run-pipeline.sh
 #
-# The three model artifacts produced:
+# The model artifacts produced:
 #
 #   Qwen3.8-27B-UD-Q4_K_M.gguf                       (downloaded base)
-#   Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf           (abliterated base)
+#   Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf           (heretic-abliterated base)
+#   Qwen3.8-27B-cyber-abliterated-UD-Q4_K_M.gguf     (cybersecurity-abliterated base)
 #   Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf  (SFT on reasoning traces)
 #
 set -euo pipefail
@@ -31,6 +33,7 @@ DATASETS="${DATASETS:-$REPO_ROOT/datasets}"
 
 MODELS_BASE="$MODELS/Qwen3.8-27B-UD-Q4_K_M.gguf"
 MODELS_ABLATED="$MODELS/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf"
+MODELS_ABLATED_CYBER="$MODELS/Qwen3.8-27B-cyber-abliterated-UD-Q4_K_M.gguf"
 MODELS_TRAINED="$MODELS/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf"
 
 # --- helpers ----------------------------------------------------------------
@@ -79,19 +82,29 @@ mkdir -p "$(dirname "$EXTRACTOR")";
 # sha256). --model is the output file the GGUF is saved as.
 "$TRAINER" download --model "$MODELS_BASE";
 
-# --- 3. abliterate the base -------------------------------------------------
+# --- 3. abliterate the base with the default Heretic catalog ----------------
 # Removes the refusal direction (Heretic-style MPOA) and streams a
 # type-preserving GGUF: every tensor keeps its original quantization type.
-"$TRAINER" abliterate --model "$MODELS_BASE" --out "$MODELS_ABLATED";
+"$TRAINER" abliterate \
+	--model "$MODELS_BASE" \
+	--out "$MODELS_ABLATED";
 
-# --- 4. SFT the abliterated model on the reasoning traces -------------------
+# --- 4. abliterate the base with the cybersecurity catalog ------------------
+# Second ablation pass using the offensive/defensive cybersecurity prompt
+# catalog. The SFT step below trains on this artifact.
+"$TRAINER" abliterate \
+	--model "$MODELS_BASE" \
+	--catalog cybersecurity \
+	--out "$MODELS_ABLATED_CYBER";
+
+# --- 5. SFT the cyber-abliterated model on the reasoning traces -------------
 # QLoRA (r=16/alpha=32) on the frozen quantized base, fully device-resident on
 # the Vulkan GPU. The run is resumable: re-running resumes from --resume, and
 # the merged GGUF is only written after the final step.
 clean_stale "$MODELS"
 
 "$TRAINER" train \
-	--model "$MODELS_ABLATED" \
+	--model "$MODELS_ABLATED_CYBER" \
 	--device \
 	--dataset "$DATASETS/reasoning-hydraone" \
 	--dataset "$DATASETS/reasoning-thinky" \
@@ -102,12 +115,12 @@ clean_stale "$MODELS"
 	--warmup "100" \
 	--max-grad-norm 1.0 \
 	--seed 1 \
-	--resume "$MODELS/sft-abliterated.ckpt" \
+	--resume "$MODELS/sft-cyber-abliterated.ckpt" \
 	--save-every "25" \
-	--adapter-out "$MODELS/sft-abliterated-adapters.gob" \
+	--adapter-out "$MODELS/sft-cyber-abliterated-adapters.gob" \
 	--out "$MODELS_TRAINED";
 
-# --- 5. verify the tensor type histogram is unchanged -----------------------
+# --- 6. verify the tensor type histogram is unchanged -----------------------
 # `inspect` prints the per-type tensor histogram; a type-preserving merge must
 # leave it identical to the downloaded base. --no-download is mandatory here:
 # without it, inspect would auto-download the base GGUF under the trained

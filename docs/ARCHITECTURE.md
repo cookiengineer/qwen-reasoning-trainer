@@ -392,11 +392,18 @@ dependency-free optimizer over Heretic's sampled space: `SearchSpace` ->
 restore them before each trial; `Model.InvalidateDevice` refreshes only the
 changed device buffers; `evaluate.BaselineLogits` caches the KL baseline.
 
-Prompt sets are bundled pre-converted in `source/prompts/`
-(`harmless_alpaca_{train,test}.jsonl`, `harmful_behaviors_{train,test}.jsonl`),
-embedded with `go:embed`, and are the defaults for `abliterate`/`search` with
-Heretic's limits (`--limit 400`, `--eval-limit 100`). The first-token KL is a
-weak signal for a thinking model (it emits `<think>` first).
+Prompt sets are bundled pre-converted in `source/prompts/`, embedded with
+`go:embed`, and are the defaults for `abliterate`/`search` with Heretic's limits
+(`--limit 400`, `--eval-limit 100`). Two catalogs are registered in
+`internal/cli/prompts.go` and selected with `--catalog`:
+
+- `heretic` (default) - `harmless_alpaca_{train,test}.jsonl` +
+  `harmful_behaviors_{train,test}.jsonl`.
+- `cybersecurity` - `cybersecurity_defensive_{train,test}.jsonl` (good) +
+  `cybersecurity_offensive_{train,test}.jsonl` (bad), `500/100` rows per split.
+
+The first-token KL is a weak signal for a thinking model (it emits `<think>`
+first).
 
 ---
 
@@ -540,8 +547,8 @@ Common flags (model commands; `--model` required): `--model/-m`, `--models-dir`,
 | `inspect` | Arch, hyperparameters, layer types, tensor type histogram. |
 | `gpu-info` | Vulkan device name, capabilities, device-local memory. |
 | `run` | Load and generate (`--prompt/--system`, `--tokens`, `--generate N`). |
-| `abliterate` | Ablate refusals and write a GGUF (`--good/--bad`, `--out`, `--row-norm`, `--direction-index`, per-component `--attn-*`/`--mlp-*`, `--limit`, `--winsorize`). |
-| `search` | Automated abliteration search (`--trials`, `--sampler`, `--lambda`, `--seed`, `--study`, `--out`). |
+| `abliterate` | Ablate refusals and write a GGUF (`--catalog`, `--good/--bad`, `--out`, `--row-norm`, `--direction-index`, per-component `--attn-*`/`--mlp-*`, `--limit`, `--winsorize`). |
+| `search` | Automated abliteration search (`--catalog`, `--trials`, `--sampler`, `--lambda`, `--seed`, `--study`, `--out`). |
 | `evaluate` | `--prompts`/`--base`; `--perplexity`/`--window`; `--tasks`/`--tasks-normalize`/`--tasks-verbose`. |
 | `dataset` | Tokenize/validate extractor output and report loss-mask stats (`--dataset`, repeatable). |
 | `train` | QLoRA SFT (`--dataset` repeatable, `--steps`, `--seq-len`, `--lr`, `--rank`, `--alpha`, `--accum`, `--max-grad-norm`, `--adapter-out`, `--out`, `--val-ratio`, `--include-subagents`, `--limit`; `--device`, `--checkpoint`, `--resume`, `--save-every`, `--eval-checkpoint`). |

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/cookiengineer/qwen-reasoning-trainer/prompts"
 )
 
 func writeTemp(t *testing.T, name, content string) string {
@@ -105,6 +107,79 @@ func TestBundledHereticPrompts(t *testing.T) {
 				t.Fatalf("%s: row %d is empty", c.file, i)
 			}
 		}
+	}
+}
+
+func TestCatalogNames(t *testing.T) {
+	want := []string{CatalogCybersecurity, CatalogHeretic}
+	if got := CatalogNames(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("CatalogNames() = %v, want %v", got, want)
+	}
+}
+
+func TestLookupCatalog(t *testing.T) {
+	def, err := LookupCatalog("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.Name != DefaultCatalog {
+		t.Fatalf("default catalog = %q, want %q", def.Name, DefaultCatalog)
+	}
+	cyber, err := LookupCatalog(CatalogCybersecurity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cyber.GoodTrain != BundledCybersecurityGoodTrain || cyber.BadTrain != BundledCybersecurityBadTrain ||
+		cyber.GoodTest != BundledCybersecurityGoodTest || cyber.BadTest != BundledCybersecurityBadTest {
+		t.Fatalf("cybersecurity catalog files = %+v", cyber)
+	}
+	if _, err := LookupCatalog("missing"); err == nil {
+		t.Fatal("expected error for unknown catalog")
+	}
+}
+
+// TestBundledCatalogPrompts validates every catalog file in the embedded
+// filesystem: expected row counts, no empty rows, and no duplicate prompts.
+func TestBundledCatalogPrompts(t *testing.T) {
+	want := map[string]int{
+		BundledGoodPrompts:            25058,
+		BundledBadPrompts:             416,
+		BundledEvalGoodPrompts:        6265,
+		BundledEvalBadPrompts:         104,
+		BundledCybersecurityGoodTrain: 500,
+		BundledCybersecurityBadTrain:  500,
+		BundledCybersecurityGoodTest:  100,
+		BundledCybersecurityBadTest:   100,
+	}
+	checked := map[string]bool{}
+	for _, cat := range BundledCatalogs {
+		for _, file := range []string{cat.GoodTrain, cat.BadTrain, cat.GoodTest, cat.BadTest} {
+			wantRows, ok := want[file]
+			if !ok {
+				t.Fatalf("catalog %q references unknown file %q", cat.Name, file)
+			}
+			rows, err := readPromptFS(prompts.FS, file, "", 0)
+			if err != nil {
+				t.Fatalf("%s: %v", file, err)
+			}
+			if len(rows) != wantRows {
+				t.Fatalf("%s: %d rows, want %d", file, len(rows), wantRows)
+			}
+			seen := make(map[string]bool, len(rows))
+			for i, r := range rows {
+				if r == "" {
+					t.Fatalf("%s: row %d is empty", file, i)
+				}
+				if seen[r] {
+					t.Fatalf("%s: row %d duplicates an earlier prompt", file, i)
+				}
+				seen[r] = true
+			}
+			checked[file] = true
+		}
+	}
+	if len(checked) != len(want) {
+		t.Fatalf("validated %d catalog files, want %d", len(checked), len(want))
 	}
 }
 

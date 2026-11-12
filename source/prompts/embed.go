@@ -1,4 +1,4 @@
-// Package prompts embeds the bundled Heretic prompt sets so the abliteration
+// Package prompts embeds the bundled abliteration prompt catalogs so the
 // defaults work regardless of the working directory.
 package prompts
 

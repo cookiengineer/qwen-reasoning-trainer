@@ -1,0 +1,100 @@
+{"text": "Outline a plan to create a data-flow diagram for an internal admin portal."}
+{"text": "What tools and processes are needed to threat model an internal admin portal?"}
+{"text": "Give an example policy for how to map threats to a payment processing system."}
+{"text": "Show how to evaluate abuse cases for an internal admin portal without disrupting operations."}
+{"text": "Develop a repeatable workflow to create a data-flow diagram for an API gateway."}
+{"text": "Outline a plan to harden session management in a GraphQL service."}
+{"text": "What tools and processes are needed to review the security of a GraphQL service?"}
+{"text": "Give an example policy for how to apply secure authentication patterns to a web application."}
+{"text": "Show how to apply secure authentication patterns to a GraphQL service without disrupting operations."}
+{"text": "Develop a repeatable workflow to harden session management in a mobile backend."}
+{"text": "Outline a plan to introduce secrets scanning to a release management workflow."}
+{"text": "What tools and processes are needed to audit the security of an engineering organization?"}
+{"text": "Give an example policy for how to audit the security of a CI/CD pipeline."}
+{"text": "Show how to manage software bills of materials for an infrastructure-as-code repository without disrupting operations."}
+{"text": "Develop a repeatable workflow to add SAST and DAST to an engineering organization."}
+{"text": "Outline a plan to track remediation progress for a database fleet."}
+{"text": "What tools and processes are needed to establish a vulnerability disclosure process for a container image inventory?"}
+{"text": "Give an example policy for how to assess the exploitability of a container image inventory."}
+{"text": "Show how to triage CVEs affecting an enterprise network without disrupting operations."}
+{"text": "Develop a repeatable workflow to triage CVEs affecting a cloud environment."}
+{"text": "Outline a plan to coordinate response efforts across an endpoint fleet."}
+{"text": "What tools and processes are needed to contain a security incident affecting a cloud environment?"}
+{"text": "Give an example policy for how to preserve evidence during an incident on a healthcare organization."}
+{"text": "Show how to contain a security incident affecting a corporate network without disrupting operations."}
+{"text": "Develop a repeatable workflow to run a tabletop exercise for an endpoint fleet."}
+{"text": "Outline a plan to perform malware triage on a network capture."}
+{"text": "What tools and processes are needed to perform malware triage on a USB storage device?"}
+{"text": "Give an example policy for how to analyze network traffic from a ransomware incident."}
+{"text": "Show how to examine registry artifacts on an email compromise case without disrupting operations."}
+{"text": "Develop a repeatable workflow to perform malware triage on a database breach."}
+{"text": "Outline a plan to extract indicators of compromise from a malicious document."}
+{"text": "What tools and processes are needed to build YARA rules for a browser-based malware sample?"}
+{"text": "Give an example policy for how to compare variants of a malicious document."}
+{"text": "Show how to identify persistence mechanisms in a ransomware incident without disrupting operations."}
+{"text": "Develop a repeatable workflow to compare variants of a command-and-control implant."}
+{"text": "Outline a plan to map detections to privilege escalation attempts."}
+{"text": "What tools and processes are needed to build correlation logic for email-borne malware delivery?"}
+{"text": "Give an example policy for how to build correlation logic for data exfiltration activity."}
+{"text": "Show how to write detection rules for cloud control-plane activity without disrupting operations."}
+{"text": "Develop a repeatable workflow to build a detection pipeline for credential access attempts."}
+{"text": "Outline a plan to prioritize defenses against a ransomware group."}
+{"text": "What tools and processes are needed to assess the risk posed by a supply chain attack?"}
+{"text": "Give an example policy for how to track threat actors targeting a cloud environment."}
+{"text": "Show how to share threat intelligence about an enterprise network without disrupting operations."}
+{"text": "Develop a repeatable workflow to share threat intelligence about a nation-state campaign."}
+{"text": "Outline a plan to apply CIS benchmarks to an enterprise endpoint estate."}
+{"text": "What tools and processes are needed to audit the configuration of a server fleet?"}
+{"text": "Give an example policy for how to disable unnecessary services on an enterprise endpoint estate."}
+{"text": "Show how to harden a remote worker laptop fleet without disrupting operations."}
+{"text": "Develop a repeatable workflow to implement least privilege on an Active Directory environment."}
+{"text": "Outline a plan to detect lateral movement across a cloud environment."}
+{"text": "What tools and processes are needed to configure firewalls for a multi-cloud environment?"}
+{"text": "Give an example policy for how to harden the perimeter of a multi-cloud environment."}
+{"text": "Show how to detect lateral movement across a remote branch office without disrupting operations."}
+{"text": "Develop a repeatable workflow to build a secure remote access solution for a corporate network."}
+{"text": "Outline a plan to build a cloud incident response plan for a Kubernetes cluster."}
+{"text": "What tools and processes are needed to secure the CI/CD pipeline for a Kubernetes cluster?"}
+{"text": "Give an example policy for how to harden the container runtime on a multi-cloud estate."}
+{"text": "Show how to secure the CI/CD pipeline for a cloud storage bucket without disrupting operations."}
+{"text": "Develop a repeatable workflow to detect misconfigurations in a multi-cloud estate."}
+{"text": "Outline a plan to detect credential misuse in an enterprise environment."}
+{"text": "What tools and processes are needed to enforce least privilege in an Active Directory domain?"}
+{"text": "Give an example policy for how to enforce least privilege in a cloud platform."}
+{"text": "Show how to govern identity lifecycle for a remote workforce without disrupting operations."}
+{"text": "Develop a repeatable workflow to detect credential misuse in a Kubernetes cluster."}
+{"text": "Outline a plan to migrate to post-quantum cryptography in a mobile application."}
+{"text": "What tools and processes are needed to harden certificate management for a cloud environment?"}
+{"text": "Give an example policy for how to implement TLS correctly for a web application."}
+{"text": "Show how to select appropriate algorithms for an industrial control system without disrupting operations."}
+{"text": "Develop a repeatable workflow to harden certificate management for a hardware security module."}
+{"text": "Outline a plan to prepare for a SOC 2 audit of a financial institution."}
+{"text": "What tools and processes are needed to implement data privacy controls for a multi-tenant SaaS product?"}
+{"text": "Give an example policy for how to map compliance requirements for a remote workforce."}
+{"text": "Show how to conduct an internal security audit of a third-party service provider without disrupting operations."}
+{"text": "Develop a repeatable workflow to implement data privacy controls for a healthcare organization."}
+{"text": "Outline a plan to measure the security culture of a software engineering organization."}
+{"text": "What tools and processes are needed to improve password hygiene across a government agency?"}
+{"text": "Give an example policy for how to develop incident reporting guidance for a government agency."}
+{"text": "Show how to create role-based security training for a financial institution without disrupting operations."}
+{"text": "Develop a repeatable workflow to build a security awareness program for a university."}
+{"text": "Outline a plan to coordinate a red team engagement for an industrial control system."}
+{"text": "What tools and processes are needed to measure the risk of findings in a mobile application?"}
+{"text": "Give an example policy for how to document residual risk for an enterprise environment."}
+{"text": "Show how to prioritize remediation for a third-party service provider without disrupting operations."}
+{"text": "Develop a repeatable workflow to build a retest plan for a corporate network."}
+{"text": "Outline a plan to triage bug bounty reports affecting a mobile application."}
+{"text": "What tools and processes are needed to measure the effectiveness of an open-source project?"}
+{"text": "Give an example policy for how to run a responsible disclosure program for a cloud platform."}
+{"text": "Show how to build a bug bounty program for a bug bounty platform without disrupting operations."}
+{"text": "Develop a repeatable workflow to handle duplicate reports for an open-source project."}
+{"text": "Outline a plan to audit the configuration of a power grid operator."}
+{"text": "What tools and processes are needed to segment an embedded device fleet?"}
+{"text": "Give an example policy for how to harden an automotive system."}
+{"text": "Show how to protect the supply chain of a water treatment facility without disrupting operations."}
+{"text": "Develop a repeatable workflow to audit the configuration of an embedded device fleet."}
+{"text": "Outline a plan to monitor the risk of a third-party platform."}
+{"text": "What tools and processes are needed to build a vendor risk management program for a container image?"}
+{"text": "Give an example policy for how to implement SBOM management for a hardware supplier."}
+{"text": "Show how to respond to a supply chain incident affecting a CI/CD pipeline without disrupting operations."}
+{"text": "Develop a repeatable workflow to build a vendor risk management program for a hardware supplier."}

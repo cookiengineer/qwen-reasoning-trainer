@@ -4,13 +4,14 @@ End-to-end operational guide for abliterating and fine-tuning **Qwen3.8 27B**
 (Q4_K_M GGUF). For the design behind these commands see
 [`ARCHITECTURE.md`](ARCHITECTURE.md); for open work see [`TASKS.md`](TASKS.md).
 
-The pipeline produces three artifacts:
+The pipeline produces four artifacts:
 
 | Artifact | Produced by |
 | --- | --- |
 | `Qwen3.8-27B-UD-Q4_K_M.gguf` | `download` (the base) |
-| `Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf` | `abliterate` |
-| `Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf` | `train` (SFT on reasoning traces) |
+| `Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf` | `abliterate` (default Heretic catalog) |
+| `Qwen3.8-27B-cyber-abliterated-UD-Q4_K_M.gguf` | `abliterate --catalog cybersecurity` |
+| `Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf` | `train` (SFT on reasoning traces, on the cyber-abliterated base) |
 
 `run-pipeline.sh` runs the whole sequence; the sections below explain each step.
 
@@ -115,10 +116,12 @@ GGUF; every tensor keeps its original quantization type.
 ```
 
 Good/bad prompt sets default to the bundled `source/prompts/` files (Heretic's
-sets, `--limit 400`); override with `--good`/`--bad` (text or JSONL). Useful
-flags: `--row-norm none|pre|full` (default `full`), `--orthogonalize`,
-`--direction-index` (`-1` = per layer), per-component `--attn-*`/`--mlp-*`
-weights, `--winsorize`.
+sets, `--limit 400`). Select the cybersecurity-focused catalog with
+`--catalog cybersecurity` (defensive good prompts, offensive/dual-use bad
+prompts; `500/100` train/test rows per side), or override with `--good`/`--bad`
+(text or JSONL). Useful flags: `--row-norm none|pre|full` (default `full`),
+`--orthogonalize`, `--direction-index` (`-1` = per layer), per-component
+`--attn-*`/`--mlp-*` weights, `--winsorize`.
 
 ### Optional: parameter search
 
@@ -132,7 +135,9 @@ weights, `--winsorize`.
 
 `search` minimizes `refusal_rate + lambda*KL`; `--sampler random|halton|tpe`.
 Trials persist to `--study` (JSONL) and resume exactly if re-run. Evaluation
-prompt sets default to the bundled test splits (`--eval-limit 100`).
+prompt sets default to the bundled test splits (`--eval-limit 100`);
+`--catalog cybersecurity` switches both residual and evaluation sets to the
+cybersecurity catalog.
 
 ---
 
@@ -247,8 +252,9 @@ Then generate a sanity sample:
 
 ## 9. The pipeline driver
 
-`run-pipeline.sh` runs build -> extract -> download -> abliterate -> train ->
-verify, and can be customized entirely from the environment:
+`run-pipeline.sh` runs build -> extract -> download -> abliterate (Heretic) ->
+abliterate (cybersecurity) -> train -> verify, and can be customized entirely
+from the environment:
 
 ```sh
 STEPS=300 LR=5e-5 ./run-pipeline.sh
