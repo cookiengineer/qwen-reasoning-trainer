@@ -25,7 +25,7 @@ cd "$REPO_ROOT"
 EXTRACTOR_REPO="${EXTRACTOR_REPO:-$REPO_ROOT/../opencode-reasoning-extractor}"
 
 # --- configuration ----------------------------------------------------------
-EXTRACTOR="${EXTRACTOR:-$EXTRACTOR_REPO/build/opencode-reasoning-extractor}"
+EXTRACTOR="${EXTRACTOR:-$EXTRACTOR_REPO/build/opencode-extractor}"
 TRAINER="${TRAINER:-$REPO_ROOT/build/qwen-trainer}"
 
 MODELS="${MODELS:-$REPO_ROOT/models}"
@@ -72,7 +72,7 @@ make -C "$REPO_ROOT";
 # topic-partitioned JSONL (sft/<topic>/sessions.jsonl, subagents/, rl/,
 # manifest.json). Refusing sessions are dropped automatically.
 mkdir -p "$(dirname "$EXTRACTOR")";
-( cd "$EXTRACTOR_REPO/source" && go build -o "$EXTRACTOR" ./cmd/opencode-reasoning-extractor )
+( cd "$EXTRACTOR_REPO/source" && go build -o "$EXTRACTOR" ./cmd/opencode-extractor )
 
 "$EXTRACTOR" --force "$DATASETS/opencode-hydraone" "$DATASETS/reasoning-hydraone"
 "$EXTRACTOR" --force "$DATASETS/opencode-thinky" "$DATASETS/reasoning-thinky"
