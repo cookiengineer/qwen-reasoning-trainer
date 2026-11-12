@@ -118,7 +118,7 @@ GGUF; every tensor keeps its original quantization type.
 Good/bad prompt sets default to the bundled `source/prompts/` files (Heretic's
 sets, `--limit 400`). Select the cybersecurity-focused catalog with
 `--catalog cybersecurity` (defensive good prompts, offensive/dual-use bad
-prompts; `500/100` train/test rows per side), or override with `--good`/`--bad`
+prompts; `2000/400` train/test rows per side), or override with `--good`/`--bad`
 (text or JSONL). Useful flags: `--row-norm none|pre|full` (default `full`),
 `--orthogonalize`, `--direction-index` (`-1` = per layer), per-component
 `--attn-*`/`--mlp-*` weights, `--winsorize`.

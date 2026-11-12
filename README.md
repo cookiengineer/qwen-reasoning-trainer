@@ -243,12 +243,6 @@ Two bundled catalogs are selectable with `--catalog`:
 | `heretic` (default) | general harmless instructions | general harmful behaviors    |
 | `cybersecurity`     | defensive security questions  | offensive/dual-use questions |
 
-The `cybersecurity` catalog is a larger, topic-focused set covering exploit
-development, malware development and analysis, offensive tooling, pentest and
-red-team workflows, network/web/cloud attacks, anti-forensics, and their
-defensive counterparts such as threat modeling, detection engineering, incident
-response, and hardening. Its train/test splits are `500/100` rows per side.
-
 ```sh
 # Use the cybersecurity catalog instead of the default Heretic set
 ./build/qwen-trainer abliterate \
@@ -271,10 +265,10 @@ or JSONL files. The `--prompt-col` CLI parameter selects the column, default `te
 | `harmful_behaviors_train.jsonl`       | 416   | bad prompts / residual directions (`--bad`)    |
 | `harmless_alpaca_test.jsonl`          | 6265  | KL divergence evaluation (`--eval-good`)       |
 | `harmful_behaviors_test.jsonl`        | 104   | refusal evaluation (`--eval-bad`)              |
-| `cybersecurity_defensive_train.jsonl` | 500   | good prompts (`--catalog cybersecurity`)       |
-| `cybersecurity_offensive_train.jsonl` | 500   | bad prompts (`--catalog cybersecurity`)        |
-| `cybersecurity_defensive_test.jsonl`  | 100   | KL evaluation (`--catalog cybersecurity`)      |
-| `cybersecurity_offensive_test.jsonl`  | 100   | refusal evaluation (`--catalog cybersecurity`) |
+| `cybersecurity_defensive_train.jsonl` | 2000  | good prompts (`--catalog cybersecurity`)       |
+| `cybersecurity_offensive_train.jsonl` | 2000  | bad prompts (`--catalog cybersecurity`)        |
+| `cybersecurity_defensive_test.jsonl`  | 400   | KL evaluation (`--catalog cybersecurity`)      |
+| `cybersecurity_offensive_test.jsonl`  | 400   | refusal evaluation (`--catalog cybersecurity`) |
 
 The full files are quite large, so the limits are defaulted to Heretic's limits,
 with `--limit 400` and `--eval-limit 100`. Set `--limit 0` or `--eval-limit 0`

@@ -400,7 +400,8 @@ Prompt sets are bundled pre-converted in `source/prompts/`, embedded with
 - `heretic` (default) - `harmless_alpaca_{train,test}.jsonl` +
   `harmful_behaviors_{train,test}.jsonl`.
 - `cybersecurity` - `cybersecurity_defensive_{train,test}.jsonl` (good) +
-  `cybersecurity_offensive_{train,test}.jsonl` (bad), `500/100` rows per split.
+  `cybersecurity_offensive_{train,test}.jsonl` (bad), `2000/400` rows per split,
+  including malware, software, and hardware/firmware reverse-engineering topics.
 
 The first-token KL is a weak signal for a thinking model (it emits `<think>`
 first).

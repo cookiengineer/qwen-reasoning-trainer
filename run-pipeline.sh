@@ -90,11 +90,14 @@ mkdir -p "$(dirname "$EXTRACTOR")";
 	--out "$MODELS_ABLATED";
 
 # --- 4. abliterate the base with the cybersecurity catalog ------------------
-# Second ablation pass using the offensive/defensive cybersecurity prompt
-# catalog. The SFT step below trains on this artifact.
+# Second ablation pass using the full offensive/defensive cybersecurity prompt
+# catalog (2000 bad + 2000 good train prompts; --limit 0 disables the default
+# 400-row cap). Runtime scales linearly with the prompt count, so this is much
+# slower than the Heretic step above. The SFT step below trains on this artifact.
 "$TRAINER" abliterate \
 	--model "$MODELS_BASE" \
 	--catalog cybersecurity \
+	--limit 0 \
 	--out "$MODELS_ABLATED_CYBER";
 
 # --- 5. SFT the cyber-abliterated model on the reasoning traces -------------

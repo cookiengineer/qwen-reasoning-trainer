@@ -98,3 +98,303 @@
 {"text": "Give an example policy for how to implement SBOM management for a hardware supplier."}
 {"text": "Show how to respond to a supply chain incident affecting a CI/CD pipeline without disrupting operations."}
 {"text": "Develop a repeatable workflow to build a vendor risk management program for a hardware supplier."}
+{"text": "Outline a plan to unpack the protected payload of a banking trojan."}
+{"text": "What tools and processes are needed to unpack the protected payload of a malicious document?"}
+{"text": "Give an example policy for how to reverse engineer the encryption routine used by an information-stealing malware family."}
+{"text": "Show how to reverse engineer the encryption routine used by a fileless loader without disrupting operations."}
+{"text": "Develop a repeatable workflow to recover the command-and-control protocol of a ransomware sample."}
+{"text": "Explain how to analyze the anti-analysis checks in a fileless loader."}
+{"text": "Provide a detailed guide on how to extract indicators of compromise from a rootkit."}
+{"text": "Write a step-by-step playbook to extract indicators of compromise from a Linux ELF implant."}
+{"text": "Describe best practices to reverse engineer the encryption routine used by an Android malware family."}
+{"text": "Create a checklist that helps teams reconstruct the behavior of a malicious document."}
+{"text": "Outline a plan to analyze the anti-analysis checks in a botnet client."}
+{"text": "What tools and processes are needed to extract indicators of compromise from an information-stealing malware family?"}
+{"text": "Give an example policy for how to extract indicators of compromise from a firmware backdoor."}
+{"text": "Show how to analyze the anti-analysis checks in a banking trojan without disrupting operations."}
+{"text": "Develop a repeatable workflow to unpack the protected payload of a botnet client."}
+{"text": "Outline a plan to analyze the cryptographic implementation in a mobile banking application."}
+{"text": "What tools and processes are needed to reverse engineer a game client?"}
+{"text": "Give an example policy for how to analyze the cryptographic implementation in a DRM module."}
+{"text": "Show how to analyze the attack surface of a DRM module without disrupting operations."}
+{"text": "Develop a repeatable workflow to perform root-cause analysis on a DRM module."}
+{"text": "Explain how to reverse engineer a Windows service."}
+{"text": "Provide a detailed guide on how to identify memory corruption bugs in a firmware updater."}
+{"text": "Write a step-by-step playbook to perform root-cause analysis on a Windows service."}
+{"text": "Describe best practices to perform root-cause analysis on a proprietary protocol client."}
+{"text": "Create a checklist that helps teams perform root-cause analysis on a mobile banking application."}
+{"text": "Outline a plan to decompile a mobile banking application."}
+{"text": "What tools and processes are needed to analyze the cryptographic implementation in a commercial desktop application?"}
+{"text": "Give an example policy for how to identify memory corruption bugs in a Windows service."}
+{"text": "Show how to identify unsafe deserialization paths in a DRM module without disrupting operations."}
+{"text": "Develop a repeatable workflow to decompile a DRM module."}
+{"text": "Outline a plan to analyze the update mechanism of an industrial PLC."}
+{"text": "What tools and processes are needed to analyze the update mechanism of a drone controller?"}
+{"text": "Give an example policy for how to emulate the firmware of a USB security token."}
+{"text": "Show how to assess the secure element in a TPM module without disrupting operations."}
+{"text": "Develop a repeatable workflow to analyze the bootloader of a USB security token."}
+{"text": "Explain how to perform a security review of the chip package of a TPM module."}
+{"text": "Provide a detailed guide on how to perform a security review of the chip package of a USB security token."}
+{"text": "Write a step-by-step playbook to audit the firmware of an industrial PLC."}
+{"text": "Describe best practices to perform a security review of the chip package of a satellite terminal."}
+{"text": "Create a checklist that helps teams test the firmware of a consumer router."}
+{"text": "Outline a plan to test the firmware of a drone controller."}
+{"text": "What tools and processes are needed to test the firmware of a TPM module?"}
+{"text": "Give an example policy for how to test the firmware of a smart meter."}
+{"text": "Show how to review key storage in a USB security token without disrupting operations."}
+{"text": "Develop a repeatable workflow to verify secure boot on a medical device."}
+{"text": "Outline a plan to design secure isolation for an IoT platform."}
+{"text": "What tools and processes are needed to perform a security architecture review of a cloud-native application?"}
+{"text": "Give an example policy for how to review the authentication architecture of a mobile banking application."}
+{"text": "Show how to evaluate the threat model of a mobile banking application without disrupting operations."}
+{"text": "Develop a repeatable workflow to assess the attack surface of an identity platform."}
+{"text": "Explain how to assess the attack surface of an API gateway."}
+{"text": "Provide a detailed guide on how to review the security requirements for an IoT platform."}
+{"text": "Write a step-by-step playbook to assess the resilience of a payment processing system."}
+{"text": "Describe best practices to evaluate the data flow security of an industrial control system."}
+{"text": "Create a checklist that helps teams assess the attack surface of a microservice platform."}
+{"text": "Outline a plan to review the authentication architecture of an IoT platform."}
+{"text": "What tools and processes are needed to evaluate the threat model of a payment processing system?"}
+{"text": "Give an example policy for how to design trust boundaries for a cloud-native application."}
+{"text": "Show how to review the security requirements for a mobile banking application without disrupting operations."}
+{"text": "Develop a repeatable workflow to assess the attack surface of a payment processing system."}
+{"text": "Outline a plan to assess the security of a GraphQL service."}
+{"text": "What tools and processes are needed to test the authentication flow of a file upload handler?"}
+{"text": "Give an example policy for how to test the authorization model of a REST API."}
+{"text": "Show how to fuzz the input handlers of a GraphQL service without disrupting operations."}
+{"text": "Develop a repeatable workflow to conduct interactive application security testing on a microservice."}
+{"text": "Explain how to validate the security controls in a serverless function."}
+{"text": "Provide a detailed guide on how to validate the security controls in a multi-tenant platform."}
+{"text": "Write a step-by-step playbook to test the authentication flow of a multi-tenant platform."}
+{"text": "Describe best practices to validate the security controls in a GraphQL service."}
+{"text": "Create a checklist that helps teams test the authorization model of a multi-tenant platform."}
+{"text": "Outline a plan to perform dynamic application security testing on a legacy application."}
+{"text": "What tools and processes are needed to assess the security of a microservice?"}
+{"text": "Give an example policy for how to perform dynamic application security testing on a file upload handler."}
+{"text": "Show how to test the authorization model of a microservice without disrupting operations."}
+{"text": "Develop a repeatable workflow to assess the security of a mobile application."}
+{"text": "Outline a plan to triage crashes from a firmware image."}
+{"text": "What tools and processes are needed to build a fuzzing harness for an industrial control system?"}
+{"text": "Give an example policy for how to assess the exploitability of a database engine."}
+{"text": "Show how to build a fuzzing harness for a firmware image without disrupting operations."}
+{"text": "Develop a repeatable workflow to prioritize vulnerabilities in an open-source project."}
+{"text": "Explain how to analyze the root cause of a crash in an API gateway."}
+{"text": "Provide a detailed guide on how to develop a regression test for a network protocol parser."}
+{"text": "Write a step-by-step playbook to develop a regression test for an open-source project."}
+{"text": "Describe best practices to analyze the root cause of a crash in an industrial control system."}
+{"text": "Create a checklist that helps teams develop a regression test for a file format parser."}
+{"text": "Outline a plan to assess the exploitability of a browser engine."}
+{"text": "What tools and processes are needed to assess the exploitability of a web framework?"}
+{"text": "Give an example policy for how to validate security patches for a file format parser."}
+{"text": "Show how to perform differential testing on a firmware image without disrupting operations."}
+{"text": "Develop a repeatable workflow to analyze the root cause of a crash in an open-source project."}
+{"text": "Outline a plan to implement shadow stacks for a server application."}
+{"text": "What tools and processes are needed to harden the memory allocator in an embedded firmware image?"}
+{"text": "Give an example policy for how to enable address space layout randomization for a Windows service."}
+{"text": "Show how to implement control-flow integrity in a Windows service without disrupting operations."}
+{"text": "Develop a repeatable workflow to implement control-flow integrity in a kernel module."}
+{"text": "Explain how to implement control-flow integrity in a browser engine."}
+{"text": "Provide a detailed guide on how to implement shadow stacks for a browser engine."}
+{"text": "Write a step-by-step playbook to enable address space layout randomization for a browser engine."}
+{"text": "Describe best practices to validate the exploit mitigations in a desktop application."}
+{"text": "Create a checklist that helps teams enable sandboxing for a server application."}
+{"text": "Outline a plan to enable compiler hardening flags for a container runtime."}
+{"text": "What tools and processes are needed to enable address space layout randomization for an embedded firmware image?"}
+{"text": "Give an example policy for how to apply seccomp filters to a Windows service."}
+{"text": "Show how to validate the exploit mitigations in an embedded firmware image without disrupting operations."}
+{"text": "Develop a repeatable workflow to enable sandboxing for an embedded firmware image."}
+{"text": "Outline a plan to deploy endpoint detection and response on a Linux server fleet."}
+{"text": "What tools and processes are needed to collect forensic telemetry from macOS workstations?"}
+{"text": "Give an example policy for how to tune EDR detections for an enterprise workstation."}
+{"text": "Show how to deploy endpoint detection and response on a point-of-sale terminal without disrupting operations."}
+{"text": "Develop a repeatable workflow to isolate compromised hosts in a remote workforce."}
+{"text": "Explain how to deploy endpoint detection and response on a virtual desktop environment."}
+{"text": "Provide a detailed guide on how to detect credential theft on a cloud virtual machine."}
+{"text": "Write a step-by-step playbook to implement application allowlisting on macOS workstations."}
+{"text": "Describe best practices to tune EDR detections for a point-of-sale terminal."}
+{"text": "Create a checklist that helps teams monitor process behavior on an enterprise workstation."}
+{"text": "Outline a plan to detect credential theft on a virtual desktop environment."}
+{"text": "What tools and processes are needed to respond to malware on a Windows endpoint fleet?"}
+{"text": "Give an example policy for how to tune EDR detections for a Windows endpoint fleet."}
+{"text": "Show how to investigate alerts from a Windows endpoint fleet without disrupting operations."}
+{"text": "Develop a repeatable workflow to collect forensic telemetry from a cloud virtual machine."}
+{"text": "Outline a plan to analyze network telemetry from a cloud environment."}
+{"text": "What tools and processes are needed to detect lateral movement in an enterprise WAN?"}
+{"text": "Give an example policy for how to analyze network telemetry from a branch office network."}
+{"text": "Show how to detect data exfiltration from a branch office network without disrupting operations."}
+{"text": "Develop a repeatable workflow to implement zero trust networking for a service provider network."}
+{"text": "Explain how to deploy network detection and response for a service provider network."}
+{"text": "Provide a detailed guide on how to detect lateral movement in a data center."}
+{"text": "Write a step-by-step playbook to detect command-and-control traffic in a data center."}
+{"text": "Describe best practices to build network segmentation for a multi-cloud environment."}
+{"text": "Create a checklist that helps teams monitor traffic across an enterprise WAN."}
+{"text": "Outline a plan to build network segmentation for a remote workforce."}
+{"text": "What tools and processes are needed to detect data exfiltration from a multi-cloud environment?"}
+{"text": "Give an example policy for how to implement zero trust networking for an industrial network."}
+{"text": "Show how to detect command-and-control traffic in a remote workforce without disrupting operations."}
+{"text": "Develop a repeatable workflow to respond to intrusions in a corporate network."}
+{"text": "Outline a plan to detect phishing campaigns targeting a customer support team."}
+{"text": "What tools and processes are needed to detect phishing campaigns targeting a remote workforce?"}
+{"text": "Give an example policy for how to investigate business email compromise in a customer support team."}
+{"text": "Show how to quarantine malicious messages in a university without disrupting operations."}
+{"text": "Develop a repeatable workflow to tune spam filters for an executive team."}
+{"text": "Explain how to analyze malicious attachments in a remote workforce."}
+{"text": "Provide a detailed guide on how to tune spam filters for a remote workforce."}
+{"text": "Write a step-by-step playbook to quarantine malicious messages in an executive team."}
+{"text": "Describe best practices to implement DMARC enforcement for a customer support team."}
+{"text": "Create a checklist that helps teams implement DMARC enforcement for a university."}
+{"text": "Outline a plan to tune spam filters for a Google Workspace tenant."}
+{"text": "What tools and processes are needed to tune spam filters for a government agency?"}
+{"text": "Give an example policy for how to deploy email authentication for an executive team."}
+{"text": "Show how to analyze malicious attachments in a Microsoft 365 tenant without disrupting operations."}
+{"text": "Develop a repeatable workflow to implement DMARC enforcement for a remote workforce."}
+{"text": "Outline a plan to classify sensitive data in a file server estate."}
+{"text": "What tools and processes are needed to respond to a data leak from an endpoint fleet?"}
+{"text": "Give an example policy for how to implement data loss prevention for a SaaS application."}
+{"text": "Show how to respond to a data leak from a customer support system without disrupting operations."}
+{"text": "Develop a repeatable workflow to implement data retention controls for a cloud storage platform."}
+{"text": "Explain how to implement data loss prevention for a corporate environment."}
+{"text": "Provide a detailed guide on how to monitor data flows across an endpoint fleet."}
+{"text": "Write a step-by-step playbook to protect intellectual property in a corporate environment."}
+{"text": "Describe best practices to audit data access in a customer support system."}
+{"text": "Create a checklist that helps teams respond to a data leak from a database fleet."}
+{"text": "Outline a plan to detect data exfiltration from an endpoint fleet."}
+{"text": "What tools and processes are needed to classify sensitive data in a data warehouse?"}
+{"text": "Give an example policy for how to control access to sensitive data in an engineering organization."}
+{"text": "Show how to classify sensitive data in a customer support system without disrupting operations."}
+{"text": "Develop a repeatable workflow to protect intellectual property in an engineering organization."}
+{"text": "Outline a plan to assess the recoverability of a manufacturing plant."}
+{"text": "What tools and processes are needed to segment backup networks for a corporate network?"}
+{"text": "Give an example policy for how to test recovery procedures for an enterprise endpoint fleet."}
+{"text": "Show how to build a ransomware resilience plan for a file server estate without disrupting operations."}
+{"text": "Develop a repeatable workflow to detect ransomware activity on a manufacturing plant."}
+{"text": "Explain how to respond to a ransomware incident affecting a file server estate."}
+{"text": "Provide a detailed guide on how to detect ransomware activity on a corporate network."}
+{"text": "Write a step-by-step playbook to build a ransomware resilience plan for a critical infrastructure operator."}
+{"text": "Describe best practices to detect ransomware activity on an enterprise endpoint fleet."}
+{"text": "Create a checklist that helps teams validate restore capabilities for a financial institution."}
+{"text": "Outline a plan to harden remote access to a cloud environment."}
+{"text": "What tools and processes are needed to harden remote access to a manufacturing plant?"}
+{"text": "Give an example policy for how to test recovery procedures for a data center."}
+{"text": "Show how to detect ransomware activity on a financial institution without disrupting operations."}
+{"text": "Develop a repeatable workflow to build a ransomware resilience plan for a manufacturing plant."}
+{"text": "Outline a plan to enforce conditional access for a Kubernetes cluster."}
+{"text": "What tools and processes are needed to implement identity threat detection for an Azure AD tenant?"}
+{"text": "Give an example policy for how to monitor service account activity in an Azure AD tenant."}
+{"text": "Show how to implement identity threat detection for a multi-tenant application without disrupting operations."}
+{"text": "Develop a repeatable workflow to respond to identity-based attacks in a cloud identity provider."}
+{"text": "Explain how to detect impossible travel in a multi-tenant application."}
+{"text": "Provide a detailed guide on how to monitor privileged access in a financial institution."}
+{"text": "Write a step-by-step playbook to detect impossible travel in an Azure AD tenant."}
+{"text": "Describe best practices to detect impossible travel in a financial institution."}
+{"text": "Create a checklist that helps teams audit authentication events in an Active Directory domain."}
+{"text": "Outline a plan to audit authentication events in a privileged access management system."}
+{"text": "What tools and processes are needed to hunt for compromised accounts in a customer identity platform?"}
+{"text": "Give an example policy for how to monitor service account activity in a cloud identity provider."}
+{"text": "Show how to respond to identity-based attacks in an enterprise SSO deployment without disrupting operations."}
+{"text": "Develop a repeatable workflow to detect credential theft in a multi-tenant application."}
+{"text": "Outline a plan to enforce security baselines for a Kubernetes cluster."}
+{"text": "What tools and processes are needed to monitor cloud activity in a multi-cloud estate?"}
+{"text": "Give an example policy for how to implement guardrails for a cloud storage environment."}
+{"text": "Show how to implement guardrails for an AWS account without disrupting operations."}
+{"text": "Develop a repeatable workflow to remediate insecure configurations in a cloud-native platform."}
+{"text": "Explain how to audit IAM policies in a cloud-native platform."}
+{"text": "Provide a detailed guide on how to detect misconfigurations in a Google Cloud project."}
+{"text": "Write a step-by-step playbook to assess the encryption posture of an Azure tenant."}
+{"text": "Describe best practices to review the network exposure of a cloud storage environment."}
+{"text": "Create a checklist that helps teams build compliance reporting for a multi-cloud estate."}
+{"text": "Outline a plan to assess the encryption posture of a container registry."}
+{"text": "What tools and processes are needed to assess the encryption posture of a Kubernetes cluster?"}
+{"text": "Give an example policy for how to monitor cloud activity in an Azure tenant."}
+{"text": "Show how to audit IAM policies in a Kubernetes cluster without disrupting operations."}
+{"text": "Develop a repeatable workflow to implement guardrails for a container registry."}
+{"text": "Outline a plan to enforce pod security standards in an OpenShift environment."}
+{"text": "What tools and processes are needed to manage secrets in a serverless platform?"}
+{"text": "Give an example policy for how to respond to a container compromise in a cloud-native application."}
+{"text": "Show how to audit RBAC policies in a serverless platform without disrupting operations."}
+{"text": "Develop a repeatable workflow to harden the container runtime on a container registry."}
+{"text": "Explain how to detect container escapes from a Kubernetes cluster."}
+{"text": "Provide a detailed guide on how to detect container escapes from a Docker environment."}
+{"text": "Write a step-by-step playbook to enforce pod security standards in a service mesh."}
+{"text": "Describe best practices to implement network policies for an OpenShift environment."}
+{"text": "Create a checklist that helps teams manage secrets in a cloud-native application."}
+{"text": "Outline a plan to respond to a container compromise in a Kubernetes cluster."}
+{"text": "What tools and processes are needed to implement network policies for a Kubernetes cluster?"}
+{"text": "Give an example policy for how to implement network policies for a CI/CD runner."}
+{"text": "Show how to respond to a container compromise in a multi-tenant cluster without disrupting operations."}
+{"text": "Develop a repeatable workflow to enforce pod security standards in a container registry."}
+{"text": "Outline a plan to monitor traffic to a webhook endpoint."}
+{"text": "What tools and processes are needed to assess the security of a mobile backend?"}
+{"text": "Give an example policy for how to implement rate limiting for a microservice mesh."}
+{"text": "Show how to detect abuse of a gRPC service without disrupting operations."}
+{"text": "Develop a repeatable workflow to respond to an API breach affecting a partner integration."}
+{"text": "Explain how to review the security of a public developer platform."}
+{"text": "Provide a detailed guide on how to test the authorization model of a partner integration."}
+{"text": "Write a step-by-step playbook to respond to an API breach affecting a gRPC service."}
+{"text": "Describe best practices to detect abuse of a microservice mesh."}
+{"text": "Create a checklist that helps teams monitor traffic to a multi-tenant API."}
+{"text": "Outline a plan to test the authentication of a webhook endpoint."}
+{"text": "What tools and processes are needed to monitor traffic to an API gateway?"}
+{"text": "Give an example policy for how to monitor traffic to a GraphQL endpoint."}
+{"text": "Show how to respond to an API breach affecting a microservice mesh without disrupting operations."}
+{"text": "Develop a repeatable workflow to assess the security of a multi-tenant API."}
+{"text": "Outline a plan to detect compromised devices in an IP camera deployment."}
+{"text": "What tools and processes are needed to implement secure update mechanisms for a smart home platform?"}
+{"text": "Give an example policy for how to respond to a compromise of a consumer router fleet."}
+{"text": "Show how to review the security of a medical device fleet without disrupting operations."}
+{"text": "Develop a repeatable workflow to implement secure update mechanisms for an Android device fleet."}
+{"text": "Explain how to review the security of an industrial sensor network."}
+{"text": "Provide a detailed guide on how to monitor the security of an industrial sensor network."}
+{"text": "Write a step-by-step playbook to review the security of a drone fleet."}
+{"text": "Describe best practices to detect compromised devices in a drone fleet."}
+{"text": "Create a checklist that helps teams assess the security of a smart home platform."}
+{"text": "Outline a plan to detect compromised devices in an Android device fleet."}
+{"text": "What tools and processes are needed to respond to a compromise of an iOS device fleet?"}
+{"text": "Give an example policy for how to assess the security of an Android device fleet."}
+{"text": "Show how to monitor the security of a drone fleet without disrupting operations."}
+{"text": "Develop a repeatable workflow to manage the lifecycle of an IP camera deployment."}
+{"text": "Outline a plan to verify the integrity of a device manufacturing line."}
+{"text": "What tools and processes are needed to validate the provenance of a hardware security module?"}
+{"text": "Give an example policy for how to detect counterfeit components in a hardware security module."}
+{"text": "Show how to assess the tamper resistance of a network appliance fleet without disrupting operations."}
+{"text": "Develop a repeatable workflow to assess the security of a semiconductor supply chain."}
+{"text": "Explain how to detect counterfeit components in a semiconductor supply chain."}
+{"text": "Provide a detailed guide on how to verify the integrity of a TPM deployment."}
+{"text": "Write a step-by-step playbook to implement secure boot for a hardware security module."}
+{"text": "Describe best practices to implement secure boot for a distribution channel."}
+{"text": "Create a checklist that helps teams review the manufacturing process for a hardware vendor."}
+{"text": "Outline a plan to review the manufacturing process for a firmware supplier."}
+{"text": "What tools and processes are needed to assess the tamper resistance of an embedded device platform?"}
+{"text": "Give an example policy for how to verify the integrity of a secure boot process."}
+{"text": "Show how to audit the firmware supply chain of a secure boot process without disrupting operations."}
+{"text": "Develop a repeatable workflow to assess the tamper resistance of a secure boot process."}
+{"text": "Outline a plan to monitor model behavior in a model serving platform."}
+{"text": "What tools and processes are needed to red team a speech recognition system?"}
+{"text": "Give an example policy for how to respond to a model extraction attack on a RAG pipeline."}
+{"text": "Show how to red team a RAG pipeline without disrupting operations."}
+{"text": "Develop a repeatable workflow to detect adversarial inputs to a speech recognition system."}
+{"text": "Explain how to red team an autonomous agent."}
+{"text": "Provide a detailed guide on how to audit the tool-calling interface of an AI-powered security tool."}
+{"text": "Write a step-by-step playbook to monitor model behavior in a computer vision model."}
+{"text": "Describe best practices to implement guardrails for a model serving platform."}
+{"text": "Create a checklist that helps teams assess the privacy of an autonomous agent."}
+{"text": "Outline a plan to audit the tool-calling interface of a computer vision model."}
+{"text": "What tools and processes are needed to respond to a model extraction attack on an AI coding assistant?"}
+{"text": "Give an example policy for how to respond to a model extraction attack on a large language model."}
+{"text": "Show how to protect training data used by a RAG pipeline without disrupting operations."}
+{"text": "Develop a repeatable workflow to defend against prompt injection in a chatbot application."}
+{"text": "Outline a plan to map detections to MITRE ATT&CK for an industrial control system."}
+{"text": "What tools and processes are needed to build a SOC playbook for a security operations center?"}
+{"text": "Give an example policy for how to respond to incidents in a corporate network."}
+{"text": "Show how to hunt for adversary activity in an Active Directory environment without disrupting operations."}
+{"text": "Develop a repeatable workflow to map detections to MITRE ATT&CK for a Kubernetes cluster."}
+{"text": "Explain how to build a SOC playbook for a Kubernetes cluster."}
+{"text": "Provide a detailed guide on how to build a threat hunting hypothesis for a threat intelligence platform."}
+{"text": "Write a step-by-step playbook to triage security events from an industrial control system."}
+{"text": "Describe best practices to develop detection coverage for a data center."}
+{"text": "Create a checklist that helps teams map detections to MITRE ATT&CK for a cloud environment."}
+{"text": "Outline a plan to map detections to MITRE ATT&CK for a corporate network."}
+{"text": "What tools and processes are needed to map detections to MITRE ATT&CK for an Active Directory environment?"}
+{"text": "Give an example policy for how to respond to incidents in an industrial control system."}
+{"text": "Show how to build a threat hunting hypothesis for an enterprise endpoint fleet without disrupting operations."}
+{"text": "Develop a repeatable workflow to hunt for adversary activity in a security operations center."}

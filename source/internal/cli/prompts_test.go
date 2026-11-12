@@ -146,10 +146,10 @@ func TestBundledCatalogPrompts(t *testing.T) {
 		BundledBadPrompts:             416,
 		BundledEvalGoodPrompts:        6265,
 		BundledEvalBadPrompts:         104,
-		BundledCybersecurityGoodTrain: 500,
-		BundledCybersecurityBadTrain:  500,
-		BundledCybersecurityGoodTest:  100,
-		BundledCybersecurityBadTest:   100,
+		BundledCybersecurityGoodTrain: 2000,
+		BundledCybersecurityBadTrain:  2000,
+		BundledCybersecurityGoodTest:  400,
+		BundledCybersecurityBadTest:   400,
 	}
 	checked := map[string]bool{}
 	for _, cat := range BundledCatalogs {
