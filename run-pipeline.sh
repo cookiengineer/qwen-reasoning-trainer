@@ -104,14 +104,14 @@ mkdir -p "$(dirname "$EXTRACTOR")";
 	--out "$MODELS_ABLATED_CYBER";
 
 # --- 5. SFT the cyber-abliterated model on the reasoning traces -------------
-# QLoRA (r=16/alpha=32) on the frozen quantized base, fully device-resident on
-# the Vulkan GPU. The run is resumable: re-running resumes from --resume, and
-# the merged GGUF is only written after the final step.
+# QLoRA (r=16/alpha=32) on the frozen quantized base. Training uses the Vulkan
+# device path by default and falls back to the CPU reference only without a
+# usable GPU; the device checkpoint flags below therefore require Vulkan. The
+# merged GGUF is only written after the final step.
 clean_stale "$MODELS"
 
 "$TRAINER" train \
 	--model "$MODELS_ABLATED_CYBER" \
-	--device \
 	--dataset "$DATASETS/reasoning-hydraone" \
 	--dataset "$DATASETS/reasoning-thinky" \
 	--include-subagents \

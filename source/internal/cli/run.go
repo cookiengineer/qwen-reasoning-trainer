@@ -51,7 +51,7 @@ Commands:
   search     Search abliteration parameters (refusal + lambda*KL) and write the best
   evaluate   Score refusal/KL, corpus perplexity, and JSONL multiple-choice tasks
   dataset    Build tokenized, loss-masked examples from extractor JSONL
-  train      QLoRA fine-tune on the extractor dataset (reference host path)
+  train      QLoRA fine-tune on the extractor dataset (Vulkan first, CPU fallback)
   status     Show the progress of a running (or last) train/abliterate/search job
   help       Show this help
 
@@ -64,6 +64,7 @@ Common flags (accepted by the model commands; --model is required):
                        $XDG_STATE_HOME/qwen-trainer/status.json)
   --no-download        Do not auto-download a missing model
   --log-level <level>  quiet|info|debug (default info)
+  --backend <mode>     auto|cpu|vulkan (default auto)
 `
 
 // Run executes the CLI and returns a process exit code.
@@ -239,11 +240,20 @@ func cmdAbliterate(cfg *Config, stdout, stderr io.Writer) int {
 		return 1
 	}
 	m := qwen38.NewModel(w)
-	if be := resolveGPU(modelBytes(g)+gpuHeadroomBytes, cfg, stderr); be != nil {
+	be, err := resolveBackend(modelBytes(g)+gpuHeadroomBytes, cfg, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if be != nil {
 		defer func() { m.FreeDevice(); be.Close() }()
 		m.Backend = be
 		if !*noDeviceResiduals {
 			if err := m.EnableDeviceForward(); err != nil {
+				if cfg.Backend == "vulkan" {
+					fmt.Fprintln(stderr, "error:", err)
+					return 1
+				}
 				fmt.Fprintf(stderr, "warning: device residual capture unavailable, using host path: %v\n", err)
 			}
 		}
@@ -436,11 +446,20 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 		return 1
 	}
 	m := qwen38.NewModel(w)
-	if be := resolveGPU(modelBytes(g)+gpuHeadroomBytes, cfg, stderr); be != nil {
+	be, err := resolveBackend(modelBytes(g)+gpuHeadroomBytes, cfg, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if be != nil {
 		defer func() { m.FreeDevice(); be.Close() }()
 		m.Backend = be
 		if !*noDeviceResiduals {
 			if err := m.EnableDeviceForward(); err != nil {
+				if cfg.Backend == "vulkan" {
+					fmt.Fprintln(stderr, "error:", err)
+					return 1
+				}
 				fmt.Fprintf(stderr, "warning: device residual capture unavailable, using host path: %v\n", err)
 			}
 		}
@@ -675,7 +694,12 @@ func cmdRun(cfg *Config, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stderr, "weights loaded in %s\n", time.Since(t0).Round(time.Millisecond))
 
 	m := qwen38.NewModel(w)
-	if be := resolveGPU(modelBytes(g)+gpuHeadroomBytes, cfg, stderr); be != nil {
+	be, err := resolveBackend(modelBytes(g)+gpuHeadroomBytes, cfg, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if be != nil {
 		defer func() { m.FreeDevice(); be.Close() }()
 		m.Backend = be
 	}
@@ -812,7 +836,11 @@ func cmdEvaluate(cfg *Config, stdout, stderr io.Writer) int {
 	if *baseFile != "" {
 		need += fileModelBytes(*baseFile)
 	}
-	be := resolveGPU(need, cfg, stderr)
+	be, err := resolveBackend(need, cfg, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
 	defer func() {
 		if be != nil {
 			be.Close()
@@ -1017,10 +1045,10 @@ func cmdStatus(cfg *Config, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// cmdTrain runs QLoRA fine-tuning on the extractor dataset. This is the
-// reference host path: the quantized base is frozen and only F32 LoRA adapters
-// are trained. It is correct-first and slow on the real 27B; the device-resident
-// Vulkan graph is future work.
+// cmdTrain runs QLoRA fine-tuning on the extractor dataset. The quantized base
+// is frozen and only F32 LoRA adapters are trained. It uses the device-resident
+// Vulkan graph by default and falls back to the host autograd reference when no
+// suitable Vulkan device is available (--backend auto).
 func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("train", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -1041,7 +1069,6 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	valRatio := fs.Float64("val-ratio", 0.0, "validation split ratio (0 = train on all)")
 	subagents := fs.Bool("include-subagents", false, "include the subagents/ tree")
 	limit := fs.Int("limit", 0, "use only the first N sessions (0 = all)")
-	device := fs.Bool("device", false, "train with the device-resident Vulkan graph")
 	checkpoint := fs.Bool("checkpoint", true, "activation checkpointing (device path)")
 	resume := fs.String("resume", "", "device checkpoint file to resume from (and save to)")
 	saveEvery := fs.Int("save-every", 0, "write the device checkpoint every N steps (0 = only at the end)")
@@ -1060,6 +1087,16 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	if *rank <= 0 || *alpha <= 0 {
 		fmt.Fprintln(stderr, "error: --rank and --alpha must be positive")
 		return 2
+	}
+	if *evalCkpt == "" {
+		if *saveEvery > 0 && *resume == "" {
+			fmt.Fprintln(stderr, "error: --save-every requires --resume <checkpoint-path>")
+			return 2
+		}
+		if cfg.Backend == "cpu" && (*resume != "" || *saveEvery > 0) {
+			fmt.Fprintln(stderr, "error: --resume/--save-every require a Vulkan backend; remove them or use --backend auto/vulkan")
+			return 2
+		}
 	}
 	if lim := applyMemoryLimit(); lim > 0 && cfg.LogLevel != "quiet" {
 		fmt.Fprintf(stderr, "go memory limit: %s (override with GOMEMLIMIT)\n", humanBytes(lim))
@@ -1141,12 +1178,26 @@ func cmdTrain(cfg *Config, stdout, stderr io.Writer) int {
 	data := toTrain(trainSet)
 	valData := toTrain(valSet)
 
-	if *device {
-		return runDeviceTrain(cfg, g, w, loCfg, data, valData, stdout, stderr, deviceTrainOpts{
-			steps: *steps, accum: *accum, warmup: *warmup, maxGrad: *maxGrad, lr: *lr,
-			seed: *seed, checkpoint: *checkpoint, adapterOut: *adapterOut, out: *out,
-			resume: *resume, saveEvery: *saveEvery,
-		})
+	opts := deviceTrainOpts{
+		steps: *steps, accum: *accum, warmup: *warmup, maxGrad: *maxGrad, lr: *lr,
+		seed: *seed, checkpoint: *checkpoint, adapterOut: *adapterOut, out: *out,
+		resume: *resume, saveEvery: *saveEvery,
+	}
+	if cfg.Backend != "cpu" {
+		need := modelBytes(g) + deviceTrainHeadroomBytes
+		be, err := resolveBackend(need, cfg, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		if be != nil {
+			defer be.Close()
+			return runDeviceTrain(cfg, g, w, loCfg, data, valData, stdout, stderr, opts, be)
+		}
+		if *resume != "" || *saveEvery > 0 {
+			fmt.Fprintln(stderr, "error: no Vulkan backend available, but --resume/--save-every require device checkpoints; remove them to train on CPU")
+			return 1
+		}
 	}
 
 	tm := train.NewQwenModel(w.Cfg, w, loCfg, uint64(*seed))
@@ -1250,16 +1301,9 @@ func runEvalCheckpoint(g *gguf.File, w *qwen38.Weights, loCfg train.LoRAConfig, 
 	return 0
 }
 
-// runDeviceTrain runs the fully-resident Vulkan QLoRA training path.
-func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.LoRAConfig, data, valData []train.Example, stdout, stderr io.Writer, o deviceTrainOpts) int {
-	need := modelBytes(g) + deviceTrainHeadroomBytes
-	be := resolveGPU(need, cfg, stderr)
-	if be == nil {
-		fmt.Fprintf(stderr, "error: --device requested but no Vulkan device with ~%s of memory is available\n", humanBytes(int64(need)))
-		return 1
-	}
-	defer be.Close()
-
+// runDeviceTrain runs the fully-resident Vulkan QLoRA training path. The caller
+// owns and closes be.
+func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.LoRAConfig, data, valData []train.Example, stdout, stderr io.Writer, o deviceTrainOpts, be compute.Backend) int {
 	dm, err := train.NewDeviceModel(be, w.Cfg, w, loCfg, uint64(o.seed))
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
@@ -1633,28 +1677,43 @@ func fileModelBytes(path string) uint64 {
 	return modelBytes(g)
 }
 
-// resolveGPU returns a Vulkan backend when a device is present and can hold at
-// least needBytes of weights, otherwise nil (CPU fallback). The caller owns a
-// non-nil backend and must Close it.
-func resolveGPU(needBytes uint64, cfg *Config, stderr io.Writer) compute.Backend {
+// resolveBackend selects the compute backend from cfg.Backend. auto returns a
+// Vulkan backend when one is present and large enough, otherwise nil (CPU
+// fallback). cpu always returns nil. vulkan returns an error when Vulkan is
+// unavailable or the model does not fit. The caller owns a non-nil backend and
+// must Close it.
+func resolveBackend(needBytes uint64, cfg *Config, stderr io.Writer) (compute.Backend, error) {
+	if cfg.Backend == "cpu" {
+		if cfg.LogLevel != "quiet" {
+			fmt.Fprintln(stderr, "backend: cpu (forced)")
+		}
+		return nil, nil
+	}
 	be, err := vulkan.New()
 	if err != nil {
+		if cfg.Backend == "vulkan" {
+			return nil, fmt.Errorf("vulkan backend requested but unavailable: %w", err)
+		}
 		if cfg.LogLevel != "quiet" {
 			fmt.Fprintf(stderr, "gpu: unavailable (%v); using CPU\n", err)
 		}
-		return nil
+		return nil, nil
 	}
 	caps := be.Capabilities()
 	if caps.MemoryBytes > 0 && caps.MemoryBytes < needBytes {
+		be.Close()
+		if cfg.Backend == "vulkan" {
+			return nil, fmt.Errorf("vulkan backend requested but %s has %s, need ~%s",
+				caps.Name, humanBytes(int64(caps.MemoryBytes)), humanBytes(int64(needBytes)))
+		}
 		if cfg.LogLevel != "quiet" {
 			fmt.Fprintf(stderr, "gpu: %s has %s, need ~%s; using CPU\n",
 				caps.Name, humanBytes(int64(caps.MemoryBytes)), humanBytes(int64(needBytes)))
 		}
-		be.Close()
-		return nil
+		return nil, nil
 	}
 	if cfg.LogLevel != "quiet" {
 		fmt.Fprintf(stderr, "gpu: using %s (%s)\n", caps.Name, humanBytes(int64(caps.MemoryBytes)))
 	}
-	return be
+	return be, nil
 }

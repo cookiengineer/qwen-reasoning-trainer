@@ -478,8 +478,10 @@ auto-load.
 ## 12. Training (`source/internal/autograd`, `source/internal/train`)
 
 Two interchangeable paths: a host autograd reference and a fully
-device-resident Vulkan graph. `train` uses the host path by default and the
-device path with `--device`.
+device-resident Vulkan graph. `train` uses the device path by default under
+`--backend auto` when a suitable GPU is present, falls back to the host path
+otherwise, and can be forced with `--backend cpu` (host) or `--backend vulkan`
+(device, error if unavailable).
 
 ### 12.1 Host reference (`source/internal/autograd`)
 
@@ -555,16 +557,17 @@ Common flags (model commands; `--model` required): `--model/-m`, `--models-dir`,
 | `search` | Automated abliteration search (`--catalog`, `--trials`, `--sampler`, `--lambda`, `--seed`, `--study`, `--out`). |
 | `evaluate` | `--prompts`/`--base`; `--perplexity`/`--window`; `--tasks`/`--tasks-normalize`/`--tasks-verbose`. |
 | `dataset` | Tokenize/validate extractor output and report loss-mask stats (`--dataset`, repeatable). |
-| `train` | QLoRA SFT (`--dataset` repeatable, `--steps`, `--seq-len`, `--lr`, `--rank`, `--alpha`, `--accum`, `--max-grad-norm`, `--adapter-out`, `--out`, `--val-ratio`, `--include-subagents`, `--limit`; `--device`, `--checkpoint`, `--resume`, `--save-every`, `--eval-checkpoint`). |
+| `train` | QLoRA SFT (`--backend`, `--dataset` repeatable, `--steps`, `--seq-len`, `--lr`, `--rank`, `--alpha`, `--accum`, `--max-grad-norm`, `--adapter-out`, `--out`, `--val-ratio`, `--include-subagents`, `--limit`; `--checkpoint`, `--resume`, `--save-every`, `--eval-checkpoint`). |
 | `status` | Progress of a running/last `train`/`abliterate`/`search` job (`--file`, `--json`). |
 
 `train`, `abliterate`, and `search` write a JSON progress file (default
 `$XDG_STATE_HOME/qwen-trainer/status.json`, override with `--status-file` or
 `$QWEN38_STATUS_FILE`) queryable with `qwen-trainer status`.
 
-`run`, `abliterate`, `search`, `evaluate`, and `train --device` select the
-backend automatically: Vulkan when a device has enough device-local memory for
-the model, otherwise the CPU reference.
+`run`, `abliterate`, `search`, `evaluate`, and `train` select the backend with
+`--backend auto|cpu|vulkan` (default `auto`): Vulkan when a device has enough
+device-local memory for the model, otherwise the CPU reference. `vulkan` fails
+instead of falling back; `cpu` forces the host path.
 
 ---
 

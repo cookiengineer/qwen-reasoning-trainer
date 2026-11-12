@@ -88,6 +88,48 @@ func TestCommonFlagsParse(t *testing.T) {
 	}
 }
 
+func TestCommonFlagsBackend(t *testing.T) {
+	cfg, err := ParseArgs([]string{"run", "--model", "/tmp/x.gguf"}, "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend != "auto" {
+		t.Fatalf("default backend = %q, want auto", cfg.Backend)
+	}
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfg.RegisterCommonFlags(fs)
+	if err := fs.Parse([]string{"--backend", "cpu"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend != "cpu" {
+		t.Fatalf("backend = %q, want cpu", cfg.Backend)
+	}
+}
+
+func TestBackendFlagRejectsUnknown(t *testing.T) {
+	cfg, err := ParseArgs([]string{"run", "--backend", "rocm"}, "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfg.RegisterCommonFlags(fs)
+	if err := fs.Parse(cfg.Args); err == nil {
+		t.Fatal("expected error for unknown backend")
+	}
+}
+
+func TestResolveBackendCPU(t *testing.T) {
+	be, err := resolveBackend(1<<40, &Config{Backend: "cpu", LogLevel: "quiet"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if be != nil {
+		t.Fatal("CPU backend should be nil")
+	}
+}
+
 func TestCommonFlagsModelAlias(t *testing.T) {
 	cfg := &Config{Download: true}
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)

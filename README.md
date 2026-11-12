@@ -118,11 +118,11 @@ make;
 - `--model` is required by every model command (`inspect`, `run`, `abliterate`, `search`, `evaluate`, `dataset`, `train`)
 - `--dataset` is repeatable. Use it multiple times to include multiple (exported) reasoning traces datasets
 
-The CPU/GPU compute backend is chosen automatically.
-Vulkan is used when a device is present and it has enough device memory for the
-model, otherwise the CPU backend and kernel runs.
+The compute backend defaults to `auto`: Vulkan is used when a device is present
+and has enough memory for the model, otherwise the CPU backend is used.
 
-Use `gpu-info` to see the detected device and available memory.
+Override the compute backend with `--backend auto|cpu|vulkan` on the model
+commands. Use `gpu-info` to see the detected device and available memory.
 
 ## Usage: Qwen Inference Server
 

@@ -18,6 +18,8 @@ type Config struct {
 	ModelsDir string
 	// LogLevel controls verbosity (quiet, info, debug).
 	LogLevel string
+	// Backend selects the compute backend: auto, cpu, or vulkan.
+	Backend string
 	// Download enables automatic download of the default model when missing.
 	Download bool
 	// Repo and File identify the default model artifact.
@@ -44,6 +46,26 @@ func (s *stringList) Set(v string) error {
 	return nil
 }
 
+// backendValue validates the --backend flag at parse time.
+type backendValue struct{ dst *string }
+
+func (b backendValue) String() string {
+	if b.dst == nil || *b.dst == "" {
+		return "auto"
+	}
+	return *b.dst
+}
+
+func (b backendValue) Set(v string) error {
+	switch v {
+	case "auto", "cpu", "vulkan":
+		*b.dst = v
+		return nil
+	default:
+		return fmt.Errorf("must be auto, cpu, or vulkan")
+	}
+}
+
 // DefaultModelFile is the default downloaded artifact.
 const DefaultModelFile = hf.DefaultFile
 
@@ -61,6 +83,7 @@ func ParseArgs(args []string, cwd string) (*Config, error) {
 	cfg := &Config{
 		ModelsDir: filepath.Join(cwd, "models"),
 		LogLevel:  "info",
+		Backend:   "auto",
 		Download:  true,
 		Repo:      hf.DefaultRepo,
 		File:      hf.DefaultFile,
@@ -95,6 +118,10 @@ func (cfg *Config) RegisterCommonFlags(fs *flag.FlagSet) {
 	fs.StringVar(&cfg.File, "file", cfg.File, "Hugging Face file for a missing model")
 	fs.StringVar(&cfg.StatusFile, "status-file", cfg.StatusFile, "progress status file")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "quiet|info|debug")
+	if cfg.Backend == "" {
+		cfg.Backend = "auto"
+	}
+	fs.Var(backendValue{&cfg.Backend}, "backend", "compute backend: auto|cpu|vulkan (default auto)")
 	fs.BoolFunc("no-download", "do not auto-download a missing model", func(string) error {
 		cfg.Download = false
 		return nil

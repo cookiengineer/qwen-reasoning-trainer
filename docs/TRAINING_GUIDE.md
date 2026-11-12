@@ -169,15 +169,16 @@ LM-head logits per window, so it is much slower than `run`.
 
 ## 7. Train (QLoRA SFT)
 
-Two interchangeable paths: the **host autograd reference** (default) and the
-fully **device-resident Vulkan** graph (`--device`). Use `--device` on the real
-27B; the host path is correct-first and host-bound (very slow at scale).
+Two interchangeable paths: the fully **device-resident Vulkan** graph (default
+with `--backend auto` when a suitable GPU is present) and the **host autograd
+reference** (`--backend cpu`, very slow at scale). `--backend vulkan` requires a
+suitable GPU and fails instead of falling back; device checkpoint flags also
+require Vulkan.
 
 ```sh
-# device-resident, resumable, merging only after the final step
+# device-resident by default, resumable, merging only after the final step
 ./build/qwen-trainer train \
   --model models/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf \
-  --device \
   --dataset datasets/reasoning-hydraone \
   --dataset datasets/reasoning-thinky \
   --include-subagents \
@@ -205,7 +206,7 @@ Key flags:
 | `--val-ratio` | 0 | validation split (0 = train on all) |
 | `--include-subagents` | false | include the `subagents/` tree |
 | `--limit` | 0 | cap the sessions used (0 = all) |
-| `--device` | false | device-resident Vulkan graph |
+| `--backend` | auto | `auto`, `cpu`, or `vulkan` compute backend |
 | `--checkpoint` | true | activation checkpointing (device path) |
 | `--resume` | - | device checkpoint to load and save to |
 | `--save-every` | 0 | checkpoint cadence in steps (0 = only at the end) |
@@ -296,9 +297,10 @@ the base.
 - **Abliteration quality.** Use the bundled prompt sets and Heretic's limits;
   very small `--limit` values are for smoke tests only. The first-token KL is a
   weak signal for a thinking model.
-- **No device present.** `run`, `evaluate`, `abliterate`, and `search` fall
-  back to the CPU reference; GPU tests and `--device` training skip/fail
-  accordingly.
+- **No device present.** Under `--backend auto`, `run`, `evaluate`,
+  `abliterate`, `search`, and `train` fall back to the CPU reference.
+  `--backend vulkan` and device checkpoint flags (`--resume`, `--save-every`)
+  fail without a suitable GPU.
 
 ---
 
@@ -313,7 +315,7 @@ make check                                       # fmt-check + vet + test
 ./build/qwen-trainer dataset  --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --dataset datasets/reasoning-hydraone
 ./build/qwen-trainer abliterate --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --out models/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf
 ./build/qwen-trainer search   --model models/Qwen3.8-27B-UD-Q4_K_M.gguf --trials 25 --sampler tpe --study models/search.jsonl --out models/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf
-./build/qwen-trainer train    --model models/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf --device --dataset datasets/reasoning-hydraone --seq-len 1024 --steps 1002 --resume models/sft-abliterated.ckpt --save-every 25 --out models/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf
+./build/qwen-trainer train    --model models/Qwen3.8-27B-abliterated-UD-Q4_K_M.gguf --dataset datasets/reasoning-hydraone --seq-len 1024 --steps 1002 --resume models/sft-abliterated.ckpt --save-every 25 --out models/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf
 ./build/qwen-trainer status
 ./build/qwen-trainer evaluate --model models/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf --prompts source/prompts/heretic_harmful_test.jsonl --max-tokens 32
 ./build/qwen-trainer run      --model models/Qwen3.8-27B-abliterated-DeepSeek-UD-Q4_K_M.gguf --prompt "The capital of France is" --generate 8
