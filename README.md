@@ -17,12 +17,28 @@ with an `AMD Radeon Pro W7800 48GB` GPU and with `96GB` DDR5 SODIMM CPU memory
 available. The costs for the hardware of self training a Qwen3.8 model is at
 a budget of around `5000 EUR`, even in this ongoing RAM crisis.
 
-It started as an experiment of making `Qwen3.8` think like `DeepSeek`, and the
-training pipeline meanwhile is reproducible and confirmed by others. The reason
-for doing so is that `DeepSeek v4.1 Flash` is very good at planning of coding
-tasks, but isn't good at cyber security tasks anymore because the model has been
-censored compared to the previous `DeepSeek v4 Pro` model, which now is absurdly
-expensive in its pricing.
+Hardware requirements depend on the amount of context-length, the memory calculation
+is like this:
+
+- Around 17GB for the model weights
+- A couple of MB for GPU kernels (negligible)
+- Additional memory for K/V and cache (`~10GB` for `512k`, `~20GB` for `1M`)
+
+That is why it's recommended to use a 32GB VRAM GPU for 512k context length,
+and a 48GB VRAM GPU for 1M context length. And yes, self-hosted, local, on
+consumer-grade hardware. Pretty awesome, huh?
+
+The Qwen Trainer project started as an experiment of making `Qwen3.8` think like
+`DeepSeek`. The training pipeline meanwhile is reproducible and confirmed by others.
+The reason for doing so is that `DeepSeek v4.1 Flash` is very good at planning of
+coding tasks, but isn't good at cyber security or exploit validation tasks anymore
+because the model has been censored heavily compared to the previous `DeepSeek v4 Pro`
+model. As v4 Pro is now as overpriced as 'murican models, I decided to go this route.
+
+The CPU backend kernel stack and the K/V cache implementations have been partially
+reused from my own experimental [gonano SIMD model](https://github.com/cookiengineer/gonano)
+that focuses on better SIMD inference and scales with CPUs (but has its own limitations
+due to Go not having lower precisions than `float32` available as of today, sadly).
 
 ## Requirements
 
